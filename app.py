@@ -26,6 +26,7 @@ from typing import Dict, List
 
 import pandas as pd
 from flask import Flask, jsonify, request, send_file, Response
+from earnings_data import fetch_fmp_and_save_csv
 
 # Load environment variables from a .env file in the same directory (if present)
 try:
@@ -45,6 +46,7 @@ app = Flask(__name__)
 
 CSV_PATH = os.environ.get("STOCK_TRACKER_CSV", "stocks.csv")
 CSV_HEADERS = ["symbol", "forecast_price", "updated_date"]
+EARNINGS_CSV = os.environ.get("EARNINGS_CSV", "earnings.csv")
 _LOCK = threading.Lock()
 
 
@@ -129,6 +131,34 @@ def _fetch_current_prices(symbols: List[str]) -> Dict[str, float | None]:
 
     return out
 
+# ----------------- Next earnings helper ----------------------
+
+def _load_next_earnings_map() -> Dict[str, str]:
+    """Return mapping SYMBOL -> next earnings date (YYYY-MM-DD) from earnings CSV.
+    Logic mimics:
+        df = pd.read_csv("earnings.csv"); df.sort_values("date");
+        df = df[pd.isna(df["epsActual"])]  # upcoming only
+        df.drop_duplicates("symbol")        # first future date per symbol
+    """
+    try:
+        if not os.path.exists(EARNINGS_CSV):
+            return {}
+        edf = pd.read_csv(EARNINGS_CSV, dtype={"symbol": str}, keep_default_na=True)
+    except Exception:
+        return {}
+    if edf.empty or "symbol" not in edf.columns or "date" not in edf.columns:
+        return {}
+    edf["symbol"] = edf["symbol"].astype(str).str.upper().str.strip()
+    # Keep only entries without actual EPS (future)
+    if "epsActual" in edf.columns:
+        edf = edf[pd.isna(edf["epsActual"])].copy()
+    try:
+        edf["date"] = pd.to_datetime(edf["date"], errors="coerce").dt.date.astype(str)
+    except Exception:
+        pass
+    edf = edf.sort_values("date").drop_duplicates("symbol", keep="first")
+    return dict(zip(edf["symbol"], edf["date"]))
+
 
 # ----------------- Routes ----------------------
 
@@ -182,6 +212,7 @@ def index() -> Response:
           const diff_pct = r.diff_pct == null ? '—' : (r.diff_pct).toFixed(2) + '%';
           const current_price = r.current_price == null ? '—' : r.current_price.toLocaleString(undefined, {{maximumFractionDigits: 2}});
           const forecast_price = r.forecast_price == null ? '—' : r.forecast_price.toLocaleString(undefined, {{maximumFractionDigits: 2}});
+          const next_earnings = (r.next_earnings == null || r.next_earnings === '') ? '—' : r.next_earnings;
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
           const yahooUrl = `https://finance.yahoo.com/quote/${{encodeURIComponent(r.symbol)}}`;
           const tr = document.createElement('tr');
@@ -189,6 +220,7 @@ def index() -> Response:
             <td><a href="${{yahooUrl}}" target="_blank" rel="noopener">${{r.symbol}}</a></td>
             <td class="num">${{forecast_price}}</td>
             <td>${{r.updated_date}}</td>
+            <td>${{next_earnings}}</td>
             <td class="num">${{current_price}}</td>
             <td class="num ${{colorClass}}">${{diff_dollar}}</td>
             <td class="num ${{colorClass}}">${{diff_pct}}</td>
@@ -255,6 +287,8 @@ def index() -> Response:
       .small {{ font-size: 12px; color: var(--muted); }}
       a {{ color: var(--accent); text-decoration: none; }}
       a:hover {{ text-decoration: underline; }}
+      /* Smaller date field for earnings updater */
+      #earnings_to {{ width: 160px; padding: 8px 10px; }}
       @media (max-width: 860px) {{
         form {{ grid-template-columns: 1fr 1fr; }}
       }}
@@ -289,6 +323,18 @@ def index() -> Response:
             <button type="submit">Add / Update</button>
           </div>
         </form>
+         <!-- Earnings Calendar Updater -->
+        <form action=\"/update-earnings\" method=\"post\" style=\"margin-top:14px; display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:end;\">
+          <div>
+            <label for=\"earnings_to\">Earnings calendar up to (date)</label>
+            <input id=\"earnings_to\" name=\"to\" type=\"date\" value=\"2025-12-16\" />
+            <div class=\"small\">Saves to <code>earnings.csv</code>.</div>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button type=\"submit\">Update Earnings</button>
+          </div>
+        </form>
         <div class="small">Last refreshed: <span id="last-refreshed">—</span></div>
         <div style="overflow-x:auto; margin-top: 10px;">
           <table>
@@ -297,6 +343,7 @@ def index() -> Response:
                 <th data-key="symbol" onclick="sortBy('symbol')">Symbol</th>
                 <th class="num" data-key="forecast_price" onclick="sortBy('forecast_price')">Forecast ($)</th>
                 <th data-key="updated_date" onclick="sortBy('updated_date')">Updated</th>
+                <th data-key="next_earnings" onclick="sortBy('next_earnings')">Next ER</th>
                 <th class="num" data-key="current_price" onclick="sortBy('current_price')">Current ($)</th>
                 <th class="num" data-key="diff_dollar" onclick="sortBy('diff_dollar')">Δ $</th>
                 <th class="num" data-key="diff_pct" onclick="sortBy('diff_pct')">Δ %</th>
@@ -349,6 +396,7 @@ def data() -> Response:
     symbols = [] if df.empty else sorted(df["symbol"].dropna().astype(str).str.upper().unique().tolist())
 
     prices: Dict[str, float | None] = _fetch_current_prices(symbols)
+    next_map: Dict[str, str] = _load_next_earnings_map()
 
     rows = []
     if not df.empty:
@@ -364,7 +412,7 @@ def data() -> Response:
             diff_dollar = None
             diff_pct = None
             if cur is not None and fpx not in (None, 0):
-                diff_dollar = cur - fpx
+                diff_dollar = fpx - cur
                 try:
                     diff_pct = (diff_dollar / fpx) * 100.0
                 except Exception:
@@ -374,6 +422,7 @@ def data() -> Response:
                 "symbol": sym,
                 "forecast_price": fpx,
                 "updated_date": str(r.get("updated_date", "")),
+                "next_earnings": next_map.get(sym),
                 "current_price": cur,
                 "diff_dollar": diff_dollar,
                 "diff_pct": diff_pct,
@@ -392,6 +441,18 @@ def export_csv() -> Response:
 def health() -> Response:
     ok = os.path.exists(CSV_PATH)
     return jsonify({"ok": ok, "csv": CSV_PATH})
+
+
+@app.post("/update-earnings")
+def update_earnings() -> Response:
+    # Accept either form post or JSON
+    to_date = (request.form.get("to") or (request.get_json(silent=True) or {}).get("to") or date.today().isoformat())
+    api_key = os.environ.get("FMP_API_KEY") or os.environ.get("FMP_APIKEY") or os.environ.get("FMP_KEY")
+    try:
+        n = fetch_fmp_and_save_csv(to_date, api_key, EARNINGS_CSV)
+    except Exception as e:
+        return Response(f"<pre>Update failed: {e}</pre>", mimetype="text/html", status=500)
+    return Response(f"<pre>Updated earnings file '{EARNINGS_CSV}' with {n} rows for to={to_date}. <a href='/'>&larr; back</a></pre>", mimetype="text/html")
 
 
 if __name__ == "__main__":
