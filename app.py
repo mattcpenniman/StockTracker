@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import threading
+import calendar
 from datetime import date
 from typing import Dict, List
 
@@ -77,6 +78,15 @@ def _read_df() -> pd.DataFrame:
 def _write_df(df: pd.DataFrame) -> None:
     with _LOCK:
         df.to_csv(CSV_PATH, index=False)
+
+
+def _add_months(d: date, months: int) -> date:
+    """Return a date shifted by N calendar months, clamping day to month end."""
+    month_index = (d.month - 1) + months
+    year = d.year + (month_index // 12)
+    month = (month_index % 12) + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
 
 
 def _upsert_stocks(rows: List[Dict]) -> int:
@@ -197,6 +207,7 @@ def _load_next_earnings_map() -> Dict[str, str]:
 
 @app.get("/")
 def index() -> Response:
+    earnings_default_date = _add_months(date.today(), 4).isoformat()
     html = f"""
 <!doctype html>
 <html lang=\"en\">
@@ -335,6 +346,7 @@ def index() -> Response:
           <div class="actions">
             <button id="refresh-btn" title="Refetch current prices">Refresh Prices</button>
             <a href="/export"><button type="button" title="Download CSV">Download CSV</button></a>
+            <a href="/api-docs"><button type="button" title="API docs">API Docs</button></a>
           </div>
         </div>
         <p class="muted">Add a symbol with your forecast and last updated date. Data is persisted to <code>stocks.csv</code> on the server.</p>
@@ -360,7 +372,7 @@ def index() -> Response:
         <form action=\"/update-earnings\" method=\"post\" style=\"margin-top:14px; display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:end;\">
           <div>
             <label for=\"earnings_to\">Earnings calendar up to (date)</label>
-            <input id=\"earnings_to\" name=\"to\" type=\"date\" value=\"2025-12-16\" />
+            <input id=\"earnings_to\" name=\"to\" type=\"date\" value=\"{earnings_default_date}\" />
             <div class=\"small\">Saves to <code>earnings.csv</code>.</div>
           </div>
           <div>
@@ -447,7 +459,11 @@ def data() -> Response:
 @app.get("/api/stocks")
 def get_stocks_api() -> Response:
     """Raw database view for external scripts (no market data enrichment)."""
+    symbol_filter = (request.args.get("symbol") or "").strip().upper()
     df = _read_df()
+    if symbol_filter and not df.empty:
+        df = df[df["symbol"].astype(str).str.upper() == symbol_filter].copy()
+
     rows = []
     if not df.empty:
         for _, r in df.iterrows():
@@ -458,7 +474,72 @@ def get_stocks_api() -> Response:
                     "updated_date": str(r.get("updated_date", "")),
                 }
             )
-    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+    return jsonify({"ok": True, "rows": rows, "count": len(rows), "symbol": symbol_filter or None})
+
+
+@app.get("/api-docs")
+def api_docs() -> Response:
+    html = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Stock Tracker API Docs</title>
+    <style>
+      :root {
+        --bg: #0b0f14; --card: #0f1520; --muted: #aab8c5; --text: #e6edf3; --accent: #2e90fa; --border: #1f2a3a;
+      }
+      html, body { background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; margin: 0; }
+      .wrap { max-width: 920px; margin: 24px auto; padding: 0 16px; }
+      .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; }
+      h1 { margin-top: 0; font-size: 24px; }
+      h2 { margin-top: 22px; font-size: 18px; }
+      p, li { color: var(--text); line-height: 1.5; }
+      .muted { color: var(--muted); }
+      pre { background: #0c121b; border: 1px solid var(--border); border-radius: 10px; padding: 12px; overflow-x: auto; }
+      code { color: #d7f0ff; }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <div class="top">
+          <h1>API Docs</h1>
+          <a href="/">Back to app</a>
+        </div>
+        <p class="muted">Base URL: <code>http://127.0.0.1:5000</code></p>
+
+        <h2>GET /api/stocks</h2>
+        <p>Returns rows from the CSV-backed database. Optional query parameter <code>symbol</code> filters to a single stock.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/stocks"
+curl -s "http://127.0.0.1:5000/api/stocks?symbol=AAPL"</code></pre>
+
+        <h2>POST /api/stocks</h2>
+        <p>Upserts one or many rows by symbol (case-insensitive).</p>
+<pre><code>curl -X POST http://127.0.0.1:5000/api/stocks \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"AAPL","forecast_price":210.5,"updated_date":"2026-03-07"}'</code></pre>
+
+<pre><code>curl -X POST http://127.0.0.1:5000/api/stocks \
+  -H "Content-Type: application/json" \
+  -d '{"rows":[{"symbol":"AAPL","forecast_price":210.5},{"symbol":"MSFT","forecast_price":480}]}'</code></pre>
+
+        <h2>Fields</h2>
+        <ul>
+          <li><code>symbol</code>: required, stock ticker (stored uppercase)</li>
+          <li><code>forecast_price</code>: required, numeric</li>
+          <li><code>updated_date</code>: optional, defaults to server date (YYYY-MM-DD)</li>
+        </ul>
+      </div>
+    </div>
+  </body>
+</html>
+    """
+    return Response(html, mimetype="text/html")
 
 
 @app.post("/api/stocks")

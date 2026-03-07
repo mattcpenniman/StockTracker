@@ -9,6 +9,7 @@ Single-file Flask app for tracking stock forecast prices in a CSV-backed store.
 - Export CSV data
 - Update earnings data into `earnings.csv`
 - External API for reading/updating the CSV "database"
+- Built-in API documentation page in the web UI
 
 ## Requirements
 - Python 3.10+
@@ -36,6 +37,7 @@ Optional environment variables:
 
 ## Routes
 - `GET /` - web UI
+- `GET /api-docs` - API documentation page
 - `POST /add` - add/update one forecast row from UI JSON
 - `GET /data` - UI table data with live prices and earnings enrichment
 - `GET /api/stocks` - raw stored rows from CSV (script-friendly)
@@ -49,6 +51,11 @@ Optional environment variables:
 ### Get raw stored rows
 ```bash
 curl -s http://127.0.0.1:5000/api/stocks
+```
+
+### Get a single stock by symbol
+```bash
+curl -s "http://127.0.0.1:5000/api/stocks?symbol=AAPL"
 ```
 
 Example response:
@@ -80,3 +87,5 @@ curl -X POST http://127.0.0.1:5000/api/stocks \
 - `POST /api/stocks` upserts by `symbol` (case-insensitive, normalized to uppercase).
 - If `updated_date` is omitted, the server uses today’s date.
 - `GET /api/stocks` returns only stored values, not live market values.
+- `GET /api/stocks?symbol=...` filters to one symbol.
+- In the UI, "Earnings calendar up to (date)" defaults to 4 calendar months in the future.
