@@ -208,10 +208,10 @@ def index() -> Response:
         const tbody = document.getElementById('tbody');
         tbody.innerHTML = '';
         for (const r of data) {{
-          const diff_dollar = r.diff_dollar == null ? '—' : r.diff_dollar.toLocaleString(undefined, {{maximumFractionDigits: 2}});
+          const diff_dollar = r.diff_dollar == null ? '—' : r.diff_dollar.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
           const diff_pct = r.diff_pct == null ? '—' : (r.diff_pct).toFixed(2) + '%';
-          const current_price = r.current_price == null ? '—' : r.current_price.toLocaleString(undefined, {{maximumFractionDigits: 2}});
-          const forecast_price = r.forecast_price == null ? '—' : r.forecast_price.toLocaleString(undefined, {{maximumFractionDigits: 2}});
+          const current_price = r.current_price == null ? '—' : r.current_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+          const forecast_price = r.forecast_price == null ? '—' : r.forecast_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
           const next_earnings = (r.next_earnings == null || r.next_earnings === '') ? '—' : r.next_earnings;
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
           const yahooUrl = `https://finance.yahoo.com/quote/${{encodeURIComponent(r.symbol)}}`;
@@ -414,7 +414,7 @@ def data() -> Response:
             if cur is not None and fpx not in (None, 0):
                 diff_dollar = fpx - cur
                 try:
-                    diff_pct = (diff_dollar / fpx) * 100.0
+                    diff_pct = (diff_dollar / cur) * 100.0
                 except Exception:
                     diff_pct = None
 

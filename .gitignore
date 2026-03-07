@@ -1,0 +1,4 @@
+*.csv
+pyapollo
+earnings_data
+.env
