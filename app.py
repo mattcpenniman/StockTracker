@@ -79,6 +79,39 @@ def _write_df(df: pd.DataFrame) -> None:
         df.to_csv(CSV_PATH, index=False)
 
 
+def _upsert_stocks(rows: List[Dict]) -> int:
+    """Upsert one or more stock rows into the CSV store."""
+    df = _read_df()
+    upserts = 0
+
+    for row in rows:
+        symbol = str(row.get("symbol", "")).strip().upper()
+        updated_date = str(row.get("updated_date") or date.today().isoformat()).strip()
+        if not symbol:
+            raise ValueError("Each row requires a symbol.")
+
+        try:
+            forecast_price = float(row.get("forecast_price"))
+        except Exception as exc:
+            raise ValueError(f"Invalid forecast price for symbol {symbol}.") from exc
+
+        if df.empty:
+            df = pd.DataFrame([[symbol, forecast_price, updated_date]], columns=CSV_HEADERS)
+        else:
+            mask = df["symbol"].str.upper() == symbol
+            if mask.any():
+                df.loc[mask, ["symbol", "forecast_price", "updated_date"]] = [symbol, forecast_price, updated_date]
+            else:
+                df = pd.concat(
+                    [df, pd.DataFrame([[symbol, forecast_price, updated_date]], columns=CSV_HEADERS)],
+                    ignore_index=True,
+                )
+        upserts += 1
+
+    _write_df(df)
+    return upserts
+
+
 # -------- Price fetching (via yfinance) ---------
 
 def _fetch_current_prices(symbols: List[str]) -> Dict[str, float | None]:
@@ -363,30 +396,10 @@ def index() -> Response:
 @app.post("/add")
 def add_symbol() -> Response:
     payload = request.get_json(force=True, silent=True) or {}
-    symbol = (payload.get("symbol") or "").strip().upper()
-    forecast_raw = payload.get("forecast_price")
-    updated_date = (payload.get("updated_date") or "").strip() or date.today().isoformat()
-
-    if not symbol:
-        return jsonify({"ok": False, "error": "Symbol is required."}), 400
-
     try:
-        forecast_price = float(forecast_raw)
-    except Exception:
-        return jsonify({"ok": False, "error": "Invalid forecast price."}), 400
-
-    df = _read_df()
-
-    if df.empty:
-        df = pd.DataFrame([[symbol, forecast_price, updated_date]], columns=CSV_HEADERS)
-    else:
-        mask = df["symbol"].str.upper() == symbol
-        if mask.any():
-            df.loc[mask, ["symbol", "forecast_price", "updated_date"]] = [symbol, forecast_price, updated_date]
-        else:
-            df = pd.concat([df, pd.DataFrame([[symbol, forecast_price, updated_date]], columns=CSV_HEADERS)], ignore_index=True)
-
-    _write_df(df)
+        _upsert_stocks([payload])
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True})
 
 
@@ -431,6 +444,46 @@ def data() -> Response:
     return jsonify({"rows": rows})
 
 
+@app.get("/api/stocks")
+def get_stocks_api() -> Response:
+    """Raw database view for external scripts (no market data enrichment)."""
+    df = _read_df()
+    rows = []
+    if not df.empty:
+        for _, r in df.iterrows():
+            rows.append(
+                {
+                    "symbol": str(r.get("symbol", "")).upper(),
+                    "forecast_price": float(r["forecast_price"]) if pd.notna(r.get("forecast_price")) else None,
+                    "updated_date": str(r.get("updated_date", "")),
+                }
+            )
+    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+
+
+@app.post("/api/stocks")
+def post_stocks_api() -> Response:
+    """Upsert one or more rows in the CSV database.
+    Accepts either:
+      - single row: {"symbol":"AAPL","forecast_price":200,"updated_date":"2026-03-07"}
+      - batch: {"rows":[...]}
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    if "rows" in payload:
+        rows = payload.get("rows")
+        if not isinstance(rows, list) or not rows:
+            return jsonify({"ok": False, "error": "'rows' must be a non-empty list."}), 400
+    else:
+        rows = [payload]
+
+    try:
+        n = _upsert_stocks(rows)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    return jsonify({"ok": True, "upserted": n})
+
+
 @app.get("/export")
 def export_csv() -> Response:
     _init_csv_if_needed()
@@ -465,4 +518,3 @@ except (TypeError, ValueError):
     port = 5000
 print(f"Running on http://{host}:{port} (dotenv={'on' if _DOTENV_LOADED else 'off'})")
 app.run(host=host, port=port, debug=True)
-
