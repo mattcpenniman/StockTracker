@@ -80,6 +80,8 @@ Optional migration env vars:
 - `POST /api/state/batch` - analytics state JSON for many symbols
 - `GET /api/events/<symbol>` - recent deterministic event JSON for one symbol
 - `GET /api/events/<symbol>/<timeframe>` - event JSON for an explicit timeframe
+- `GET /api/futurestate/<symbol>` - realized future max/min/end price window from an `asof` date
+- `GET /api/futurestate/<symbol>/<timeframe>` - realized future window for an explicit timeframe
 - `GET /api/metadata/<symbol>` - symbol metadata + sync freshness JSON
 - `GET /api/health/analytics` - analytics health check
 - `GET /export` - download current stock data as CSV
@@ -137,6 +139,11 @@ curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20"
 `GET /api/events/<symbol>`
 ```bash
 curl -s "http://127.0.0.1:5000/api/events/NVDA?timeframe=1D&event_limit=10&breakout_lookback=20"
+```
+
+`GET /api/futurestate/<symbol>`
+```bash
+curl -s "http://127.0.0.1:5000/api/futurestate/NVDA?timeframe=1D&asof=2023-09-20&days=20"
 ```
 
 `POST /api/state/batch`
@@ -322,6 +329,47 @@ The event feed returns timestamped, deterministic events such as:
   ]
 }
 ```
+
+### Example future-state response
+
+```json
+{
+  "ok": true,
+  "symbol": "NVDA",
+  "timeframe": "1Day",
+  "as_of": "2023-09-20T00:00:00Z",
+  "horizon_days": 20,
+  "anchor_price": {
+    "close": 444.1,
+    "timestamp": "2023-09-20T00:00:00Z"
+  },
+  "window": {
+    "target_end_timestamp": "2023-10-10T00:00:00Z",
+    "realized_end_timestamp": "2023-10-10T00:00:00Z",
+    "future_bar_count": 14
+  },
+  "future_state": {
+    "max_price": 471.2,
+    "max_price_timestamp": "2023-10-02T00:00:00Z",
+    "max_return_pct": 0.061,
+    "min_price": 430.4,
+    "min_price_timestamp": "2023-09-25T00:00:00Z",
+    "min_return_pct": -0.0308,
+    "price_at_horizon": 468.7,
+    "price_at_horizon_timestamp": "2023-10-10T00:00:00Z",
+    "return_at_horizon_pct": 0.0554
+  }
+}
+```
+
+### Future-state rules
+
+- `asof` is required and anchors the calculation on the latest stored bar at or before that timestamp
+- `days` is required and defines the forward-looking calendar-day window
+- `max_price` uses the maximum future `high` inside the window
+- `min_price` uses the minimum future `low` inside the window
+- `price_at_horizon` uses the close of the last stored bar on or before the target end timestamp
+- all `*_pct` values are relative to the anchor close at `asof`
 
 ### Assumptions
 

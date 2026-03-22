@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from datetime import timedelta
 from typing import Any
 
 import pandas as pd
@@ -47,6 +48,7 @@ class AnalyticsService:
         self.repository = repository or AnalyticsRepository()
         self._state_cache = _StateCache()
         self._events_cache = _StateCache()
+        self._future_cache = _StateCache()
 
     def _context_for_symbol(self, symbol: str) -> dict[str, Any]:
         context = self.repository.fetch_symbol_context(symbol)
@@ -220,6 +222,87 @@ class AnalyticsService:
         events = generate_events(features, settings, event_limit=event_limit or settings.event_limit)
         payload = serialize_events(context["symbol"], timeframe, events)
         self._events_cache.set(cache_key, payload)
+        return payload
+
+    def get_future_state(
+        self,
+        symbol: str,
+        timeframe: str,
+        asof_dt,
+        days: int,
+    ) -> dict[str, Any]:
+        if days <= 0:
+            raise ValueError("'days' must be greater than zero.")
+
+        context = self._context_for_symbol(symbol)
+        cache_key = (
+            context["symbol"],
+            timeframe,
+            isoformat_utc(asof_dt),
+            days,
+            isoformat_utc(context.get("last_bar_synced_at")),
+        )
+        cached = self._future_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        anchor_bars = self.repository.fetch_bars(context["symbol_id"], timeframe, asof_dt)
+        if anchor_bars.empty:
+            raise AnalyticsNotFoundError(
+                f"No anchor bar available for symbol '{context['symbol']}' on timeframe '{timeframe}' at the requested as-of."
+            )
+
+        anchor_bar = anchor_bars.iloc[-1]
+        anchor_timestamp = anchor_bar["timestamp"]
+        anchor_close = float(anchor_bar["close"])
+        target_end = anchor_timestamp + timedelta(days=days)
+
+        future_bars = self.repository.fetch_bars(
+            context["symbol_id"],
+            timeframe,
+            asof=target_end,
+            start=anchor_timestamp + pd.Timedelta(microseconds=1),
+        )
+        if future_bars.empty:
+            raise AnalyticsNotFoundError(
+                f"No future bars available for symbol '{context['symbol']}' on timeframe '{timeframe}' for the requested window."
+            )
+
+        end_bar = future_bars.iloc[-1]
+        high_idx = future_bars["high"].idxmax()
+        low_idx = future_bars["low"].idxmin()
+        max_bar = future_bars.loc[high_idx]
+        min_bar = future_bars.loc[low_idx]
+
+        payload = clean_json_value(
+            {
+                "symbol": context["symbol"],
+                "timeframe": timeframe,
+                "as_of": anchor_timestamp,
+                "horizon_days": days,
+                "anchor_price": {
+                    "close": anchor_close,
+                    "timestamp": anchor_timestamp,
+                },
+                "window": {
+                    "target_end_timestamp": target_end,
+                    "realized_end_timestamp": end_bar["timestamp"],
+                    "future_bar_count": len(future_bars),
+                },
+                "future_state": {
+                    "max_price": float(max_bar["high"]),
+                    "max_price_timestamp": max_bar["timestamp"],
+                    "max_return_pct": (float(max_bar["high"]) / anchor_close) - 1.0 if anchor_close else None,
+                    "min_price": float(min_bar["low"]),
+                    "min_price_timestamp": min_bar["timestamp"],
+                    "min_return_pct": (float(min_bar["low"]) / anchor_close) - 1.0 if anchor_close else None,
+                    "price_at_horizon": float(end_bar["close"]),
+                    "price_at_horizon_timestamp": end_bar["timestamp"],
+                    "return_at_horizon_pct": (float(end_bar["close"]) / anchor_close) - 1.0 if anchor_close else None,
+                },
+            }
+        )
+        self._future_cache.set(cache_key, payload)
         return payload
 
     def get_batch_state(

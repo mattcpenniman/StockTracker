@@ -175,6 +175,48 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("signal_bias", payload["state"])
         self.assertTrue(payload["data_quality"]["has_sufficient_history_200"])
 
+    def test_service_builds_future_state_payload(self) -> None:
+        repo = Mock()
+        repo.fetch_symbol_context.return_value = {
+            "symbol_id": 1,
+            "symbol": "NVDA",
+            "exchange": "NASDAQ",
+            "asset_class": "us_equity",
+            "name": "NVIDIA Corp",
+            "is_active": True,
+            "created_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "updated_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "last_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_successful_sync_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_quote_synced_at": None,
+            "last_bar_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_bar_time": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_quote_time": None,
+            "sync_status": "idle",
+            "sync_error": None,
+        }
+        anchor_and_history = _fixture_bars(30)
+        future = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2023-01-31", periods=5, freq="D", tz="UTC"),
+                "open": [130.0, 131.0, 132.0, 133.0, 134.0],
+                "high": [132.0, 140.0, 136.0, 137.0, 138.0],
+                "low": [129.0, 128.0, 127.0, 130.0, 133.0],
+                "close": [131.0, 135.0, 133.0, 136.0, 137.0],
+                "volume": [1000.0] * 5,
+            }
+        )
+        repo.fetch_bars.side_effect = [anchor_and_history, future]
+        service = AnalyticsService(repository=repo)
+
+        payload = service.get_future_state("NVDA", "1Day", pd.Timestamp("2023-01-30", tz="UTC"), 5)
+        self.assertEqual(payload["symbol"], "NVDA")
+        self.assertEqual(payload["horizon_days"], 5)
+        self.assertEqual(payload["future_state"]["max_price"], 140.0)
+        self.assertEqual(payload["future_state"]["min_price"], 127.0)
+        self.assertEqual(payload["future_state"]["price_at_horizon"], 137.0)
+        self.assertAlmostEqual(payload["future_state"]["max_return_pct"], (140.0 / 129.0) - 1.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

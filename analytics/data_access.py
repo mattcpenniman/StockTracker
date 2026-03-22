@@ -90,6 +90,7 @@ class AnalyticsRepository:
         symbol_id: int,
         timeframe: str,
         asof: datetime | None = None,
+        start: datetime | None = None,
     ) -> pd.DataFrame:
         sql = """
             SELECT bar_time, open, high, low, close, volume
@@ -98,6 +99,9 @@ class AnalyticsRepository:
               AND timeframe = %s
         """
         params: list[Any] = [symbol_id, timeframe]
+        if start is not None:
+            sql += " AND bar_time >= %s"
+            params.append(start.astimezone(timezone.utc))
         if asof is not None:
             sql += " AND bar_time <= %s"
             params.append(asof.astimezone(timezone.utc))
