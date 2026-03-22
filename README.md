@@ -5,6 +5,9 @@ Single-file Flask app for tracking stock forecast prices with a PostgreSQL backe
 ## Features
 - Add or update stock forecasts from the web UI
 - Persist stock data in PostgreSQL
+- Click a symbol to open a chart page backed by PostgreSQL market data
+- Auto-fetch Alpaca bars on first chart load when no cached data exists
+- Show sync status, last sync timestamps, latest quote, and a manual sync button
 - Track `reward_score`, `risk_score`, `confidence_score` (all 0-10)
 - Track `classification` (`buy`, `hold/watch`, `sell`)
 - Compute dashboard/API `opportunity_score` using:
@@ -59,6 +62,7 @@ Optional migration env vars:
 - `STOCK_TRACKER_TABLE` (default: `stock_forecasts`)
 - `STOCK_TRACKER_EARNINGS_TABLE` (default: `earnings_calendar`)
 - `FMP_API_KEY` (for earnings update route)
+- `CHART_DELAY` or `CHART_DELAY_MINUTES` (default: `20`; shifts Alpaca historical bar queries back to avoid recent SIP data restrictions on free plans)
 
 ## Routes
 - `GET /` - web UI
@@ -67,6 +71,10 @@ Optional migration env vars:
 - `GET /data` - UI table data with live prices and earnings enrichment
 - `GET /api/stocks` - stored rows from PostgreSQL
 - `POST /api/stocks` - upsert one or many rows into PostgreSQL
+- `GET /chart/<symbol>` - chart page for a symbol
+- `GET /api/chart/<symbol>` - stored bars + sync state + latest quote/bar cache
+- `POST /api/chart/<symbol>/sync` - fetch fresh market data from Alpaca and upsert it
+- `GET /api/chart/<symbol>/latest` - latest quote/bar cache + sync state
 - `GET /export` - download current stock data as CSV
 - `GET /health` - health check
 - `POST /update-earnings` - refresh the earnings calendar table in PostgreSQL
@@ -122,4 +130,7 @@ curl -X POST http://127.0.0.1:5000/api/stocks \
 - `POST /api/stocks` upserts by `symbol` (case-insensitive, normalized to uppercase).
 - `GET /api/stocks` returns only the latest stored row per stock, ordered by newest `updated_date` first.
 - `GET /api/stocks?limit=N` limits the number of rows returned.
+- `GET /chart/<symbol>` will try PostgreSQL first and only fetch from Alpaca automatically if no stored bars are available yet.
+- Alpaca credentials are read from `APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` in `.env`.
+- If you are on Alpaca's free plan, set `CHART_DELAY=20` in `.env` so historical bar syncs stop 20 minutes behind real time and avoid recent SIP data 403 errors.
 - In the UI, "Earnings calendar up to (date)" defaults to 4 calendar months in the future.
