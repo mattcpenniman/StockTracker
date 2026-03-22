@@ -17,6 +17,9 @@ import pandas as pd
 from flask import Flask, Response, jsonify, request
 import matplotlib.pyplot as plt
 
+from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
+from analytics.utils import parse_asof
+
 # Load environment variables from a .env file in the same directory (if present)
 try:
     from dotenv import load_dotenv
@@ -70,6 +73,17 @@ INTRADAY_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_INTRADAY_LOOKBACK_DAYS"
 CHART_DELAY_MINUTES = int(os.environ.get("CHART_DELAY_MINUTES", os.environ.get("CHART_DELAY", "20")))
 ALPACA_BAR_ADJUSTMENT = os.environ.get("ALPACA_BAR_ADJUSTMENT", "split").strip() or "split"
 SUPPORTED_TIMEFRAMES = {"1Min", "5Min", "15Min", "1Hour", "1Day"}
+ANALYTICS_TIMEFRAME_ALIASES = {
+    "1D": "1Day",
+    "1DAY": "1Day",
+    "1DAYS": "1Day",
+    "1H": "1Hour",
+    "1HR": "1Hour",
+    "60MIN": "1Hour",
+    "15M": "15Min",
+    "5M": "5Min",
+    "1M": "1Min",
+}
 TIMEFRAME_DELTAS = {
     "1Min": timedelta(minutes=1),
     "5Min": timedelta(minutes=5),
@@ -77,6 +91,7 @@ TIMEFRAME_DELTAS = {
     "1Hour": timedelta(hours=1),
     "1Day": timedelta(days=1),
 }
+analytics_service = AnalyticsService()
 
 
 def _opportunity_score(reward_score: float, risk_score: float, confidence_score: float) -> float:
@@ -982,6 +997,58 @@ def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False, sna
     result["fetched_from_alpaca"] = True
     result["bars_inserted"] = bars_inserted
     return result
+
+
+def _normalize_analytics_timeframe(value: str | None) -> str:
+    raw = str(value or DEFAULT_CHART_TIMEFRAME).strip()
+    if not raw:
+        return DEFAULT_CHART_TIMEFRAME
+    normalized = ANALYTICS_TIMEFRAME_ALIASES.get(raw.upper(), raw)
+    if normalized not in SUPPORTED_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe '{raw}'.")
+    return normalized
+
+
+def _analytics_settings_from_request(source: Dict | None = None) -> AnalyticsSettings:
+    source = source or {}
+
+    def _get_value(name: str, default):
+        if name in source and source.get(name) not in (None, ""):
+            return source.get(name)
+        if request.args.get(name) not in (None, ""):
+            return request.args.get(name)
+        return default
+
+    def _to_int(name: str, default: int) -> int:
+        raw = _get_value(name, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"'{name}' must be an integer.") from exc
+        if value <= 0:
+            raise ValueError(f"'{name}' must be greater than zero.")
+        return value
+
+    def _to_float(name: str, default: float) -> float:
+        raw = _get_value(name, default)
+        try:
+            return float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"'{name}' must be numeric.") from exc
+
+    volume_confirmation_raw = _get_value("volume_confirmation", True)
+    if isinstance(volume_confirmation_raw, str):
+        volume_confirmation = volume_confirmation_raw.strip().lower() not in {"0", "false", "no"}
+    else:
+        volume_confirmation = bool(volume_confirmation_raw)
+
+    return AnalyticsSettings(
+        breakout_lookback=_to_int("breakout_lookback", 20),
+        buffer_pct=_to_float("buffer_pct", 0.0025),
+        volume_confirmation=volume_confirmation,
+        volume_multiple=_to_float("volume_multiple", 1.5),
+        event_limit=_to_int("event_limit", 20),
+    )
 
 
 # ----------------- Routes ----------------------
@@ -2038,6 +2105,87 @@ def get_latest_market_data(symbol: str) -> Response:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.get("/api/state/<symbol>")
+@app.get("/api/state/<symbol>/<timeframe>")
+def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
+    try:
+        normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
+        settings = _analytics_settings_from_request()
+        asof_dt = parse_asof(request.args.get("asof"))
+        payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
+        payload["ok"] = True
+        return jsonify(payload)
+    except AnalyticsNotFoundError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/api/events/<symbol>")
+@app.get("/api/events/<symbol>/<timeframe>")
+def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
+    try:
+        normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
+        settings = _analytics_settings_from_request()
+        asof_dt = parse_asof(request.args.get("asof"))
+        event_limit_raw = request.args.get("event_limit")
+        event_limit = int(event_limit_raw) if event_limit_raw else settings.event_limit
+        payload = analytics_service.get_events(symbol, normalized_timeframe, asof_dt, settings, event_limit=event_limit)
+        payload["ok"] = True
+        payload["as_of"] = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)["as_of"]
+        return jsonify(payload)
+    except AnalyticsNotFoundError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/api/metadata/<symbol>")
+def get_symbol_metadata_api(symbol: str) -> Response:
+    try:
+        payload = analytics_service.get_symbol_metadata(symbol)
+        payload["ok"] = True
+        return jsonify(payload)
+    except AnalyticsNotFoundError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.post("/api/state/batch")
+def get_analytics_batch_state() -> Response:
+    payload = request.get_json(silent=True) or {}
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, list) or not symbols:
+        return jsonify({"ok": False, "error": "'symbols' must be a non-empty array."}), 400
+
+    try:
+        normalized_timeframe = _normalize_analytics_timeframe(payload.get("timeframe") or request.args.get("timeframe"))
+        settings = _analytics_settings_from_request(payload)
+        asof_dt = parse_asof(str(payload.get("asof") or request.args.get("asof") or "").strip() or None)
+        batch = analytics_service.get_batch_state([str(item).strip().upper() for item in symbols], normalized_timeframe, asof_dt, settings)
+        batch["ok"] = True
+        return jsonify(batch)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/api/health/analytics")
+def analytics_health() -> Response:
+    try:
+        payload = analytics_service.health()
+        status = 200 if payload["ok"] else 503
+        return jsonify(payload), status
+    except Exception as exc:
+        return jsonify({"ok": False, "service": "analytics", "error": str(exc)}), 500
+
+
 @app.get("/api/stocks")
 def get_stocks_api() -> Response:
     """Return the latest stored row per symbol for external scripts."""
@@ -2128,6 +2276,90 @@ def api_docs() -> Response:
         </div>
         <p class="muted">Base URL: <code>http://127.0.0.1:5000</code></p>
 
+        <h2>Analytics Endpoints</h2>
+        <p>These endpoints expose non-visual market state JSON built from already-synced OHLCV bars in PostgreSQL.</p>
+
+        <h2>GET /api/state/&lt;symbol&gt;</h2>
+        <p>Returns current or backdated analytics state for one symbol. Optional query parameters: <code>timeframe</code>, <code>asof</code>, <code>breakout_lookback</code>, <code>buffer_pct</code>, <code>volume_confirmation</code>, <code>volume_multiple</code>.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/state/NVDA"
+curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20"
+curl -s "http://127.0.0.1:5000/api/state/NVDA/1Day?breakout_lookback=55&buffer_pct=0.005"</code></pre>
+
+<pre><code>{
+  "ok": true,
+  "symbol": "NVDA",
+  "timeframe": "1Day",
+  "as_of": "2023-09-20T00:00:00Z",
+  "trend": {
+    "regime": "uptrend",
+    "trend_strength": 2.48
+  },
+  "momentum": {
+    "regime": "bullish"
+  },
+  "signals": {
+    "is_breakout": false,
+    "above_sma20": true
+  },
+  "data_quality": {
+    "bar_count": 252,
+    "sync_status": "idle"
+  }
+}</code></pre>
+
+        <h2>POST /api/state/batch</h2>
+        <p>Returns analytics state for multiple symbols in a single request. Useful for watchlists and downstream agents.</p>
+<pre><code>curl -X POST http://127.0.0.1:5000/api/state/batch \
+  -H "Content-Type: application/json" \
+  -d '{"symbols":["NVDA","AAPL","MSFT"],"timeframe":"1D","asof":"2023-09-20"}'</code></pre>
+
+        <h2>GET /api/events/&lt;symbol&gt;</h2>
+        <p>Returns recent deterministic events for one symbol. Optional query parameters: <code>timeframe</code>, <code>asof</code>, <code>event_limit</code>, <code>breakout_lookback</code>, <code>buffer_pct</code>, <code>volume_confirmation</code>, <code>volume_multiple</code>.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/events/NVDA?timeframe=1D&event_limit=10"
+curl -s "http://127.0.0.1:5000/api/events/NVDA/1Day?asof=2023-09-20&volume_multiple=2.0"</code></pre>
+
+<pre><code>{
+  "ok": true,
+  "symbol": "NVDA",
+  "timeframe": "1Day",
+  "as_of": "2023-09-20T00:00:00Z",
+  "events": [
+    {
+      "event_type": "breakout",
+      "timestamp": "2023-09-20T00:00:00Z",
+      "value": 444.1,
+      "reference_level": 442.99,
+      "strength": 0.13,
+      "confirmed_by_volume": true
+    }
+  ]
+}</code></pre>
+
+        <h2>GET /api/metadata/&lt;symbol&gt;</h2>
+        <p>Returns symbol metadata and data freshness fields from <code>symbol_metadata</code> and <code>symbol_sync_state</code>.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/metadata/NVDA"</code></pre>
+
+        <h2>GET /api/health/analytics</h2>
+        <p>Returns analytics service health and database connectivity status.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/health/analytics"</code></pre>
+
+        <h2>Analytics Query Parameters</h2>
+        <ul>
+          <li><code>timeframe</code>: one of <code>1Day</code>, <code>1D</code>, <code>1Hour</code>, <code>15Min</code>, <code>5Min</code>, <code>1Min</code></li>
+          <li><code>asof</code>: optional backdated cutoff; accepts <code>YYYY-MM-DD</code> or full ISO 8601 timestamps</li>
+          <li><code>event_limit</code>: optional max number of events returned, default <code>20</code></li>
+          <li><code>breakout_lookback</code>: optional prior-bar lookback for breakout and breakdown rules, default <code>20</code></li>
+          <li><code>buffer_pct</code>: optional breakout and breakdown buffer, default <code>0.0025</code></li>
+          <li><code>volume_confirmation</code>: optional boolean, default <code>true</code></li>
+          <li><code>volume_multiple</code>: optional volume confirmation threshold, default <code>1.5</code></li>
+        </ul>
+
+        <h2>Analytics Outputs</h2>
+        <p>The state payload includes returns, moving averages, EMA, RSI, MACD, ATR, realized volatility, range positioning, volume metrics, normalized strengths, regime labels, signal flags, and data quality metadata. Nulls are returned for values that cannot be computed yet from short history.</p>
+
+        <h2>Event Types</h2>
+        <p>Possible event types include <code>breakout</code>, <code>breakdown</code>, price crosses vs. <code>SMA 20/50/200</code>, <code>macd_bullish_cross</code>, <code>macd_bearish_cross</code>, <code>rsi_enters_overbought</code>, <code>rsi_enters_oversold</code>, <code>new_high_20</code>, <code>new_low_20</code>, <code>new_high_55</code>, <code>new_low_55</code>, <code>volume_spike</code>, and <code>volatility_spike</code>.</p>
+
         <h2>GET /api/stocks</h2>
         <p>Returns the latest stored row per stock from PostgreSQL. Optional query parameters: <code>symbol</code> and <code>limit</code>.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/stocks"
@@ -2157,6 +2389,10 @@ curl -s "http://127.0.0.1:5000/api/stocks?limit=10"</code></pre>
 <pre><code>curl -X POST http://127.0.0.1:5000/api/chart/AAPL/sync \
   -H "Content-Type: application/json" \
   -d '{"timeframe":"1Day"}'</code></pre>
+
+        <h2>GET /api/chart/&lt;symbol&gt;/latest</h2>
+        <p>Returns the latest quote, latest cached bar, and sync metadata for a symbol.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/chart/AAPL/latest?timeframe=1Day"</code></pre>
 
         <h2>Fields</h2>
         <ul>
