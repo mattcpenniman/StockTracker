@@ -1,0 +1,35 @@
+services:
+  app:
+    build: .
+    container_name: stock-tracker-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 5000
+      DATABASE_URL: postgresql://stock_user:stock_pass@postgres:5432/stock_tracker
+    ports:
+      - "${PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: stock-tracker-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stock_tracker
+      POSTGRES_USER: stock_user
+      POSTGRES_PASSWORD: stock_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stock_user -d stock_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
