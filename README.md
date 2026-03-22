@@ -174,7 +174,7 @@ Returned state JSON includes:
 - Trend: `sma_20`, `sma_50`, `sma_200`, `ema_12`, `ema_26`, `sma20_slope`, `sma50_slope`
 - Momentum: `rsi_14`, `macd`, `macd_signal`, `macd_hist`
 - Volatility: `atr_14`, `stddev_20`, `realized_vol_20`, `volatility_ratio`
-- Range and positioning: `high_20`, `low_20`, `high_55`, `low_55`, distance-from-range and distance-from-mean metrics, `range_position_20`
+- Range and positioning: `high_20`, `low_20`, `high_55`, `low_55`, explicit percentage fields such as `distance_from_high_20_pct`, and `range_position_20_pct`
 - Volume: `avg_volume_20`, `volume_ratio_20`, `volume_anomaly`
 - Normalized metrics: `breakout_strength`, `breakdown_strength`, `trend_strength`, `extension_from_mean`, `volume_zscore`, `return_zscore`
 
@@ -256,12 +256,12 @@ The event feed returns timestamped, deterministic events such as:
     "low_20": 395.5,
     "high_55": 481.9,
     "low_55": 352.3,
-    "distance_from_high_20": -0.0043,
-    "distance_from_low_20": 0.1229,
-    "distance_from_sma_20": 0.0309,
-    "distance_from_sma_50": 0.0826,
-    "distance_from_sma_200": 0.6067,
-    "range_position_20": 0.9624
+    "distance_from_high_20_pct": -0.0043,
+    "distance_from_low_20_pct": 0.1229,
+    "distance_from_sma_20_pct": 0.0309,
+    "distance_from_sma_50_pct": 0.0826,
+    "distance_from_sma_200_pct": 0.6067,
+    "range_position_20_pct": 0.9624
   },
   "volume": {
     "avg_volume_20": 42150600.0,
@@ -323,7 +323,7 @@ The event feed returns timestamped, deterministic events such as:
 - Sync freshness comes from `symbol_sync_state`
 - The analytics layer reads stored bars only; it does not trigger new ingestion
 - Timestamps are emitted as UTC ISO 8601 strings
-- `distance_from_*` values are percentage distances, not raw dollar distances
+- `distance_from_*_pct` and `range_position_20_pct` are percentage-style values, not raw dollar distances
 
 ### Known limits
 

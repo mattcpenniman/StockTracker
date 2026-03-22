@@ -2355,7 +2355,7 @@ curl -s "http://127.0.0.1:5000/api/events/NVDA/1Day?asof=2023-09-20&volume_multi
         </ul>
 
         <h2>Analytics Outputs</h2>
-        <p>The state payload includes returns, moving averages, EMA, RSI, MACD, ATR, realized volatility, range positioning, volume metrics, normalized strengths, regime labels, signal flags, and data quality metadata. Nulls are returned for values that cannot be computed yet from short history.</p>
+        <p>The state payload includes returns, moving averages, EMA, RSI, MACD, ATR, realized volatility, range positioning, volume metrics, normalized strengths, regime labels, signal flags, and data quality metadata. Percentage-style fields use a <code>_pct</code> suffix, and nulls are returned for values that cannot be computed yet from short history.</p>
 
         <h2>Event Types</h2>
         <p>Possible event types include <code>breakout</code>, <code>breakdown</code>, price crosses vs. <code>SMA 20/50/200</code>, <code>macd_bullish_cross</code>, <code>macd_bearish_cross</code>, <code>rsi_enters_overbought</code>, <code>rsi_enters_oversold</code>, <code>new_high_20</code>, <code>new_low_20</code>, <code>new_high_55</code>, <code>new_low_55</code>, <code>volume_spike</code>, and <code>volatility_spike</code>.</p>
