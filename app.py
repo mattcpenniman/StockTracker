@@ -1546,6 +1546,7 @@ def chart_page(symbol: str) -> Response:
         <div class="card">
           <div id="chart-summary" class="muted">Loading chart data...</div>
           <div id="range-summary" class="chart-help">Preparing chart viewport...</div>
+          <div id="hover-summary" class="chart-help">Hover over the chart to inspect a bar.</div>
           <div class="canvas-wrap">
             <canvas id="chart" width="960" height="380"></canvas>
           </div>
@@ -1569,8 +1570,8 @@ def chart_page(symbol: str) -> Response:
               <div class="stat-value" id="latest-quote">-</div>
             </div>
             <div class="stat">
-              <span class="stat-label">Latest Bar</span>
-              <div class="stat-value" id="latest-bar-time">-</div>
+              <span class="stat-label">Chart Last Bar</span>
+              <div class="stat-value" id="chart-last-bar-time">-</div>
             </div>
           </div>
 
@@ -1595,6 +1596,8 @@ def chart_page(symbol: str) -> Response:
       let WINDOW_SIZE = 0;
       let CURRENT_TIMEFRAME = '1Day';
       let DRAG_STATE = null;
+      let HOVER_INDEX = null;
+      let LAST_DRAW_STATE = null;
 
       function fmtDate(value) {{
         if (!value) return '-';
@@ -1615,6 +1618,7 @@ def chart_page(symbol: str) -> Response:
 
       function clearCanvas() {{
         ctx.clearRect(0, 0, canvas.width, canvas.height);
+        LAST_DRAW_STATE = null;
         ctx.fillStyle = '#9fb0c0';
         ctx.font = '16px Georgia';
         ctx.fillText('No chart data yet', 24, 40);
@@ -1670,6 +1674,15 @@ def chart_page(symbol: str) -> Response:
         return ALL_BARS.slice(start, VIEW_END);
       }}
 
+      function clampHoverIndex(bars) {{
+        if (!bars.length) {{
+          HOVER_INDEX = null;
+          return;
+        }}
+        if (HOVER_INDEX == null) return;
+        HOVER_INDEX = Math.max(0, Math.min(HOVER_INDEX, bars.length - 1));
+      }}
+
       function drawChart(bars) {{
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         if (!bars.length) {{
@@ -1689,6 +1702,11 @@ def chart_page(symbol: str) -> Response:
         const w = canvas.width - padLeft - padRight;
         const h = canvas.height - padTop - padBottom;
         const range = Math.max(max - min, 0.0001);
+        const pointX = (idx) => padLeft + ((bars.length === 1 ? 0.5 : idx / (bars.length - 1)) * w);
+        const pointY = (value) => padTop + ((max - value) / range) * h;
+
+        clampHoverIndex(bars);
+        LAST_DRAW_STATE = {{ bars, padLeft, padRight, padTop, padBottom, w, h, max, min, range, pointX, pointY }};
 
         ctx.strokeStyle = 'rgba(159, 176, 192, 0.18)';
         ctx.lineWidth = 1;
@@ -1711,8 +1729,8 @@ def chart_page(symbol: str) -> Response:
 
         ctx.beginPath();
         closes.forEach((value, idx) => {{
-          const x = padLeft + ((bars.length === 1 ? 0.5 : idx / (bars.length - 1)) * w);
-          const y = padTop + ((max - value) / range) * h;
+          const x = pointX(idx);
+          const y = pointY(value);
           if (idx === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         }});
@@ -1731,7 +1749,7 @@ def chart_page(symbol: str) -> Response:
             bars.length - 1,
             Math.round((bars.length - 1) * (labelCount === 1 ? 0 : tick / (labelCount - 1)))
           );
-          const x = padLeft + ((bars.length === 1 ? 0.5 : idx / (bars.length - 1)) * w);
+          const x = pointX(idx);
           const label = formatAxisLabel(bars[idx].t);
           const labelWidth = ctx.measureText(label).width;
           ctx.fillText(
@@ -1739,6 +1757,42 @@ def chart_page(symbol: str) -> Response:
             Math.max(padLeft, Math.min(x - (labelWidth / 2), canvas.width - padRight - labelWidth)),
             canvas.height - 12
           );
+        }}
+
+        if (HOVER_INDEX != null && bars[HOVER_INDEX]) {{
+          const hovered = bars[HOVER_INDEX];
+          const hoverX = pointX(HOVER_INDEX);
+          const hoverY = pointY(Number(hovered.c));
+
+          ctx.strokeStyle = 'rgba(215, 240, 255, 0.55)';
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(hoverX, padTop);
+          ctx.lineTo(hoverX, canvas.height - padBottom);
+          ctx.moveTo(padLeft, hoverY);
+          ctx.lineTo(canvas.width - padRight, hoverY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          ctx.fillStyle = '#d7f0ff';
+          ctx.beginPath();
+          ctx.arc(hoverX, hoverY, 4, 0, Math.PI * 2);
+          ctx.fill();
+
+          const tooltipDate = formatAxisLabel(hovered.t);
+          const tooltipPrice = fmtPrice(hovered.c);
+          const tooltipText = `${{tooltipDate}}  Close ${{tooltipPrice}}`;
+          ctx.font = '12px Georgia';
+          const tooltipWidth = ctx.measureText(tooltipText).width + 18;
+          const tooltipHeight = 24;
+          const tooltipX = Math.min(canvas.width - padRight - tooltipWidth, Math.max(padLeft, hoverX + 12));
+          const tooltipY = Math.max(padTop + 4, hoverY - 30);
+          ctx.fillStyle = 'rgba(7, 17, 28, 0.92)';
+          ctx.fillRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
+          ctx.strokeStyle = 'rgba(124, 196, 255, 0.45)';
+          ctx.strokeRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
+          ctx.fillStyle = '#d7f0ff';
+          ctx.fillText(tooltipText, tooltipX + 9, tooltipY + 16);
         }}
       }}
 
@@ -1749,14 +1803,19 @@ def chart_page(symbol: str) -> Response:
 
         const lastBar = visibleBars.length ? visibleBars[visibleBars.length - 1] : null;
         const firstBar = visibleBars.length ? visibleBars[0] : null;
+        const hoveredBar = (HOVER_INDEX != null && visibleBars[HOVER_INDEX]) ? visibleBars[HOVER_INDEX] : null;
         document.getElementById('chart-summary').textContent = visibleBars.length
           ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}}.`
           : `No ${{CURRENT_TIMEFRAME}} bars stored for ${{SYMBOL}}.`;
         document.getElementById('range-summary').textContent = visibleBars.length
           ? `Viewport: ${{formatAxisLabel(firstBar.t)}} to ${{formatAxisLabel(lastBar.t)}}`
           : 'No viewport available yet.';
+        document.getElementById('hover-summary').textContent = hoveredBar
+          ? `Hovered bar: ${{fmtDate(hoveredBar.t)}} | Close $${{fmtPrice(hoveredBar.c)}} | High $${{fmtPrice(hoveredBar.h)}} | Low $${{fmtPrice(hoveredBar.l)}}`
+          : 'Hover over the chart to inspect a bar.';
         document.getElementById('last-close').textContent = lastBar ? fmtPrice(lastBar.c) : '-';
         document.getElementById('bar-count').textContent = String(ALL_BARS.length);
+        document.getElementById('chart-last-bar-time').textContent = lastBar ? fmtDate(lastBar.t) : '-';
       }}
 
       function applyPayload(payload) {{
@@ -1769,7 +1828,6 @@ def chart_page(symbol: str) -> Response:
         document.getElementById('latest-quote').textContent = payload.latest_quote
           ? `${{fmtPrice(payload.latest_quote.bid_price)}} / ${{fmtPrice(payload.latest_quote.ask_price)}}`
           : '-';
-        document.getElementById('latest-bar-time').textContent = payload.latest_bar ? fmtDate(payload.latest_bar.t) : '-';
 
         const sync = payload.sync_state || {{}};
         document.getElementById('last-synced').textContent = fmtDate(sync.last_synced_at);
@@ -1867,8 +1925,21 @@ def chart_page(symbol: str) -> Response:
         canvas.addEventListener('mousedown', (event) => {{
           DRAG_STATE = {{ startX: event.clientX, startViewEnd: VIEW_END }};
         }});
+        canvas.addEventListener('mouseleave', () => {{
+          HOVER_INDEX = null;
+          renderViewport();
+        }});
         window.addEventListener('mouseup', () => {{
           DRAG_STATE = null;
+        }});
+        canvas.addEventListener('mousemove', (event) => {{
+          if (DRAG_STATE || !LAST_DRAW_STATE || !LAST_DRAW_STATE.bars.length) return;
+          const rect = canvas.getBoundingClientRect();
+          const x = (event.clientX - rect.left) * (canvas.width / Math.max(rect.width, 1));
+          const relative = (x - LAST_DRAW_STATE.padLeft) / Math.max(LAST_DRAW_STATE.w, 1);
+          const idx = Math.round(relative * Math.max(LAST_DRAW_STATE.bars.length - 1, 0));
+          HOVER_INDEX = Math.max(0, Math.min(LAST_DRAW_STATE.bars.length - 1, idx));
+          renderViewport();
         }});
         window.addEventListener('mousemove', (event) => {{
           if (!DRAG_STATE || !ALL_BARS.length) return;
