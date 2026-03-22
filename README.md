@@ -212,6 +212,13 @@ The event feed returns timestamped, deterministic events such as:
   "symbol": "NVDA",
   "timeframe": "1Day",
   "as_of": "2023-09-20T00:00:00Z",
+  "state": {
+    "trend": "uptrend",
+    "momentum": "bullish",
+    "volatility": "moderate",
+    "position_in_range": "near_high",
+    "signal_bias": "bullish"
+  },
   "price": {
     "open": 440.0,
     "high": 445.2,

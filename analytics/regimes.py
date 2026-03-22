@@ -32,3 +32,43 @@ def classify_volatility_regime(row: pd.Series, settings: AnalyticsSettings) -> s
             return "high"
     return "moderate"
 
+
+def classify_position_in_range(row: pd.Series) -> str:
+    position = row.get("range_position_20")
+    if pd.isna(position):
+        return "unknown"
+    if position <= 0.2:
+        return "near_low"
+    if position >= 0.8:
+        return "near_high"
+    return "mid_range"
+
+
+def classify_signal_bias(row: pd.Series, settings: AnalyticsSettings) -> str:
+    breakout = bool(row.get("is_breakout")) if pd.notna(row.get("is_breakout")) else False
+    breakdown = bool(row.get("is_breakdown")) if pd.notna(row.get("is_breakdown")) else False
+    trend = classify_trend_regime(row)
+    momentum = classify_momentum_regime(row)
+
+    if breakout and momentum == "bullish":
+        return "strong_bullish"
+    if breakdown and momentum == "bearish":
+        return "strong_bearish"
+
+    if trend == "uptrend" and momentum == "bullish":
+        return "bullish"
+    if trend == "downtrend" and momentum == "bearish":
+        return "bearish"
+
+    trend_strength = row.get("trend_strength")
+    if pd.notna(trend_strength) and pd.notna(row.get("atr_14")):
+        if trend_strength >= 0.5:
+            return "weak_bullish"
+        if trend_strength <= -0.5:
+            return "weak_bearish"
+
+    if momentum == "bullish":
+        return "weak_bullish"
+    if momentum == "bearish":
+        return "weak_bearish"
+    return "neutral"

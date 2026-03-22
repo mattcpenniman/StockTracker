@@ -8,7 +8,13 @@ import pandas as pd
 
 from analytics.config import AnalyticsSettings
 from analytics.indicators import compute_feature_frame
-from analytics.regimes import classify_momentum_regime, classify_trend_regime, classify_volatility_regime
+from analytics.regimes import (
+    classify_momentum_regime,
+    classify_position_in_range,
+    classify_signal_bias,
+    classify_trend_regime,
+    classify_volatility_regime,
+)
 from analytics.serializers import serialize_events
 from analytics.service import AnalyticsService
 from analytics.signals import compute_signal_columns, generate_events
@@ -111,12 +117,19 @@ class RegimeTests(unittest.TestCase):
                 "rsi_14": 60.0,
                 "macd_hist": 0.5,
                 "volatility_ratio": 1.8,
+                "range_position_20": 0.1,
+                "is_breakout": False,
+                "is_breakdown": False,
+                "trend_strength": -0.8,
+                "atr_14": 2.0,
             }
         )
         settings = AnalyticsSettings()
         self.assertEqual(classify_trend_regime(row), "uptrend")
         self.assertEqual(classify_momentum_regime(row), "bullish")
         self.assertEqual(classify_volatility_regime(row, settings), "high")
+        self.assertEqual(classify_position_in_range(row), "near_low")
+        self.assertEqual(classify_signal_bias(row, settings), "bullish")
 
 
 class SerializationTests(unittest.TestCase):
@@ -158,6 +171,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["symbol"], "NVDA")
         self.assertEqual(payload["timeframe"], "1Day")
         self.assertEqual(payload["trend"]["regime"], "uptrend")
+        self.assertEqual(payload["state"]["trend"], "uptrend")
+        self.assertIn("signal_bias", payload["state"])
         self.assertTrue(payload["data_quality"]["has_sufficient_history_200"])
 
 

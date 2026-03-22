@@ -2290,6 +2290,13 @@ curl -s "http://127.0.0.1:5000/api/state/NVDA/1Day?breakout_lookback=55&buffer_p
   "symbol": "NVDA",
   "timeframe": "1Day",
   "as_of": "2023-09-20T00:00:00Z",
+  "state": {
+    "trend": "uptrend",
+    "momentum": "bullish",
+    "volatility": "moderate",
+    "position_in_range": "near_high",
+    "signal_bias": "bullish"
+  },
   "trend": {
     "regime": "uptrend",
     "trend_strength": 2.48

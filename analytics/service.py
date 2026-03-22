@@ -8,7 +8,13 @@ import pandas as pd
 from .config import AnalyticsSettings
 from .data_access import AnalyticsRepository
 from .indicators import compute_feature_frame, latest_price_payload, sufficiency_flags
-from .regimes import classify_momentum_regime, classify_trend_regime, classify_volatility_regime
+from .regimes import (
+    classify_momentum_regime,
+    classify_position_in_range,
+    classify_signal_bias,
+    classify_trend_regime,
+    classify_volatility_regime,
+)
 from .serializers import serialize_events, serialize_state_payload, serialize_symbol_metadata
 from .signals import compute_signal_columns, generate_events, latest_signal_payload
 from .utils import clean_json_value, isoformat_utc
@@ -104,6 +110,11 @@ class AnalyticsService:
 
         features = compute_signal_columns(compute_feature_frame(bars, timeframe, settings), settings)
         latest = features.iloc[-1]
+        trend_regime = classify_trend_regime(latest)
+        momentum_regime = classify_momentum_regime(latest)
+        volatility_regime = classify_volatility_regime(latest, settings)
+        position_in_range = classify_position_in_range(latest)
+        signal_bias = classify_signal_bias(latest, settings)
         quality = sufficiency_flags(features)
         quality.update(
             {
@@ -115,6 +126,13 @@ class AnalyticsService:
         )
 
         sections = {
+            "state": {
+                "trend": trend_regime,
+                "momentum": momentum_regime,
+                "volatility": volatility_regime,
+                "position_in_range": position_in_range,
+                "signal_bias": signal_bias,
+            },
             "price": latest_price_payload(latest),
             "returns": {
                 "r_1": latest.get("return_1"),
@@ -131,7 +149,7 @@ class AnalyticsService:
                 "ema_26": latest.get("ema_26"),
                 "sma20_slope": latest.get("sma20_slope"),
                 "sma50_slope": latest.get("sma50_slope"),
-                "regime": classify_trend_regime(latest),
+                "regime": trend_regime,
                 "trend_strength": latest.get("trend_strength"),
             },
             "momentum": {
@@ -139,14 +157,14 @@ class AnalyticsService:
                 "macd": latest.get("macd"),
                 "macd_signal": latest.get("macd_signal"),
                 "macd_hist": latest.get("macd_hist"),
-                "regime": classify_momentum_regime(latest),
+                "regime": momentum_regime,
             },
             "volatility": {
                 "atr_14": latest.get("atr_14"),
                 "stddev_20": latest.get("stddev_20"),
                 "realized_vol_20": latest.get("realized_vol_20"),
                 "volatility_ratio": latest.get("volatility_ratio"),
-                "regime": classify_volatility_regime(latest, settings),
+                "regime": volatility_regime,
             },
             "range": {
                 "high_20": latest.get("high_20"),
