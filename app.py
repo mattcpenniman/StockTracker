@@ -2371,7 +2371,7 @@ curl -s "http://127.0.0.1:5000/api/events/NVDA/1Day?asof=2023-09-20&volume_multi
 }</code></pre>
 
         <h2>GET /api/futurestate/&lt;symbol&gt;</h2>
-        <p>Returns realized forward max price, min price, and end-of-window price from an <code>asof</code> anchor. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameter: <code>timeframe</code>.</p>
+        <p>Returns realized forward max price, min price, and end-of-window price from an <code>asof</code> anchor using the next <code>N</code> future bars. For <code>1Day</code>, <code>days</code> means trading days rather than calendar days. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameter: <code>timeframe</code>.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/futurestate/NVDA?timeframe=1D&asof=2023-09-20&days=20"
 curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:00Z&days=5"</code></pre>
 

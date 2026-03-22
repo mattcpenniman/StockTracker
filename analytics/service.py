@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from datetime import timedelta
 from typing import Any
 
 import pandas as pd
@@ -255,14 +254,17 @@ class AnalyticsService:
         anchor_bar = anchor_bars.iloc[-1]
         anchor_timestamp = anchor_bar["timestamp"]
         anchor_close = float(anchor_bar["close"])
-        target_end = anchor_timestamp + timedelta(days=days)
-
-        future_bars = self.repository.fetch_bars(
+        future_bars_all = self.repository.fetch_bars(
             context["symbol_id"],
             timeframe,
-            asof=target_end,
             start=anchor_timestamp + pd.Timedelta(microseconds=1),
         )
+        if future_bars_all.empty:
+            raise AnalyticsNotFoundError(
+                f"No future bars available for symbol '{context['symbol']}' on timeframe '{timeframe}' for the requested window."
+            )
+
+        future_bars = future_bars_all.head(days).copy()
         if future_bars.empty:
             raise AnalyticsNotFoundError(
                 f"No future bars available for symbol '{context['symbol']}' on timeframe '{timeframe}' for the requested window."
@@ -273,6 +275,7 @@ class AnalyticsService:
         low_idx = future_bars["low"].idxmin()
         max_bar = future_bars.loc[high_idx]
         min_bar = future_bars.loc[low_idx]
+        complete_window = len(future_bars) == days
 
         payload = clean_json_value(
             {
@@ -285,9 +288,11 @@ class AnalyticsService:
                     "timestamp": anchor_timestamp,
                 },
                 "window": {
-                    "target_end_timestamp": target_end,
-                    "realized_end_timestamp": end_bar["timestamp"],
+                    "requested_future_bar_count": days,
                     "future_bar_count": len(future_bars),
+                    "complete_window": complete_window,
+                    "target_end_timestamp": future_bars.iloc[days - 1]["timestamp"] if complete_window else None,
+                    "realized_end_timestamp": end_bar["timestamp"],
                 },
                 "future_state": {
                     "max_price": float(max_bar["high"]),

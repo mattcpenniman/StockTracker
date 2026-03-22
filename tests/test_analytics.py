@@ -198,12 +198,22 @@ class ServiceTests(unittest.TestCase):
         anchor_and_history = _fixture_bars(30)
         future = pd.DataFrame(
             {
-                "timestamp": pd.date_range("2023-01-31", periods=5, freq="D", tz="UTC"),
-                "open": [130.0, 131.0, 132.0, 133.0, 134.0],
-                "high": [132.0, 140.0, 136.0, 137.0, 138.0],
-                "low": [129.0, 128.0, 127.0, 130.0, 133.0],
-                "close": [131.0, 135.0, 133.0, 136.0, 137.0],
-                "volume": [1000.0] * 5,
+                "timestamp": pd.to_datetime(
+                    [
+                        "2023-01-31T00:00:00Z",
+                        "2023-02-01T00:00:00Z",
+                        "2023-02-02T00:00:00Z",
+                        "2023-02-03T00:00:00Z",
+                        "2023-02-06T00:00:00Z",
+                        "2023-02-07T00:00:00Z",
+                    ],
+                    utc=True,
+                ),
+                "open": [130.0, 131.0, 132.0, 133.0, 134.0, 135.0],
+                "high": [132.0, 140.0, 136.0, 137.0, 138.0, 150.0],
+                "low": [129.0, 128.0, 127.0, 130.0, 133.0, 132.0],
+                "close": [131.0, 135.0, 133.0, 136.0, 137.0, 149.0],
+                "volume": [1000.0] * 6,
             }
         )
         repo.fetch_bars.side_effect = [anchor_and_history, future]
@@ -216,6 +226,10 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["future_state"]["min_price"], 127.0)
         self.assertEqual(payload["future_state"]["price_at_horizon"], 137.0)
         self.assertAlmostEqual(payload["future_state"]["max_return_pct"], (140.0 / 129.0) - 1.0, places=6)
+        self.assertEqual(payload["window"]["future_bar_count"], 5)
+        self.assertTrue(payload["window"]["complete_window"])
+        self.assertEqual(payload["future_state"]["price_at_horizon_timestamp"], "2023-02-06T00:00:00Z")
+        self.assertEqual(payload["window"]["target_end_timestamp"], "2023-02-06T00:00:00Z")
 
 
 if __name__ == "__main__":

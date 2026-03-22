@@ -80,8 +80,8 @@ Optional migration env vars:
 - `POST /api/state/batch` - analytics state JSON for many symbols
 - `GET /api/events/<symbol>` - recent deterministic event JSON for one symbol
 - `GET /api/events/<symbol>/<timeframe>` - event JSON for an explicit timeframe
-- `GET /api/futurestate/<symbol>` - realized future max/min/end price window from an `asof` date
-- `GET /api/futurestate/<symbol>/<timeframe>` - realized future window for an explicit timeframe
+- `GET /api/futurestate/<symbol>` - realized future max/min/end price window from an `asof` date using the next N future bars
+- `GET /api/futurestate/<symbol>/<timeframe>` - realized future window for an explicit timeframe using the next N future bars
 - `GET /api/metadata/<symbol>` - symbol metadata + sync freshness JSON
 - `GET /api/health/analytics` - analytics health check
 - `GET /export` - download current stock data as CSV
@@ -365,10 +365,10 @@ The event feed returns timestamped, deterministic events such as:
 ### Future-state rules
 
 - `asof` is required and anchors the calculation on the latest stored bar at or before that timestamp
-- `days` is required and defines the forward-looking calendar-day window
+- `days` is required and defines the number of future bars to evaluate; for `1Day` this means trading days, not calendar days
 - `max_price` uses the maximum future `high` inside the window
 - `min_price` uses the minimum future `low` inside the window
-- `price_at_horizon` uses the close of the last stored bar on or before the target end timestamp
+- `price_at_horizon` uses the close of the Nth future bar in the realized window
 - all `*_pct` values are relative to the anchor close at `asof`
 
 ### Assumptions
