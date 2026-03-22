@@ -133,6 +133,7 @@ def compute_feature_frame(
 
 def latest_price_payload(row: pd.Series) -> dict:
     return {
+        "timestamp": row.get("timestamp"),
         "open": row["open"],
         "high": row["high"],
         "low": row["low"],

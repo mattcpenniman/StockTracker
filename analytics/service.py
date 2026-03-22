@@ -73,6 +73,18 @@ class AnalyticsService:
             settings.cache_key(),
         )
 
+    def _preferred_price_timeframe(self, requested_timeframe: str, asof_dt) -> str:
+        if requested_timeframe != "1Day" or asof_dt is None:
+            return requested_timeframe
+
+        timestamp = pd.Timestamp(asof_dt)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+
+        if timestamp.hour == 0 and timestamp.minute == 0 and timestamp.second == 0 and timestamp.microsecond == 0:
+            return requested_timeframe
+        return "15Min"
+
     def _load_feature_frame(
         self,
         symbol: str,
@@ -103,28 +115,77 @@ class AnalyticsService:
         if cached is not None:
             return cached
 
-        bars = self.repository.fetch_bars(context["symbol_id"], timeframe, asof_dt)
+        indicator_timeframe = "1Day"
+        price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
+        bars = self.repository.fetch_bars(context["symbol_id"], indicator_timeframe, asof_dt)
         if bars.empty:
             raise AnalyticsNotFoundError(
-                f"No bars available for symbol '{context['symbol']}' on timeframe '{timeframe}'."
+                f"No bars available for symbol '{context['symbol']}' on timeframe '{indicator_timeframe}'."
             )
 
-        features = compute_signal_columns(compute_feature_frame(bars, timeframe, settings), settings)
+        features = compute_signal_columns(compute_feature_frame(bars, indicator_timeframe, settings), settings)
         latest = features.iloc[-1]
+        anchor_bar = latest
+        if price_timeframe != indicator_timeframe:
+            anchor_bars = self.repository.fetch_bars(context["symbol_id"], price_timeframe, asof_dt)
+            if anchor_bars.empty:
+                price_timeframe = indicator_timeframe
+            else:
+                anchor_bar = anchor_bars.iloc[-1]
+
+        anchor_timestamp = anchor_bar["timestamp"]
+        anchor_close = float(anchor_bar["close"])
         trend_regime = classify_trend_regime(latest)
         momentum_regime = classify_momentum_regime(latest)
         volatility_regime = classify_volatility_regime(latest, settings)
-        position_in_range = classify_position_in_range(latest)
-        signal_bias = classify_signal_bias(latest, settings)
         quality = sufficiency_flags(features)
         quality.update(
             {
-                "last_bar_timestamp": latest["timestamp"],
+                "last_bar_timestamp": anchor_timestamp,
+                "indicator_bar_timestamp": latest["timestamp"],
+                "price_bar_timestamp": anchor_timestamp,
+                "indicator_source_timeframe": indicator_timeframe,
+                "price_source_timeframe": price_timeframe,
                 "last_sync_timestamp": context.get("last_synced_at"),
                 "sync_status": context.get("sync_status"),
                 "sync_error": context.get("sync_error"),
             }
         )
+
+        volume_confirmed = bool(latest.get("volume_ratio_20") >= settings.volume_multiple) if pd.notna(latest.get("volume_ratio_20")) else False
+        breakout_level = latest.get("breakout_level")
+        breakdown_level = latest.get("breakdown_level")
+        atr_14 = latest.get("atr_14")
+        high_20 = latest.get("high_20")
+        low_20 = latest.get("low_20")
+        sma_20 = latest.get("sma_20")
+        sma_50 = latest.get("sma_50")
+        sma_200 = latest.get("sma_200")
+        range_span = (high_20 - low_20) if pd.notna(high_20) and pd.notna(low_20) else None
+
+        breakout_strength = ((anchor_close - breakout_level) / atr_14) if pd.notna(breakout_level) and pd.notna(atr_14) and atr_14 not in (0, 0.0) else None
+        breakdown_strength = ((breakdown_level - anchor_close) / atr_14) if pd.notna(breakdown_level) and pd.notna(atr_14) and atr_14 not in (0, 0.0) else None
+        extension_from_mean = ((anchor_close - sma_20) / atr_14) if pd.notna(sma_20) and pd.notna(atr_14) and atr_14 not in (0, 0.0) else None
+        distance_from_high_20_pct = ((anchor_close / high_20) - 1.0) if pd.notna(high_20) and high_20 not in (0, 0.0) else None
+        distance_from_low_20_pct = ((anchor_close / low_20) - 1.0) if pd.notna(low_20) and low_20 not in (0, 0.0) else None
+        distance_from_sma_20_pct = ((anchor_close / sma_20) - 1.0) if pd.notna(sma_20) and sma_20 not in (0, 0.0) else None
+        distance_from_sma_50_pct = ((anchor_close / sma_50) - 1.0) if pd.notna(sma_50) and sma_50 not in (0, 0.0) else None
+        distance_from_sma_200_pct = ((anchor_close / sma_200) - 1.0) if pd.notna(sma_200) and sma_200 not in (0, 0.0) else None
+        range_position_20_pct = ((anchor_close - low_20) / range_span) if range_span not in (None, 0, 0.0) else None
+        above_sma20 = bool(anchor_close > sma_20) if pd.notna(sma_20) else False
+        above_sma50 = bool(anchor_close > sma_50) if pd.notna(sma_50) else False
+        above_sma200 = bool(anchor_close > sma_200) if pd.notna(sma_200) else False
+        is_breakout = bool(anchor_close > breakout_level) if pd.notna(breakout_level) else False
+        is_breakdown = bool(anchor_close < breakdown_level) if pd.notna(breakdown_level) else False
+        if settings.volume_confirmation:
+            is_breakout = is_breakout and volume_confirmed
+            is_breakdown = is_breakdown and volume_confirmed
+        anchor_classification_row = latest.copy()
+        anchor_classification_row["range_position_20"] = range_position_20_pct
+        anchor_classification_row["is_breakout"] = is_breakout
+        anchor_classification_row["is_breakdown"] = is_breakdown
+        position_in_range = classify_position_in_range(anchor_classification_row)
+        signal_bias = classify_signal_bias(anchor_classification_row, settings)
 
         sections = {
             "state": {
@@ -134,7 +195,10 @@ class AnalyticsService:
                 "position_in_range": position_in_range,
                 "signal_bias": signal_bias,
             },
-            "price": latest_price_payload(latest),
+            "price": {
+                **latest_price_payload(anchor_bar),
+                "source_timeframe": price_timeframe,
+            },
             "returns": {
                 "r_1": latest.get("return_1"),
                 "r_5": latest.get("return_5"),
@@ -172,22 +236,34 @@ class AnalyticsService:
                 "low_20": latest.get("low_20"),
                 "high_55": latest.get("high_55"),
                 "low_55": latest.get("low_55"),
-                "distance_from_high_20_pct": latest.get("distance_from_high_20"),
-                "distance_from_low_20_pct": latest.get("distance_from_low_20"),
-                "distance_from_sma_20_pct": latest.get("distance_from_sma_20"),
-                "distance_from_sma_50_pct": latest.get("distance_from_sma_50"),
-                "distance_from_sma_200_pct": latest.get("distance_from_sma_200"),
-                "range_position_20_pct": latest.get("range_position_20"),
+                "distance_from_high_20_pct": distance_from_high_20_pct,
+                "distance_from_low_20_pct": distance_from_low_20_pct,
+                "distance_from_sma_20_pct": distance_from_sma_20_pct,
+                "distance_from_sma_50_pct": distance_from_sma_50_pct,
+                "distance_from_sma_200_pct": distance_from_sma_200_pct,
+                "range_position_20_pct": range_position_20_pct,
             },
             "volume": {
                 "avg_volume_20": latest.get("avg_volume_20"),
                 "volume_ratio_20": latest.get("volume_ratio_20"),
                 "volume_anomaly": bool(latest.get("volume_anomaly")) if pd.notna(latest.get("volume_anomaly")) else False,
             },
-            "signals": latest_signal_payload(latest),
+            "signals": {
+                **latest_signal_payload(latest),
+                "is_breakout": is_breakout,
+                "is_breakdown": is_breakdown,
+                "breakout_strength": breakout_strength,
+                "breakdown_strength": breakdown_strength,
+                "above_sma20": above_sma20,
+                "above_sma50": above_sma50,
+                "above_sma200": above_sma200,
+                "extension_from_mean": extension_from_mean,
+            },
         }
 
-        payload = serialize_state_payload(context["symbol"], timeframe, latest, quality, sections)
+        latest_for_serialization = latest.copy()
+        latest_for_serialization["timestamp"] = anchor_timestamp
+        payload = serialize_state_payload(context["symbol"], timeframe, latest_for_serialization, quality, sections)
         self._state_cache.set(cache_key, payload)
         return payload
 

@@ -175,6 +175,100 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("signal_bias", payload["state"])
         self.assertTrue(payload["data_quality"]["has_sufficient_history_200"])
 
+    def test_intraday_asof_uses_daily_indicators_and_intraday_price(self) -> None:
+        repo = Mock()
+        repo.fetch_symbol_context.return_value = {
+            "symbol_id": 1,
+            "symbol": "NVDA",
+            "exchange": "NASDAQ",
+            "asset_class": "us_equity",
+            "name": "NVIDIA Corp",
+            "is_active": True,
+            "created_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "updated_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "last_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_successful_sync_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_quote_synced_at": None,
+            "last_bar_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_bar_time": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_quote_time": None,
+            "sync_status": "idle",
+            "sync_error": None,
+        }
+        daily_bars = _fixture_bars(260)
+        intraday_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2023-09-17T15:45:00Z", "2023-09-17T16:00:00Z"], utc=True),
+                "open": [360.0, 399.0],
+                "high": [361.0, 401.0],
+                "low": [359.0, 398.5],
+                "close": [360.5, 400.0],
+                "volume": [1000.0, 1200.0],
+            }
+        )
+        repo.fetch_bars.side_effect = [daily_bars, intraday_bars]
+        service = AnalyticsService(repository=repo)
+
+        payload = service.get_symbol_state("NVDA", "15Min", pd.Timestamp("2023-09-17T16:00:00Z"), AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))
+        expected_sma20 = daily_bars["close"].tail(20).mean()
+
+        self.assertEqual(payload["timeframe"], "15Min")
+        self.assertEqual(payload["price"]["close"], 400.0)
+        self.assertEqual(payload["price"]["open"], 399.0)
+        self.assertEqual(payload["price"]["high"], 401.0)
+        self.assertEqual(payload["price"]["low"], 398.5)
+        self.assertEqual(payload["price"]["timestamp"], "2023-09-17T16:00:00Z")
+        self.assertEqual(payload["price"]["source_timeframe"], "15Min")
+        self.assertEqual(payload["as_of"], "2023-09-17T16:00:00Z")
+        self.assertAlmostEqual(payload["trend"]["sma_20"], expected_sma20, places=6)
+        self.assertAlmostEqual(payload["range"]["distance_from_sma_20_pct"], (400.0 / expected_sma20) - 1.0, places=6)
+        self.assertEqual(payload["data_quality"]["indicator_source_timeframe"], "1Day")
+        self.assertEqual(payload["data_quality"]["price_source_timeframe"], "15Min")
+        self.assertEqual(payload["data_quality"]["indicator_bar_timestamp"], daily_bars.iloc[-1]["timestamp"].isoformat().replace("+00:00", "Z"))
+        self.assertEqual(payload["data_quality"]["price_bar_timestamp"], "2023-09-17T16:00:00Z")
+
+    def test_daily_request_with_intraday_asof_uses_15min_anchor_price(self) -> None:
+        repo = Mock()
+        repo.fetch_symbol_context.return_value = {
+            "symbol_id": 1,
+            "symbol": "NVDA",
+            "exchange": "NASDAQ",
+            "asset_class": "us_equity",
+            "name": "NVIDIA Corp",
+            "is_active": True,
+            "created_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "updated_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "last_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_successful_sync_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_quote_synced_at": None,
+            "last_bar_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_bar_time": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_quote_time": None,
+            "sync_status": "idle",
+            "sync_error": None,
+        }
+        daily_bars = _fixture_bars(260)
+        intraday_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2023-09-17T12:00:00Z", "2023-09-17T12:15:00Z"], utc=True),
+                "open": [360.0, 399.0],
+                "high": [361.0, 401.0],
+                "low": [359.0, 398.5],
+                "close": [360.5, 400.0],
+                "volume": [1000.0, 1200.0],
+            }
+        )
+        repo.fetch_bars.side_effect = [daily_bars, intraday_bars]
+        service = AnalyticsService(repository=repo)
+
+        payload = service.get_symbol_state("NVDA", "1Day", pd.Timestamp("2023-09-17T12:15:00Z"), AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))
+        self.assertEqual(payload["timeframe"], "1Day")
+        self.assertEqual(payload["price"]["close"], 400.0)
+        self.assertEqual(payload["price"]["source_timeframe"], "15Min")
+        self.assertEqual(payload["data_quality"]["indicator_source_timeframe"], "1Day")
+        self.assertEqual(payload["data_quality"]["price_source_timeframe"], "15Min")
+        self.assertEqual(payload["price"]["timestamp"], "2023-09-17T12:15:00Z")
+
     def test_service_builds_future_state_payload(self) -> None:
         repo = Mock()
         repo.fetch_symbol_context.return_value = {

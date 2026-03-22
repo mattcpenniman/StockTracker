@@ -134,6 +134,7 @@ The app now exposes a non-visual analytics layer over already-synced `stock_bars
 `GET /api/state/<symbol>`
 ```bash
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20"
+curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=15Min&asof=2023-09-20T15:45:00Z"
 ```
 
 `GET /api/events/<symbol>`
@@ -184,6 +185,8 @@ Returned state JSON includes:
 - Range and positioning: `high_20`, `low_20`, `high_55`, `low_55`, explicit percentage fields such as `distance_from_high_20_pct`, and `range_position_20_pct`
 - Volume: `avg_volume_20`, `volume_ratio_20`, `volume_anomaly`
 - Normalized metrics: `breakout_strength`, `breakdown_strength`, `trend_strength`, `extension_from_mean`, `volume_zscore`, `return_zscore`
+
+When `GET /api/state` is queried with an intraday timeframe such as `15Min`, the anchor price comes from that intraday bar at or before `asof`, while moving averages, regimes, RSI, MACD, ATR, and other indicator stacks remain based on daily bars. Price-sensitive fields like `distance_from_sma_*_pct`, `range_position_20_pct`, `above_sma*`, and `extension_from_mean` are recalculated from the intraday anchor price.
 
 ### Regime labels
 

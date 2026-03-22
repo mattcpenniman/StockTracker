@@ -2308,9 +2308,10 @@ def api_docs() -> Response:
         <p>These endpoints expose non-visual market state JSON built from already-synced OHLCV bars in PostgreSQL.</p>
 
         <h2>GET /api/state/&lt;symbol&gt;</h2>
-        <p>Returns current or backdated analytics state for one symbol. Optional query parameters: <code>timeframe</code>, <code>asof</code>, <code>breakout_lookback</code>, <code>buffer_pct</code>, <code>volume_confirmation</code>, <code>volume_multiple</code>.</p>
+        <p>Returns current or backdated analytics state for one symbol. Optional query parameters: <code>timeframe</code>, <code>asof</code>, <code>breakout_lookback</code>, <code>buffer_pct</code>, <code>volume_confirmation</code>, <code>volume_multiple</code>. If you request an intraday timeframe like <code>15Min</code>, the anchor price comes from the intraday bar at or before <code>asof</code> while moving averages and regimes still use daily bars.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/state/NVDA"
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20"
+curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=15Min&asof=2023-09-20T15:45:00Z"
 curl -s "http://127.0.0.1:5000/api/state/NVDA/1Day?breakout_lookback=55&buffer_pct=0.005"</code></pre>
 
 <pre><code>{
