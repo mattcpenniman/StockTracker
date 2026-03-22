@@ -65,7 +65,10 @@ ALPACA_API_KEY_ID = os.environ.get("APCA-API-KEY-ID") or os.environ.get("ALPACA_
 ALPACA_API_SECRET_KEY = os.environ.get("APCA-API-SECRET-KEY") or os.environ.get("ALPACA_API_SECRET_KEY")
 DEFAULT_CHART_TIMEFRAME = os.environ.get("CHART_DEFAULT_TIMEFRAME", "1Day")
 DEFAULT_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_LOOKBACK_DAYS", "180"))
+DAILY_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_DAILY_LOOKBACK_DAYS", "2555"))
+INTRADAY_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_INTRADAY_LOOKBACK_DAYS", os.environ.get("CHART_LOOKBACK_DAYS", "180")))
 CHART_DELAY_MINUTES = int(os.environ.get("CHART_DELAY_MINUTES", os.environ.get("CHART_DELAY", "20")))
+ALPACA_BAR_ADJUSTMENT = os.environ.get("ALPACA_BAR_ADJUSTMENT", "split").strip() or "split"
 SUPPORTED_TIMEFRAMES = {"1Min", "5Min", "15Min", "1Hour", "1Day"}
 TIMEFRAME_DELTAS = {
     "1Min": timedelta(minutes=1),
@@ -472,6 +475,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _lookback_days_for_timeframe(timeframe: str) -> int:
+    if timeframe == "1Day":
+        return max(1, DAILY_CHART_LOOKBACK_DAYS)
+    return max(1, INTRADAY_CHART_LOOKBACK_DAYS)
+
+
 def _to_alpaca_ts(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -575,7 +584,7 @@ def _fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: dateti
                 "timeframe": timeframe,
                 "start": _to_alpaca_ts(start),
                 "end": _to_alpaca_ts(end),
-                "adjustment": "raw",
+                "adjustment": ALPACA_BAR_ADJUSTMENT,
                 "limit": 10000,
                 "page_token": page_token,
             },
@@ -879,7 +888,7 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int) -> Dict:
     }
 
 
-def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False) -> Dict:
+def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False, snapshot_limit: int = 5000) -> Dict:
     symbol = str(symbol).strip().upper()
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe '{timeframe}'.")
@@ -909,7 +918,7 @@ def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False) -> 
             row = cur.fetchone()
     latest_historical_bar_time = row[0] if row else None
 
-    start = delayed_now - timedelta(days=DEFAULT_CHART_LOOKBACK_DAYS)
+    start = delayed_now - timedelta(days=_lookback_days_for_timeframe(timeframe))
     if latest_historical_bar_time and not force_full:
         start = latest_historical_bar_time.astimezone(timezone.utc) + TIMEFRAME_DELTAS.get(timeframe, timedelta(days=1))
     end = delayed_now
@@ -969,7 +978,7 @@ def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False) -> 
                 )
         raise
 
-    result = _get_market_snapshot(symbol, timeframe, 500)
+    result = _get_market_snapshot(symbol, timeframe, snapshot_limit)
     result["fetched_from_alpaca"] = True
     result["bars_inserted"] = bars_inserted
     return result
@@ -1465,6 +1474,12 @@ def chart_page(symbol: str) -> Response:
         align-items: center;
         margin-top: 12px;
       }}
+      .toolbar-group {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }}
       .status {{
         margin-top: 14px;
         padding: 12px;
@@ -1487,6 +1502,11 @@ def chart_page(symbol: str) -> Response:
         color: var(--muted);
         font-style: italic;
       }}
+      .chart-help {{
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }}
     </style>
   </head>
   <body>
@@ -1498,25 +1518,38 @@ def chart_page(symbol: str) -> Response:
           <div class="muted">Historical chart with PostgreSQL cache and Alpaca sync controls.</div>
         </div>
         <div class="toolbar">
-          <label class="muted" for="timeframe">Timeframe</label>
-          <select id="timeframe">
-            <option value="1Day" selected>1 Day</option>
-            <option value="1Hour">1 Hour</option>
-            <option value="15Min">15 Min</option>
-            <option value="5Min">5 Min</option>
-            <option value="1Min">1 Min</option>
-          </select>
-          <button id="sync-btn">Sync Now</button>
-          <button id="reload-btn" class="secondary">Reload DB Data</button>
+          <div class="toolbar-group">
+            <label class="muted" for="timeframe">Timeframe</label>
+            <select id="timeframe">
+              <option value="1Day" selected>1 Day</option>
+              <option value="1Hour">1 Hour</option>
+              <option value="15Min">15 Min</option>
+              <option value="5Min">5 Min</option>
+              <option value="1Min">1 Min</option>
+            </select>
+          </div>
+          <div class="toolbar-group">
+            <button id="pan-left-btn" class="secondary" type="button">Earlier</button>
+            <button id="pan-right-btn" class="secondary" type="button">Later</button>
+            <button id="zoom-in-btn" class="secondary" type="button">Zoom In</button>
+            <button id="zoom-out-btn" class="secondary" type="button">Zoom Out</button>
+            <button id="reset-view-btn" class="secondary" type="button">Reset View</button>
+          </div>
+          <div class="toolbar-group">
+            <button id="sync-btn" type="button">Sync Now</button>
+            <button id="reload-btn" class="secondary" type="button">Reload DB Data</button>
+          </div>
         </div>
       </div>
 
       <div class="grid">
         <div class="card">
           <div id="chart-summary" class="muted">Loading chart data...</div>
+          <div id="range-summary" class="chart-help">Preparing chart viewport...</div>
           <div class="canvas-wrap">
             <canvas id="chart" width="960" height="380"></canvas>
           </div>
+          <div class="chart-help">Mouse wheel zooms. Drag horizontally to pan. Use Earlier/Later to move through older bars.</div>
           <div id="empty-state" class="status empty" style="display:none;">No bars available yet.</div>
           <div id="status" class="status" style="display:none;"></div>
         </div>
@@ -1557,6 +1590,11 @@ def chart_page(symbol: str) -> Response:
       const SYMBOL = {json.dumps(symbol)};
       const canvas = document.getElementById('chart');
       const ctx = canvas.getContext('2d');
+      let ALL_BARS = [];
+      let VIEW_END = 0;
+      let WINDOW_SIZE = 0;
+      let CURRENT_TIMEFRAME = '1Day';
+      let DRAG_STATE = null;
 
       function fmtDate(value) {{
         if (!value) return '-';
@@ -1580,6 +1618,56 @@ def chart_page(symbol: str) -> Response:
         ctx.fillStyle = '#9fb0c0';
         ctx.font = '16px Georgia';
         ctx.fillText('No chart data yet', 24, 40);
+      }}
+
+      function formatAxisLabel(value) {{
+        const date = new Date(value);
+        if (CURRENT_TIMEFRAME === '1Day') return date.toLocaleDateString();
+        return date.toLocaleString(undefined, {{
+          month: 'short',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+        }});
+      }}
+
+      function defaultWindowSize(timeframe, totalBars) {{
+        const defaults = {{
+          '1Min': 240,
+          '5Min': 288,
+          '15Min': 320,
+          '1Hour': 360,
+          '1Day': 260,
+        }};
+        return Math.max(20, Math.min(defaults[timeframe] || 180, totalBars || defaults[timeframe] || 180));
+      }}
+
+      function desiredFetchLimit(timeframe) {{
+        const limits = {{
+          '1Min': 1500,
+          '5Min': 1500,
+          '15Min': 1200,
+          '1Hour': 1200,
+          '1Day': 3000,
+        }};
+        return String(limits[timeframe] || 1000);
+      }}
+
+      function clampViewport() {{
+        if (!ALL_BARS.length) {{
+          VIEW_END = 0;
+          WINDOW_SIZE = 0;
+          return;
+        }}
+        WINDOW_SIZE = Math.max(20, Math.min(WINDOW_SIZE || defaultWindowSize(CURRENT_TIMEFRAME, ALL_BARS.length), ALL_BARS.length));
+        VIEW_END = Math.max(WINDOW_SIZE, Math.min(VIEW_END || ALL_BARS.length, ALL_BARS.length));
+      }}
+
+      function getVisibleBars() {{
+        clampViewport();
+        if (!ALL_BARS.length) return [];
+        const start = Math.max(0, VIEW_END - WINDOW_SIZE);
+        return ALL_BARS.slice(start, VIEW_END);
       }}
 
       function drawChart(bars) {{
@@ -1637,24 +1725,47 @@ def chart_page(symbol: str) -> Response:
 
         ctx.fillStyle = '#d7f0ff';
         ctx.font = '12px Georgia';
-        const firstLabel = new Date(bars[0].t).toLocaleDateString();
-        const lastLabel = new Date(bars[bars.length - 1].t).toLocaleDateString();
-        ctx.fillText(firstLabel, padLeft, canvas.height - 12);
-        const lastWidth = ctx.measureText(lastLabel).width;
-        ctx.fillText(lastLabel, canvas.width - padRight - lastWidth, canvas.height - 12);
+        const labelCount = Math.min(6, bars.length);
+        for (let tick = 0; tick < labelCount; tick++) {{
+          const idx = Math.min(
+            bars.length - 1,
+            Math.round((bars.length - 1) * (labelCount === 1 ? 0 : tick / (labelCount - 1)))
+          );
+          const x = padLeft + ((bars.length === 1 ? 0.5 : idx / (bars.length - 1)) * w);
+          const label = formatAxisLabel(bars[idx].t);
+          const labelWidth = ctx.measureText(label).width;
+          ctx.fillText(
+            label,
+            Math.max(padLeft, Math.min(x - (labelWidth / 2), canvas.width - padRight - labelWidth)),
+            canvas.height - 12
+          );
+        }}
+      }}
+
+      function renderViewport() {{
+        const visibleBars = getVisibleBars();
+        drawChart(visibleBars);
+        document.getElementById('empty-state').style.display = visibleBars.length ? 'none' : 'block';
+
+        const lastBar = visibleBars.length ? visibleBars[visibleBars.length - 1] : null;
+        const firstBar = visibleBars.length ? visibleBars[0] : null;
+        document.getElementById('chart-summary').textContent = visibleBars.length
+          ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}}.`
+          : `No ${{CURRENT_TIMEFRAME}} bars stored for ${{SYMBOL}}.`;
+        document.getElementById('range-summary').textContent = visibleBars.length
+          ? `Viewport: ${{formatAxisLabel(firstBar.t)}} to ${{formatAxisLabel(lastBar.t)}}`
+          : 'No viewport available yet.';
+        document.getElementById('last-close').textContent = lastBar ? fmtPrice(lastBar.c) : '-';
+        document.getElementById('bar-count').textContent = String(ALL_BARS.length);
       }}
 
       function applyPayload(payload) {{
-        const bars = payload.bars || [];
-        drawChart(bars);
-        document.getElementById('empty-state').style.display = bars.length ? 'none' : 'block';
-        document.getElementById('chart-summary').textContent = bars.length
-          ? `Showing ${{bars.length}} ${{payload.timeframe}} bars from PostgreSQL for ${{payload.symbol}}.`
-          : `No ${{payload.timeframe}} bars stored for ${{payload.symbol}}.`;
+        CURRENT_TIMEFRAME = payload.timeframe || CURRENT_TIMEFRAME;
+        ALL_BARS = payload.bars || [];
+        VIEW_END = ALL_BARS.length;
+        WINDOW_SIZE = defaultWindowSize(CURRENT_TIMEFRAME, ALL_BARS.length);
+        renderViewport();
 
-        const lastBar = bars.length ? bars[bars.length - 1] : null;
-        document.getElementById('last-close').textContent = lastBar ? fmtPrice(lastBar.c) : '-';
-        document.getElementById('bar-count').textContent = String(payload.bar_count || bars.length || 0);
         document.getElementById('latest-quote').textContent = payload.latest_quote
           ? `${{fmtPrice(payload.latest_quote.bid_price)}} / ${{fmtPrice(payload.latest_quote.ask_price)}}`
           : '-';
@@ -1669,11 +1780,35 @@ def chart_page(symbol: str) -> Response:
         document.getElementById('sync-error').textContent = sync.sync_error || '-';
       }}
 
+      function zoomViewport(direction) {{
+        if (!ALL_BARS.length) return;
+        const step = Math.max(10, Math.round(WINDOW_SIZE * 0.2));
+        WINDOW_SIZE = direction > 0
+          ? Math.min(ALL_BARS.length, WINDOW_SIZE + step)
+          : Math.max(20, WINDOW_SIZE - step);
+        clampViewport();
+        renderViewport();
+      }}
+
+      function panViewport(direction) {{
+        if (!ALL_BARS.length) return;
+        const step = Math.max(5, Math.round(WINDOW_SIZE * 0.25));
+        VIEW_END = Math.max(WINDOW_SIZE, Math.min(ALL_BARS.length, VIEW_END + (direction * step)));
+        renderViewport();
+      }}
+
+      function resetViewport() {{
+        if (!ALL_BARS.length) return;
+        WINDOW_SIZE = defaultWindowSize(CURRENT_TIMEFRAME, ALL_BARS.length);
+        VIEW_END = ALL_BARS.length;
+        renderViewport();
+      }}
+
       async function loadChart(options = {{}}) {{
         const timeframe = document.getElementById('timeframe').value;
         const params = new URLSearchParams({{
           timeframe,
-          limit: '180',
+          limit: desiredFetchLimit(timeframe),
           auto_sync: options.autoSync ? '1' : '0',
         }});
         const res = await fetch(`/api/chart/${{encodeURIComponent(SYMBOL)}}?${{params.toString()}}`);
@@ -1697,10 +1832,11 @@ def chart_page(symbol: str) -> Response:
         setStatus('Syncing latest market data from Alpaca...');
         try {{
           const timeframe = document.getElementById('timeframe').value;
+          const limit = Number(desiredFetchLimit(timeframe));
           const res = await fetch(`/api/chart/${{encodeURIComponent(SYMBOL)}}/sync`, {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ timeframe }}),
+            body: JSON.stringify({{ timeframe, force_full: timeframe === '1Day', limit }}),
           }});
           const payload = await res.json();
           if (!res.ok || !payload.ok) {{
@@ -1719,6 +1855,29 @@ def chart_page(symbol: str) -> Response:
         document.getElementById('timeframe').addEventListener('change', () => loadChart({{ autoSync: true }}).catch((err) => setStatus(err.message, true)));
         document.getElementById('reload-btn').addEventListener('click', () => loadChart({{ autoSync: false, showReloadMessage: true }}).catch((err) => setStatus(err.message, true)));
         document.getElementById('sync-btn').addEventListener('click', syncNow);
+        document.getElementById('pan-left-btn').addEventListener('click', () => panViewport(-1));
+        document.getElementById('pan-right-btn').addEventListener('click', () => panViewport(1));
+        document.getElementById('zoom-in-btn').addEventListener('click', () => zoomViewport(-1));
+        document.getElementById('zoom-out-btn').addEventListener('click', () => zoomViewport(1));
+        document.getElementById('reset-view-btn').addEventListener('click', resetViewport);
+        canvas.addEventListener('wheel', (event) => {{
+          event.preventDefault();
+          zoomViewport(event.deltaY > 0 ? 1 : -1);
+        }}, {{ passive: false }});
+        canvas.addEventListener('mousedown', (event) => {{
+          DRAG_STATE = {{ startX: event.clientX, startViewEnd: VIEW_END }};
+        }});
+        window.addEventListener('mouseup', () => {{
+          DRAG_STATE = null;
+        }});
+        window.addEventListener('mousemove', (event) => {{
+          if (!DRAG_STATE || !ALL_BARS.length) return;
+          const deltaX = event.clientX - DRAG_STATE.startX;
+          const barsPerPixel = WINDOW_SIZE / Math.max(canvas.clientWidth, 1);
+          const deltaBars = Math.round(deltaX * barsPerPixel);
+          VIEW_END = Math.max(WINDOW_SIZE, Math.min(ALL_BARS.length, DRAG_STATE.startViewEnd - deltaBars));
+          renderViewport();
+        }});
         try {{
           await loadChart({{ autoSync: true }});
         }} catch (err) {{
@@ -1750,7 +1909,7 @@ def get_chart_data(symbol: str) -> Response:
         payload = _get_market_snapshot(symbol, timeframe, limit)
         auto_synced = False
         if auto_sync and not payload["bars"]:
-            payload = _sync_market_data(symbol, timeframe, force_full=True)
+            payload = _sync_market_data(symbol, timeframe, force_full=True, snapshot_limit=limit)
             payload["bar_count"] = min(len(payload["bars"]), limit)
             payload["bars"] = payload["bars"][-limit:]
             auto_synced = True
@@ -1767,10 +1926,16 @@ def get_chart_data(symbol: str) -> Response:
 def sync_chart_data(symbol: str) -> Response:
     payload = request.get_json(silent=True) or {}
     timeframe = str(payload.get("timeframe") or DEFAULT_CHART_TIMEFRAME).strip()
+    force_full = bool(payload.get("force_full", timeframe == "1Day"))
+    limit_raw = payload.get("limit", 5000)
     if timeframe not in SUPPORTED_TIMEFRAMES:
         return jsonify({"ok": False, "error": f"Unsupported timeframe '{timeframe}'."}), 400
     try:
-        snapshot = _sync_market_data(symbol, timeframe, force_full=False)
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "'limit' must be an integer."}), 400
+    try:
+        snapshot = _sync_market_data(symbol, timeframe, force_full=force_full, snapshot_limit=limit)
         snapshot["ok"] = True
         return jsonify(snapshot)
     except ValueError as exc:
