@@ -1143,6 +1143,33 @@ def _analytics_price_timeframe_for_request(requested_timeframe: str, asof_dt: da
     return "15Min"
 
 
+def _parse_bool_query_param(name: str, default: bool = False) -> bool:
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _strip_symbol_and_timestamps(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            key_str = str(key)
+            if key_str == "symbol":
+                continue
+            if key_str == "as_of":
+                continue
+            if key_str == "timestamp":
+                continue
+            if key_str.endswith("_timestamp") or key_str.endswith("_time") or key_str.endswith("_at"):
+                continue
+            out[key] = _strip_symbol_and_timestamps(item)
+        return out
+    if isinstance(value, list):
+        return [_strip_symbol_and_timestamps(item) for item in value]
+    return value
+
+
 # ----------------- Routes ----------------------
 
 @app.get("/")
@@ -2203,6 +2230,7 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
     normalized_timeframe = None
     settings = None
     asof_dt = None
+    hide_ts = _parse_bool_query_param("hidets", default=False)
     try:
         normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
         settings = _analytics_settings_from_request()
@@ -2225,6 +2253,8 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
                 _sync_market_data(symbol, desired_price_timeframe, force_full=True, snapshot_limit=1)
             payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
         payload["ok"] = True
+        if hide_ts:
+            payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
         try:
@@ -2242,6 +2272,8 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
                     _sync_market_data(symbol, desired_price_timeframe, force_full=True, snapshot_limit=1)
                 payload = analytics_service.get_symbol_state(symbol, normalized_timeframe or "1Day", asof_dt, settings or AnalyticsSettings())
                 payload["ok"] = True
+                if hide_ts:
+                    payload = _strip_symbol_and_timestamps(payload)
                 return jsonify(payload)
         except Exception:
             pass
@@ -2256,6 +2288,7 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
 @app.get("/api/events/<symbol>/<timeframe>")
 def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
     try:
+        hide_ts = _parse_bool_query_param("hidets", default=False)
         normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
         settings = _analytics_settings_from_request()
         asof_dt = parse_asof(request.args.get("asof"))
@@ -2264,6 +2297,8 @@ def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
         payload = analytics_service.get_events(symbol, normalized_timeframe, asof_dt, settings, event_limit=event_limit)
         payload["ok"] = True
         payload["as_of"] = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)["as_of"]
+        if hide_ts:
+            payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 404
@@ -2276,8 +2311,11 @@ def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
 @app.get("/api/metadata/<symbol>")
 def get_symbol_metadata_api(symbol: str) -> Response:
     try:
+        hide_ts = _parse_bool_query_param("hidets", default=False)
         payload = analytics_service.get_symbol_metadata(symbol)
         payload["ok"] = True
+        if hide_ts:
+            payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 404
@@ -2288,6 +2326,7 @@ def get_symbol_metadata_api(symbol: str) -> Response:
 @app.get("/api/futurestate/<symbol>")
 @app.get("/api/futurestate/<symbol>/<timeframe>")
 def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Response:
+    hide_ts = _parse_bool_query_param("hidets", default=False)
     days_raw = (request.args.get("days") or request.args.get("horizon_days") or "").strip()
     if not days_raw:
         return jsonify({"ok": False, "error": "'days' is required."}), 400
@@ -2304,6 +2343,8 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
             return jsonify({"ok": False, "error": "'asof' is required."}), 400
         payload = analytics_service.get_future_state(symbol, normalized_timeframe, asof_dt, days)
         payload["ok"] = True
+        if hide_ts:
+            payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 404
@@ -2321,11 +2362,14 @@ def get_analytics_batch_state() -> Response:
         return jsonify({"ok": False, "error": "'symbols' must be a non-empty array."}), 400
 
     try:
+        hide_ts = _parse_bool_query_param("hidets", default=False)
         normalized_timeframe = _normalize_analytics_timeframe(payload.get("timeframe") or request.args.get("timeframe"))
         settings = _analytics_settings_from_request(payload)
         asof_dt = parse_asof(str(payload.get("asof") or request.args.get("asof") or "").strip() or None)
         batch = analytics_service.get_batch_state([str(item).strip().upper() for item in symbols], normalized_timeframe, asof_dt, settings)
         batch["ok"] = True
+        if hide_ts:
+            batch = _strip_symbol_and_timestamps(batch)
         return jsonify(batch)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -2441,6 +2485,7 @@ def api_docs() -> Response:
 <pre><code>curl -s "http://127.0.0.1:5000/api/state/NVDA"
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20"
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=15Min&asof=2023-09-20T15:45:00Z"
+curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20&hidets=true"
 curl -s "http://127.0.0.1:5000/api/state/NVDA/1Day?breakout_lookback=55&buffer_pct=0.005"</code></pre>
 
 <pre><code>{
@@ -2537,6 +2582,7 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
         <ul>
           <li><code>timeframe</code>: one of <code>1Day</code>, <code>1D</code>, <code>1Hour</code>, <code>15Min</code>, <code>5Min</code>, <code>1Min</code></li>
           <li><code>asof</code>: optional backdated cutoff; accepts <code>YYYY-MM-DD</code> or full ISO 8601 timestamps</li>
+          <li><code>hidets</code>: optional boolean, default <code>false</code>; when true, removes <code>symbol</code> and timestamp-like fields from the response</li>
           <li><code>event_limit</code>: optional max number of events returned, default <code>20</code></li>
           <li><code>breakout_lookback</code>: optional prior-bar lookback for breakout and breakdown rules, default <code>20</code></li>
           <li><code>buffer_pct</code>: optional breakout and breakdown buffer, default <code>0.0025</code></li>

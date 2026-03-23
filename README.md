@@ -135,6 +135,7 @@ The app now exposes a non-visual analytics layer over already-synced `stock_bars
 ```bash
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20"
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=15Min&asof=2023-09-20T15:45:00Z"
+curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20&hidets=true"
 ```
 
 `GET /api/events/<symbol>`
@@ -168,6 +169,7 @@ curl -s http://127.0.0.1:5000/api/health/analytics
 
 - `timeframe`: supported values are `1D`/`1Day`, `1Hour`, `15Min`, `5Min`, `1Min`
 - `asof`: backdated cutoff, accepts `YYYY-MM-DD` or ISO 8601
+- `hidets`: optional boolean, default `false`; when `true`, removes `symbol` and timestamp-like fields from the response
 - `event_limit`: number of most recent events to return, default `20`
 - `breakout_lookback`: prior-bar lookback window for breakout and breakdown rules, default `20`
 - `buffer_pct`: confirmation buffer for breakout and breakdown rules, default `0.0025`
