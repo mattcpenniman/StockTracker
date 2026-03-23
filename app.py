@@ -1170,6 +1170,10 @@ def _strip_symbol_and_timestamps(value):
     return value
 
 
+def _backfill_analytics_symbol_if_needed(symbol: str) -> None:
+    _sync_market_data(symbol, "1Day", force_full=True, snapshot_limit=1)
+
+
 # ----------------- Routes ----------------------
 
 @app.get("/")
@@ -2258,6 +2262,7 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
         try:
+            _backfill_analytics_symbol_if_needed(symbol)
             desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe or "1Day", asof_dt)
             if desired_price_timeframe != "1Day":
                 if asof_dt is not None:
@@ -2270,11 +2275,11 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
                     )
                 else:
                     _sync_market_data(symbol, desired_price_timeframe, force_full=True, snapshot_limit=1)
-                payload = analytics_service.get_symbol_state(symbol, normalized_timeframe or "1Day", asof_dt, settings or AnalyticsSettings())
-                payload["ok"] = True
-                if hide_ts:
-                    payload = _strip_symbol_and_timestamps(payload)
-                return jsonify(payload)
+            payload = analytics_service.get_symbol_state(symbol, normalized_timeframe or "1Day", asof_dt, settings or AnalyticsSettings())
+            payload["ok"] = True
+            if hide_ts:
+                payload = _strip_symbol_and_timestamps(payload)
+            return jsonify(payload)
         except Exception:
             pass
         return jsonify({"ok": False, "error": str(exc)}), 404
@@ -2301,6 +2306,16 @@ def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
             payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
+        try:
+            _backfill_analytics_symbol_if_needed(symbol)
+            payload = analytics_service.get_events(symbol, normalized_timeframe, asof_dt, settings, event_limit=event_limit)
+            payload["ok"] = True
+            payload["as_of"] = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)["as_of"]
+            if hide_ts:
+                payload = _strip_symbol_and_timestamps(payload)
+            return jsonify(payload)
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(exc)}), 404
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -2318,6 +2333,15 @@ def get_symbol_metadata_api(symbol: str) -> Response:
             payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
+        try:
+            _backfill_analytics_symbol_if_needed(symbol)
+            payload = analytics_service.get_symbol_metadata(symbol)
+            payload["ok"] = True
+            if hide_ts:
+                payload = _strip_symbol_and_timestamps(payload)
+            return jsonify(payload)
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(exc)}), 404
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -2347,6 +2371,15 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
             payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
+        try:
+            _backfill_analytics_symbol_if_needed(symbol)
+            payload = analytics_service.get_future_state(symbol, normalized_timeframe, asof_dt, days)
+            payload["ok"] = True
+            if hide_ts:
+                payload = _strip_symbol_and_timestamps(payload)
+            return jsonify(payload)
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(exc)}), 404
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
