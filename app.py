@@ -999,6 +999,88 @@ def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False, sna
     return result
 
 
+def _sync_market_data_window(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+    snapshot_limit: int = 1,
+) -> Dict:
+    symbol = str(symbol).strip().upper()
+    if timeframe not in SUPPORTED_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'.")
+
+    symbol_id = _ensure_symbol_metadata(symbol)
+    now = _utcnow()
+    delayed_now = now - timedelta(minutes=max(CHART_DELAY_MINUTES, 0))
+    bounded_end = min(end.astimezone(timezone.utc), delayed_now)
+    bounded_start = start.astimezone(timezone.utc)
+
+    if bounded_start > bounded_end:
+        raise ValueError("Target sync window is in the future after delay adjustment.")
+
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE symbol_sync_state
+                SET sync_status = 'running', sync_error = NULL, updated_at = now()
+                WHERE symbol_id = %s
+                """,
+                (symbol_id,),
+            )
+
+    bars_inserted = 0
+    try:
+        historical_bars = _fetch_alpaca_bars(symbol, timeframe, bounded_start, bounded_end)
+        bars_inserted = _upsert_stock_bars(symbol_id, timeframe, historical_bars)
+
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                effective_latest_bar_time = None
+                if historical_bars:
+                    effective_latest_bar_time = _parse_market_timestamp(historical_bars[-1].get("t"))
+                cur.execute(
+                    """
+                    UPDATE symbol_sync_state
+                    SET last_synced_at = now(),
+                        last_successful_sync_at = now(),
+                        last_bar_synced_at = CASE WHEN %s > 0 THEN now() ELSE last_bar_synced_at END,
+                        latest_bar_time = COALESCE(%s, latest_bar_time),
+                        sync_status = 'idle',
+                        sync_error = NULL,
+                        updated_at = now()
+                    WHERE symbol_id = %s
+                    """,
+                    (
+                        bars_inserted,
+                        effective_latest_bar_time,
+                        symbol_id,
+                    ),
+                )
+    except Exception as exc:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE symbol_sync_state
+                    SET sync_status = 'error',
+                        sync_error = %s,
+                        updated_at = now()
+                    WHERE symbol_id = %s
+                    """,
+                    (str(exc)[:1000], symbol_id),
+                )
+        raise
+
+    result = _get_market_snapshot(symbol, timeframe, snapshot_limit)
+    result["fetched_from_alpaca"] = True
+    result["bars_inserted"] = bars_inserted
+    result["requested_window_start"] = bounded_start.isoformat()
+    result["requested_window_end"] = bounded_end.isoformat()
+    return result
+
+
 def _normalize_analytics_timeframe(value: str | None) -> str:
     raw = str(value or DEFAULT_CHART_TIMEFRAME).strip()
     if not raw:
@@ -1049,6 +1131,16 @@ def _analytics_settings_from_request(source: Dict | None = None) -> AnalyticsSet
         volume_multiple=_to_float("volume_multiple", 1.5),
         event_limit=_to_int("event_limit", 20),
     )
+
+
+def _analytics_price_timeframe_for_request(requested_timeframe: str, asof_dt: datetime | None) -> str:
+    if requested_timeframe != "1Day" or asof_dt is None:
+        return requested_timeframe
+
+    ts = asof_dt.astimezone(timezone.utc)
+    if ts.hour == 0 and ts.minute == 0 and ts.second == 0 and ts.microsecond == 0:
+        return requested_timeframe
+    return "15Min"
 
 
 # ----------------- Routes ----------------------
@@ -2108,14 +2200,51 @@ def get_latest_market_data(symbol: str) -> Response:
 @app.get("/api/state/<symbol>")
 @app.get("/api/state/<symbol>/<timeframe>")
 def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
+    normalized_timeframe = None
+    settings = None
+    asof_dt = None
     try:
         normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
         settings = _analytics_settings_from_request()
         asof_dt = parse_asof(request.args.get("asof"))
         payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
+        desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
+        if (
+            desired_price_timeframe != "1Day"
+            and payload.get("data_quality", {}).get("price_source_timeframe") != desired_price_timeframe
+        ):
+            if asof_dt is not None:
+                _sync_market_data_window(
+                    symbol,
+                    desired_price_timeframe,
+                    start=asof_dt - timedelta(days=7),
+                    end=asof_dt + timedelta(days=1),
+                    snapshot_limit=1,
+                )
+            else:
+                _sync_market_data(symbol, desired_price_timeframe, force_full=True, snapshot_limit=1)
+            payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
         payload["ok"] = True
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
+        try:
+            desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe or "1Day", asof_dt)
+            if desired_price_timeframe != "1Day":
+                if asof_dt is not None:
+                    _sync_market_data_window(
+                        symbol,
+                        desired_price_timeframe,
+                        start=asof_dt - timedelta(days=7),
+                        end=asof_dt + timedelta(days=1),
+                        snapshot_limit=1,
+                    )
+                else:
+                    _sync_market_data(symbol, desired_price_timeframe, force_full=True, snapshot_limit=1)
+                payload = analytics_service.get_symbol_state(symbol, normalized_timeframe or "1Day", asof_dt, settings or AnalyticsSettings())
+                payload["ok"] = True
+                return jsonify(payload)
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(exc)}), 404
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400

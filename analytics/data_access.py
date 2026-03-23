@@ -108,16 +108,17 @@ class AnalyticsRepository:
         sql += " ORDER BY bar_time ASC"
 
         with self.get_conn() as conn:
-            df = pd.read_sql_query(
-                sql,
-                conn,
-                params=params,
-                parse_dates=["bar_time"],
-            )
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
 
-        if df.empty:
+        if not rows:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
+        df = pd.DataFrame(
+            rows,
+            columns=["bar_time", "open", "high", "low", "close", "volume"],
+        )
         timestamps = pd.to_datetime(df["bar_time"], utc=True)
         return pd.DataFrame(
             {
