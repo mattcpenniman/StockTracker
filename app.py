@@ -519,6 +519,12 @@ def _alpaca_headers() -> Dict[str, str]:
     }
 
 
+def _alpaca_bar_adjustment_for_timeframe(timeframe: str) -> str:
+    if timeframe in {"1Min", "5Min", "15Min", "1Hour"}:
+        return "split"
+    return ALPACA_BAR_ADJUSTMENT
+
+
 def _alpaca_get_json(path: str, params: Dict[str, str | int | None]) -> Dict:
     query = urlencode({k: v for k, v in params.items() if v not in (None, "")}, doseq=True)
     url = f"{ALPACA_DATA_BASE_URL}{path}"
@@ -590,6 +596,7 @@ def _fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: dateti
     symbol = symbol.upper()
     page_token = None
     bars: List[Dict] = []
+    adjustment = _alpaca_bar_adjustment_for_timeframe(timeframe)
 
     while True:
         payload = _alpaca_get_json(
@@ -599,7 +606,7 @@ def _fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: dateti
                 "timeframe": timeframe,
                 "start": _to_alpaca_ts(start),
                 "end": _to_alpaca_ts(end),
-                "adjustment": ALPACA_BAR_ADJUSTMENT,
+                "adjustment": adjustment,
                 "limit": 10000,
                 "page_token": page_token,
             },
@@ -2239,8 +2246,19 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
         normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
         settings = _analytics_settings_from_request()
         asof_dt = parse_asof(request.args.get("asof"))
-        payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
         desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
+        if desired_price_timeframe != "1Day" and asof_dt is not None:
+            try:
+                _sync_market_data_window(
+                    symbol,
+                    desired_price_timeframe,
+                    start=asof_dt - timedelta(days=7),
+                    end=asof_dt + timedelta(days=1),
+                    snapshot_limit=1,
+                )
+            except Exception:
+                pass
+        payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
         if (
             desired_price_timeframe != "1Day"
             and payload.get("data_quality", {}).get("price_source_timeframe") != desired_price_timeframe
