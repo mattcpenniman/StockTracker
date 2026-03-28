@@ -310,9 +310,11 @@ class AnalyticsService:
             raise ValueError("'days' must be greater than zero.")
 
         context = self._context_for_symbol(symbol)
+        price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
         cache_key = (
             context["symbol"],
             timeframe,
+            price_timeframe,
             isoformat_utc(asof_dt),
             days,
             isoformat_utc(context.get("last_bar_synced_at")),
@@ -321,10 +323,10 @@ class AnalyticsService:
         if cached is not None:
             return cached
 
-        anchor_bars = self.repository.fetch_bars(context["symbol_id"], timeframe, asof_dt)
+        anchor_bars = self.repository.fetch_bars(context["symbol_id"], price_timeframe, asof_dt)
         if anchor_bars.empty:
             raise AnalyticsNotFoundError(
-                f"No anchor bar available for symbol '{context['symbol']}' on timeframe '{timeframe}' at the requested as-of."
+                f"No anchor bar available for symbol '{context['symbol']}' on timeframe '{price_timeframe}' at the requested as-of."
             )
 
         anchor_bar = anchor_bars.iloc[-1]
@@ -332,18 +334,18 @@ class AnalyticsService:
         anchor_close = float(anchor_bar["close"])
         future_bars_all = self.repository.fetch_bars(
             context["symbol_id"],
-            timeframe,
+            price_timeframe,
             start=anchor_timestamp + pd.Timedelta(microseconds=1),
         )
         if future_bars_all.empty:
             raise AnalyticsNotFoundError(
-                f"No future bars available for symbol '{context['symbol']}' on timeframe '{timeframe}' for the requested window."
+                f"No future bars available for symbol '{context['symbol']}' on timeframe '{price_timeframe}' for the requested window."
             )
 
         future_bars = future_bars_all.head(days).copy()
         if future_bars.empty:
             raise AnalyticsNotFoundError(
-                f"No future bars available for symbol '{context['symbol']}' on timeframe '{timeframe}' for the requested window."
+                f"No future bars available for symbol '{context['symbol']}' on timeframe '{price_timeframe}' for the requested window."
             )
 
         end_bar = future_bars.iloc[-1]
@@ -362,6 +364,7 @@ class AnalyticsService:
                 "anchor_price": {
                     "close": anchor_close,
                     "timestamp": anchor_timestamp,
+                    "source_timeframe": price_timeframe,
                 },
                 "window": {
                     "requested_future_bar_count": days,
@@ -369,6 +372,7 @@ class AnalyticsService:
                     "complete_window": complete_window,
                     "target_end_timestamp": future_bars.iloc[days - 1]["timestamp"] if complete_window else None,
                     "realized_end_timestamp": end_bar["timestamp"],
+                    "source_timeframe": price_timeframe,
                 },
                 "future_state": {
                     "max_price": float(max_bar["high"]),
@@ -380,6 +384,7 @@ class AnalyticsService:
                     "price_at_horizon": float(end_bar["close"]),
                     "price_at_horizon_timestamp": end_bar["timestamp"],
                     "return_at_horizon_pct": (float(end_bar["close"]) / anchor_close) - 1.0 if anchor_close else None,
+                    "source_timeframe": price_timeframe,
                 },
             }
         )

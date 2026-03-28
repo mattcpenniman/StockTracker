@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pandas as pd
 
+from app import _state_payload_has_desired_price_anchor
 from analytics.config import AnalyticsSettings
 from analytics.indicators import compute_feature_frame
 from analytics.regimes import (
@@ -324,6 +325,113 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(payload["window"]["complete_window"])
         self.assertEqual(payload["future_state"]["price_at_horizon_timestamp"], "2023-02-06T00:00:00Z")
         self.assertEqual(payload["window"]["target_end_timestamp"], "2023-02-06T00:00:00Z")
+
+    def test_future_state_daily_request_with_intraday_asof_uses_15min_bars(self) -> None:
+        repo = Mock()
+        repo.fetch_symbol_context.return_value = {
+            "symbol_id": 1,
+            "symbol": "NVDA",
+            "exchange": "NASDAQ",
+            "asset_class": "us_equity",
+            "name": "NVIDIA Corp",
+            "is_active": True,
+            "created_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "updated_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "last_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_successful_sync_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_quote_synced_at": None,
+            "last_bar_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_bar_time": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_quote_time": None,
+            "sync_status": "idle",
+            "sync_error": None,
+        }
+        intraday_anchor_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2023-09-17T12:00:00Z", "2023-09-17T12:15:00Z"],
+                    utc=True,
+                ),
+                "open": [360.0, 399.0],
+                "high": [361.0, 401.0],
+                "low": [359.0, 398.5],
+                "close": [360.5, 400.0],
+                "volume": [1000.0, 1200.0],
+            }
+        )
+        intraday_future_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        "2023-09-17T12:30:00Z",
+                        "2023-09-17T12:45:00Z",
+                        "2023-09-17T13:00:00Z",
+                    ],
+                    utc=True,
+                ),
+                "open": [400.0, 404.0, 402.0],
+                "high": [405.0, 406.0, 407.0],
+                "low": [399.0, 401.0, 400.0],
+                "close": [404.0, 402.0, 406.0],
+                "volume": [900.0, 800.0, 1000.0],
+            }
+        )
+        repo.fetch_bars.side_effect = [intraday_anchor_bars, intraday_future_bars]
+        service = AnalyticsService(repository=repo)
+
+        payload = service.get_future_state(
+            "NVDA",
+            "1Day",
+            pd.Timestamp("2023-09-17T12:15:00Z"),
+            2,
+        )
+
+        self.assertEqual(payload["timeframe"], "1Day")
+        self.assertEqual(payload["anchor_price"]["close"], 400.0)
+        self.assertEqual(payload["anchor_price"]["timestamp"], "2023-09-17T12:15:00Z")
+        self.assertEqual(payload["anchor_price"]["source_timeframe"], "15Min")
+        self.assertEqual(payload["window"]["source_timeframe"], "15Min")
+        self.assertEqual(payload["future_state"]["source_timeframe"], "15Min")
+        self.assertEqual(payload["future_state"]["max_price"], 406.0)
+        self.assertEqual(payload["future_state"]["max_price_timestamp"], "2023-09-17T12:45:00Z")
+        self.assertEqual(payload["future_state"]["price_at_horizon"], 402.0)
+        self.assertEqual(payload["future_state"]["price_at_horizon_timestamp"], "2023-09-17T12:45:00Z")
+
+
+class StateEndpointHelperTests(unittest.TestCase):
+    def test_intraday_anchor_accepts_same_day_bar(self) -> None:
+        payload = {
+            "price": {"timestamp": "2024-08-23T20:00:00Z"},
+            "data_quality": {
+                "price_source_timeframe": "15Min",
+                "price_bar_timestamp": "2024-08-23T20:00:00Z",
+            },
+        }
+
+        self.assertTrue(
+            _state_payload_has_desired_price_anchor(
+                payload,
+                "15Min",
+                pd.Timestamp("2024-08-23T21:03:00Z"),
+            )
+        )
+
+    def test_intraday_anchor_rejects_stale_prior_day_bar(self) -> None:
+        payload = {
+            "price": {"timestamp": "2024-08-22T20:00:00Z"},
+            "data_quality": {
+                "price_source_timeframe": "15Min",
+                "price_bar_timestamp": "2024-08-22T20:00:00Z",
+            },
+        }
+
+        self.assertFalse(
+            _state_payload_has_desired_price_anchor(
+                payload,
+                "15Min",
+                pd.Timestamp("2024-08-23T21:03:00Z"),
+            )
+        )
 
 
 if __name__ == "__main__":

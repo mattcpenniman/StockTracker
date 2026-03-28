@@ -71,6 +71,7 @@ DEFAULT_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_LOOKBACK_DAYS", "180"))
 DAILY_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_DAILY_LOOKBACK_DAYS", "2555"))
 INTRADAY_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_INTRADAY_LOOKBACK_DAYS", os.environ.get("CHART_LOOKBACK_DAYS", "180")))
 CHART_DELAY_MINUTES = int(os.environ.get("CHART_DELAY_MINUTES", os.environ.get("CHART_DELAY", "20")))
+CHART_15MIN_FETCH_LIMIT = int(os.environ.get("CHART_15MIN_FETCH_LIMIT", "1200"))
 ALPACA_BAR_ADJUSTMENT = os.environ.get("ALPACA_BAR_ADJUSTMENT", "split").strip() or "split"
 SUPPORTED_TIMEFRAMES = {"1Min", "5Min", "15Min", "1Hour", "1Day"}
 ANALYTICS_TIMEFRAME_ALIASES = {
@@ -1150,6 +1151,40 @@ def _analytics_price_timeframe_for_request(requested_timeframe: str, asof_dt: da
     return "15Min"
 
 
+def _state_payload_has_desired_price_anchor(
+    payload: Dict,
+    desired_price_timeframe: str,
+    asof_dt: datetime | None,
+) -> bool:
+    quality = payload.get("data_quality") or {}
+    if quality.get("price_source_timeframe") != desired_price_timeframe:
+        return False
+
+    if desired_price_timeframe == "1Day" or asof_dt is None:
+        return True
+
+    raw_price_bar_timestamp = quality.get("price_bar_timestamp") or (payload.get("price") or {}).get("timestamp")
+    if not raw_price_bar_timestamp:
+        return False
+
+    price_bar_timestamp = parse_asof(raw_price_bar_timestamp)
+    if price_bar_timestamp is None:
+        return False
+
+    asof_ts = asof_dt.astimezone(timezone.utc)
+    price_ts = price_bar_timestamp.astimezone(timezone.utc)
+    if price_ts > asof_ts:
+        return False
+
+    # On weekdays we expect an intraday anchor from the same UTC trading date.
+    # This avoids treating stale 15-minute rows from a prior day as a valid
+    # backfill for a timed 1Day request.
+    if asof_ts.weekday() < 5 and price_ts.date() != asof_ts.date():
+        return False
+
+    return True
+
+
 def _parse_bool_query_param(name: str, default: bool = False) -> bool:
     raw = request.args.get(name)
     if raw is None:
@@ -1847,7 +1882,7 @@ def chart_page(symbol: str) -> Response:
         const limits = {{
           '1Min': 1500,
           '5Min': 1500,
-          '15Min': 1200,
+          '15Min': {CHART_15MIN_FETCH_LIMIT},
           '1Hour': 1200,
           '1Day': 3000,
         }};
@@ -2261,7 +2296,7 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
         payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
         if (
             desired_price_timeframe != "1Day"
-            and payload.get("data_quality", {}).get("price_source_timeframe") != desired_price_timeframe
+            and not _state_payload_has_desired_price_anchor(payload, desired_price_timeframe, asof_dt)
         ):
             if asof_dt is not None:
                 _sync_market_data_window(
@@ -2383,6 +2418,18 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
         asof_dt = parse_asof(request.args.get("asof"))
         if asof_dt is None:
             return jsonify({"ok": False, "error": "'asof' is required."}), 400
+        desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
+        if desired_price_timeframe != "1Day":
+            try:
+                _sync_market_data_window(
+                    symbol,
+                    desired_price_timeframe,
+                    start=asof_dt - timedelta(days=7),
+                    end=asof_dt + timedelta(days=max(1, days)),
+                    snapshot_limit=1,
+                )
+            except Exception:
+                pass
         payload = analytics_service.get_future_state(symbol, normalized_timeframe, asof_dt, days)
         payload["ok"] = True
         if hide_ts:
@@ -2391,6 +2438,15 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
     except AnalyticsNotFoundError as exc:
         try:
             _backfill_analytics_symbol_if_needed(symbol)
+            desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
+            if desired_price_timeframe != "1Day":
+                _sync_market_data_window(
+                    symbol,
+                    desired_price_timeframe,
+                    start=asof_dt - timedelta(days=7),
+                    end=asof_dt + timedelta(days=max(1, days)),
+                    snapshot_limit=1,
+                )
             payload = analytics_service.get_future_state(symbol, normalized_timeframe, asof_dt, days)
             payload["ok"] = True
             if hide_ts:
