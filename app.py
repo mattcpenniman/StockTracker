@@ -803,7 +803,7 @@ def _upsert_latest_bar(symbol_id: int, payload: Dict | None) -> Dict | None:
     return normalized
 
 
-def _get_market_snapshot(symbol: str, timeframe: str, limit: int) -> Dict:
+def _get_market_snapshot(symbol: str, timeframe: str, limit: int, before: datetime | None = None) -> Dict:
     symbol = str(symbol).strip().upper()
     symbol_id = _ensure_symbol_metadata(symbol)
     limit = max(1, min(limit, 5000))
@@ -811,19 +811,25 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int) -> Dict:
     _init_db_if_needed()
     with _get_conn() as conn:
         with conn.cursor() as cur:
+            before_filter_sql = ""
+            params = [symbol_id, timeframe]
+            if before is not None:
+                before_filter_sql = " AND bar_time < %s"
+                params.append(before.astimezone(timezone.utc))
+            params.append(limit)
             cur.execute(
-                """
+                f"""
                 SELECT bar_time, open, high, low, close, volume
                 FROM (
                     SELECT bar_time, open, high, low, close, volume
                     FROM stock_bars
-                    WHERE symbol_id = %s AND timeframe = %s
+                    WHERE symbol_id = %s AND timeframe = %s{before_filter_sql}
                     ORDER BY bar_time DESC
                     LIMIT %s
                 ) bars
                 ORDER BY bar_time ASC
                 """,
-                (symbol_id, timeframe, limit),
+                params,
             )
             bars = [
                 {
@@ -836,6 +842,24 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int) -> Dict:
                 }
                 for bar_time, open_, high, low, close, volume in cur.fetchall()
             ]
+
+            oldest_loaded_bar_time = bars[0]["t"] if bars else None
+            has_older_bars = False
+            if bars:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM stock_bars
+                    WHERE symbol_id = %s AND timeframe = %s AND bar_time < %s
+                    LIMIT 1
+                    """,
+                    (
+                        symbol_id,
+                        timeframe,
+                        datetime.fromisoformat(oldest_loaded_bar_time).astimezone(timezone.utc),
+                    ),
+                )
+                has_older_bars = cur.fetchone() is not None
 
             cur.execute(
                 """
@@ -905,6 +929,8 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int) -> Dict:
         "timeframe": timeframe,
         "bars": bars,
         "bar_count": len(bars),
+        "has_older_bars": has_older_bars,
+        "oldest_loaded_bar_time": oldest_loaded_bar_time,
         "latest_quote": latest_quote,
         "latest_bar": latest_bar,
         "sync_state": sync_state,
@@ -1830,6 +1856,8 @@ def chart_page(symbol: str) -> Response:
       let DRAG_STATE = null;
       let HOVER_INDEX = null;
       let LAST_DRAW_STATE = null;
+      let HAS_OLDER_BARS = false;
+      let FETCHING_OLDER_BARS = false;
 
       function fmtDate(value) {{
         if (!value) return '-';
@@ -2050,11 +2078,20 @@ def chart_page(symbol: str) -> Response:
         document.getElementById('chart-last-bar-time').textContent = lastBar ? fmtDate(lastBar.t) : '-';
       }}
 
-      function applyPayload(payload) {{
+      function applyPayload(payload, options = {{}}) {{
         CURRENT_TIMEFRAME = payload.timeframe || CURRENT_TIMEFRAME;
-        ALL_BARS = payload.bars || [];
-        VIEW_END = ALL_BARS.length;
-        WINDOW_SIZE = defaultWindowSize(CURRENT_TIMEFRAME, ALL_BARS.length);
+        const incomingBars = payload.bars || [];
+        if (options.prepend && incomingBars.length) {{
+          const seen = new Set(ALL_BARS.map((bar) => bar.t));
+          const olderBars = incomingBars.filter((bar) => !seen.has(bar.t));
+          ALL_BARS = olderBars.concat(ALL_BARS);
+          VIEW_END += olderBars.length;
+        }} else {{
+          ALL_BARS = incomingBars;
+          VIEW_END = ALL_BARS.length;
+          WINDOW_SIZE = defaultWindowSize(CURRENT_TIMEFRAME, ALL_BARS.length);
+        }}
+        HAS_OLDER_BARS = !!payload.has_older_bars;
         renderViewport();
 
         document.getElementById('latest-quote').textContent = payload.latest_quote
@@ -2070,6 +2107,32 @@ def chart_page(symbol: str) -> Response:
         document.getElementById('sync-error').textContent = sync.sync_error || '-';
       }}
 
+      async function loadOlderBarsIfNeeded() {{
+        if (FETCHING_OLDER_BARS || !ALL_BARS.length || !HAS_OLDER_BARS) return false;
+        FETCHING_OLDER_BARS = true;
+        try {{
+          const params = new URLSearchParams({{
+            timeframe: CURRENT_TIMEFRAME,
+            limit: desiredFetchLimit(CURRENT_TIMEFRAME),
+            before: ALL_BARS[0].t,
+          }});
+          const res = await fetch(`/api/chart/${{encodeURIComponent(SYMBOL)}}?${{params.toString()}}`);
+          const payload = await res.json();
+          if (!res.ok || !payload.ok) {{
+            throw new Error(payload.error || 'Failed to load older chart data.');
+          }}
+          if (!(payload.bars || []).length) {{
+            HAS_OLDER_BARS = false;
+            return false;
+          }}
+          applyPayload(payload, {{ prepend: true }});
+          setStatus(`Loaded ${{payload.bars.length}} older ${{CURRENT_TIMEFRAME}} bars from PostgreSQL.`);
+          return true;
+        }} finally {{
+          FETCHING_OLDER_BARS = false;
+        }}
+      }}
+
       function zoomViewport(direction) {{
         if (!ALL_BARS.length) return;
         const step = Math.max(10, Math.round(WINDOW_SIZE * 0.2));
@@ -2080,9 +2143,16 @@ def chart_page(symbol: str) -> Response:
         renderViewport();
       }}
 
-      function panViewport(direction) {{
+      async function panViewport(direction) {{
         if (!ALL_BARS.length) return;
         const step = Math.max(5, Math.round(WINDOW_SIZE * 0.25));
+        if (direction < 0 && VIEW_END - WINDOW_SIZE <= step && HAS_OLDER_BARS) {{
+          try {{
+            await loadOlderBarsIfNeeded();
+          }} catch (err) {{
+            setStatus(err.message || String(err), true);
+          }}
+        }}
         VIEW_END = Math.max(WINDOW_SIZE, Math.min(ALL_BARS.length, VIEW_END + (direction * step)));
         renderViewport();
       }}
@@ -2202,6 +2272,7 @@ def get_chart_data(symbol: str) -> Response:
         return jsonify({"ok": False, "error": f"Unsupported timeframe '{timeframe}'."}), 400
 
     limit_raw = (request.args.get("limit") or "180").strip()
+    before_dt = parse_asof(request.args.get("before"))
     auto_sync = (request.args.get("auto_sync") or "").strip().lower() in {"1", "true", "yes"}
     try:
         limit = int(limit_raw)
@@ -2209,9 +2280,9 @@ def get_chart_data(symbol: str) -> Response:
         return jsonify({"ok": False, "error": "'limit' must be an integer."}), 400
 
     try:
-        payload = _get_market_snapshot(symbol, timeframe, limit)
+        payload = _get_market_snapshot(symbol, timeframe, limit, before=before_dt)
         auto_synced = False
-        if auto_sync and not payload["bars"]:
+        if auto_sync and before_dt is None and not payload["bars"]:
             payload = _sync_market_data(symbol, timeframe, force_full=True, snapshot_limit=limit)
             payload["bar_count"] = min(len(payload["bars"]), limit)
             payload["bars"] = payload["bars"][-limit:]
