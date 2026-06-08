@@ -72,6 +72,7 @@ DAILY_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_DAILY_LOOKBACK_DAYS", "255
 INTRADAY_CHART_LOOKBACK_DAYS = int(os.environ.get("CHART_INTRADAY_LOOKBACK_DAYS", os.environ.get("CHART_LOOKBACK_DAYS", "180")))
 CHART_DELAY_MINUTES = int(os.environ.get("CHART_DELAY_MINUTES", os.environ.get("CHART_DELAY", "20")))
 CHART_15MIN_FETCH_LIMIT = int(os.environ.get("CHART_15MIN_FETCH_LIMIT", "1200"))
+CHART_LATEST_AUTO_SYNC_MAX_AGE_DAYS = int(os.environ.get("CHART_LATEST_AUTO_SYNC_MAX_AGE_DAYS", "5"))
 ALPACA_BAR_ADJUSTMENT = os.environ.get("ALPACA_BAR_ADJUSTMENT", "split").strip() or "split"
 SUPPORTED_TIMEFRAMES = {"1Min", "5Min", "15Min", "1Hour", "1Day"}
 ANALYTICS_TIMEFRAME_ALIASES = {
@@ -508,6 +509,20 @@ def _parse_market_timestamp(value: str | None) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def _market_snapshot_needs_sync(snapshot: Dict, max_age_days: int) -> bool:
+    if max_age_days < 0:
+        return False
+
+    sync_state = snapshot.get("sync_state") or {}
+    synced_at = _parse_market_timestamp(
+        sync_state.get("last_successful_sync_at") or sync_state.get("last_synced_at")
+    )
+    if synced_at is None:
+        return True
+
+    return synced_at <= _utcnow() - timedelta(days=max_age_days)
 
 
 def _alpaca_headers() -> Dict[str, str]:
@@ -994,8 +1009,8 @@ def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False, sna
                     UPDATE symbol_sync_state
                     SET last_synced_at = now(),
                         last_successful_sync_at = now(),
-                        last_quote_synced_at = CASE WHEN %s IS NOT NULL THEN now() ELSE last_quote_synced_at END,
-                        last_bar_synced_at = CASE WHEN %s IS NOT NULL OR %s > 0 THEN now() ELSE last_bar_synced_at END,
+                        last_quote_synced_at = CASE WHEN %s THEN now() ELSE last_quote_synced_at END,
+                        last_bar_synced_at = CASE WHEN %s OR %s > 0 THEN now() ELSE last_bar_synced_at END,
                         latest_bar_time = COALESCE(%s, latest_bar_time),
                         latest_quote_time = COALESCE(%s, latest_quote_time),
                         sync_status = 'idle',
@@ -2325,6 +2340,10 @@ def get_latest_market_data(symbol: str) -> Response:
         return jsonify({"ok": False, "error": f"Unsupported timeframe '{timeframe}'."}), 400
     try:
         snapshot = _get_market_snapshot(symbol, timeframe, 1)
+        auto_synced = False
+        if _market_snapshot_needs_sync(snapshot, CHART_LATEST_AUTO_SYNC_MAX_AGE_DAYS):
+            snapshot = _sync_market_data(symbol, timeframe, force_full=False, snapshot_limit=1)
+            auto_synced = True
         return jsonify(
             {
                 "ok": True,
@@ -2333,6 +2352,8 @@ def get_latest_market_data(symbol: str) -> Response:
                 "latest_quote": snapshot["latest_quote"],
                 "latest_bar": snapshot["latest_bar"],
                 "sync_state": snapshot["sync_state"],
+                "auto_synced": auto_synced,
+                "auto_sync_max_age_days": CHART_LATEST_AUTO_SYNC_MAX_AGE_DAYS,
             }
         )
     except ValueError as exc:
