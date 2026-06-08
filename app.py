@@ -2500,10 +2500,29 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
     if not days_raw:
         return jsonify({"ok": False, "error": "'days' is required."}), 400
 
+    stop_loss_pct = None
+    take_profit_pct = None
+    side = (request.args.get("side") or "long").strip().lower() or "long"
+    stop_loss_raw = (request.args.get("stoploss") or request.args.get("stop_loss") or "").strip()
+    take_profit_raw = (request.args.get("takeprofit") or request.args.get("take_profit") or "").strip()
+
     try:
         days = int(days_raw)
     except ValueError:
         return jsonify({"ok": False, "error": "'days' must be an integer."}), 400
+
+    if stop_loss_raw:
+        try:
+            stop_loss_pct = float(stop_loss_raw)
+        except ValueError:
+            return jsonify({"ok": False, "error": "'stoploss' must be a number."}), 400
+    if take_profit_raw:
+        try:
+            take_profit_pct = float(take_profit_raw)
+        except ValueError:
+            return jsonify({"ok": False, "error": "'takeprofit' must be a number."}), 400
+    if side not in {"long", "short"}:
+        return jsonify({"ok": False, "error": "'side' must be either 'long' or 'short'."}), 400
 
     try:
         normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
@@ -2522,7 +2541,15 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
                 )
             except Exception:
                 pass
-        payload = analytics_service.get_future_state(symbol, normalized_timeframe, asof_dt, days)
+        payload = analytics_service.get_future_state(
+            symbol,
+            normalized_timeframe,
+            asof_dt,
+            days,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            side=side,
+        )
         payload["ok"] = True
         if hide_ts:
             payload = _strip_symbol_and_timestamps(payload)
@@ -2539,7 +2566,15 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
                     end=asof_dt + timedelta(days=max(1, days)),
                     snapshot_limit=1,
                 )
-            payload = analytics_service.get_future_state(symbol, normalized_timeframe, asof_dt, days)
+            payload = analytics_service.get_future_state(
+                symbol,
+                normalized_timeframe,
+                asof_dt,
+                days,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                side=side,
+            )
             payload["ok"] = True
             if hide_ts:
                 payload = _strip_symbol_and_timestamps(payload)

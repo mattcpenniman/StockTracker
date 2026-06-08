@@ -397,6 +397,141 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["future_state"]["price_at_horizon"], 402.0)
         self.assertEqual(payload["future_state"]["price_at_horizon_timestamp"], "2023-09-17T12:45:00Z")
 
+    def test_future_state_reports_stop_loss_and_take_profit_hit_timestamps(self) -> None:
+        repo = Mock()
+        repo.fetch_symbol_context.return_value = {
+            "symbol_id": 1,
+            "symbol": "NVDA",
+            "exchange": "NASDAQ",
+            "asset_class": "us_equity",
+            "name": "NVIDIA Corp",
+            "is_active": True,
+            "created_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "updated_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "last_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_successful_sync_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_quote_synced_at": None,
+            "last_bar_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_bar_time": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_quote_time": None,
+            "sync_status": "idle",
+            "sync_error": None,
+        }
+        intraday_anchor_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2023-09-17T12:15:00Z"], utc=True),
+                "open": [399.0],
+                "high": [401.0],
+                "low": [398.5],
+                "close": [400.0],
+                "volume": [1200.0],
+            }
+        )
+        intraday_future_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        "2023-09-17T12:30:00Z",
+                        "2023-09-17T12:45:00Z",
+                        "2023-09-17T13:00:00Z",
+                    ],
+                    utc=True,
+                ),
+                "open": [400.0, 403.0, 381.0],
+                "high": [404.0, 421.0, 382.0],
+                "low": [399.0, 402.0, 379.0],
+                "close": [403.0, 420.0, 380.0],
+                "volume": [900.0, 800.0, 1000.0],
+            }
+        )
+        repo.fetch_bars.side_effect = [intraday_anchor_bars, intraday_future_bars]
+        service = AnalyticsService(repository=repo)
+
+        payload = service.get_future_state(
+            "NVDA",
+            "1Day",
+            pd.Timestamp("2023-09-17T12:15:00Z"),
+            3,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.05,
+        )
+
+        self.assertEqual(payload["future_state"]["take_profit_price"], 420.0)
+        self.assertEqual(payload["future_state"]["take_profit_hit_timestamp"], "2023-09-17T12:45:00Z")
+        self.assertEqual(payload["future_state"]["stop_loss_price"], 380.0)
+        self.assertEqual(payload["future_state"]["stop_loss_hit_timestamp"], "2023-09-17T13:00:00Z")
+        self.assertEqual(payload["future_state"]["first_threshold_hit"], "take_profit")
+        self.assertEqual(payload["future_state"]["first_threshold_hit_timestamp"], "2023-09-17T12:45:00Z")
+
+    def test_future_state_short_side_flips_stop_loss_and_take_profit_logic(self) -> None:
+        repo = Mock()
+        repo.fetch_symbol_context.return_value = {
+            "symbol_id": 1,
+            "symbol": "NVDA",
+            "exchange": "NASDAQ",
+            "asset_class": "us_equity",
+            "name": "NVIDIA Corp",
+            "is_active": True,
+            "created_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "updated_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+            "last_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_successful_sync_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "last_quote_synced_at": None,
+            "last_bar_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_bar_time": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+            "latest_quote_time": None,
+            "sync_status": "idle",
+            "sync_error": None,
+        }
+        intraday_anchor_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2023-09-17T12:15:00Z"], utc=True),
+                "open": [399.0],
+                "high": [401.0],
+                "low": [398.5],
+                "close": [400.0],
+                "volume": [1200.0],
+            }
+        )
+        intraday_future_bars = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        "2023-09-17T12:30:00Z",
+                        "2023-09-17T12:45:00Z",
+                        "2023-09-17T13:00:00Z",
+                    ],
+                    utc=True,
+                ),
+                "open": [400.0, 378.0, 418.0],
+                "high": [402.0, 379.0, 421.0],
+                "low": [399.0, 379.0, 417.0],
+                "close": [401.0, 380.0, 420.0],
+                "volume": [900.0, 800.0, 1000.0],
+            }
+        )
+        repo.fetch_bars.side_effect = [intraday_anchor_bars, intraday_future_bars]
+        service = AnalyticsService(repository=repo)
+
+        payload = service.get_future_state(
+            "NVDA",
+            "1Day",
+            pd.Timestamp("2023-09-17T12:15:00Z"),
+            3,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.05,
+            side="short",
+        )
+
+        self.assertEqual(payload["side"], "short")
+        self.assertEqual(payload["future_state"]["side"], "short")
+        self.assertEqual(payload["future_state"]["take_profit_price"], 380.0)
+        self.assertEqual(payload["future_state"]["take_profit_hit_timestamp"], "2023-09-17T12:45:00Z")
+        self.assertEqual(payload["future_state"]["stop_loss_price"], 420.0)
+        self.assertEqual(payload["future_state"]["stop_loss_hit_timestamp"], "2023-09-17T13:00:00Z")
+        self.assertEqual(payload["future_state"]["first_threshold_hit"], "take_profit")
+        self.assertEqual(payload["future_state"]["first_threshold_hit_timestamp"], "2023-09-17T12:45:00Z")
+
 
 class StateEndpointHelperTests(unittest.TestCase):
     def test_intraday_anchor_accepts_same_day_bar(self) -> None:

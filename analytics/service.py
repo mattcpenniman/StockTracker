@@ -305,9 +305,18 @@ class AnalyticsService:
         timeframe: str,
         asof_dt,
         days: int,
+        stop_loss_pct: float | None = None,
+        take_profit_pct: float | None = None,
+        side: str = "long",
     ) -> dict[str, Any]:
         if days <= 0:
             raise ValueError("'days' must be greater than zero.")
+        if stop_loss_pct is not None and stop_loss_pct < 0:
+            raise ValueError("'stop_loss_pct' must be greater than or equal to zero.")
+        if take_profit_pct is not None and take_profit_pct < 0:
+            raise ValueError("'take_profit_pct' must be greater than or equal to zero.")
+        if side not in {"long", "short"}:
+            raise ValueError("'side' must be either 'long' or 'short'.")
 
         context = self._context_for_symbol(symbol)
         price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
@@ -317,6 +326,9 @@ class AnalyticsService:
             price_timeframe,
             isoformat_utc(asof_dt),
             days,
+            stop_loss_pct,
+            take_profit_pct,
+            side,
             isoformat_utc(context.get("last_bar_synced_at")),
         )
         cached = self._future_cache.get(cache_key)
@@ -355,12 +367,59 @@ class AnalyticsService:
         min_bar = future_bars.loc[low_idx]
         complete_window = len(future_bars) == days
 
+        if side == "long":
+            stop_loss_price = (anchor_close * (1.0 - stop_loss_pct)) if stop_loss_pct is not None else None
+            take_profit_price = (anchor_close * (1.0 + take_profit_pct)) if take_profit_pct is not None else None
+        else:
+            stop_loss_price = (anchor_close * (1.0 + stop_loss_pct)) if stop_loss_pct is not None else None
+            take_profit_price = (anchor_close * (1.0 - take_profit_pct)) if take_profit_pct is not None else None
+
+        stop_loss_hit = None
+        if stop_loss_price is not None:
+            if side == "long":
+                stop_loss_hits = future_bars[future_bars["low"] <= stop_loss_price]
+            else:
+                stop_loss_hits = future_bars[future_bars["high"] >= stop_loss_price]
+            if not stop_loss_hits.empty:
+                stop_loss_hit = stop_loss_hits.iloc[0]
+
+        take_profit_hit = None
+        if take_profit_price is not None:
+            if side == "long":
+                take_profit_hits = future_bars[future_bars["high"] >= take_profit_price]
+            else:
+                take_profit_hits = future_bars[future_bars["low"] <= take_profit_price]
+            if not take_profit_hits.empty:
+                take_profit_hit = take_profit_hits.iloc[0]
+
+        first_threshold_hit = None
+        first_threshold_hit_timestamp = None
+        if stop_loss_hit is not None and take_profit_hit is not None:
+            stop_loss_hit_ts = pd.Timestamp(stop_loss_hit["timestamp"])
+            take_profit_hit_ts = pd.Timestamp(take_profit_hit["timestamp"])
+            if stop_loss_hit_ts < take_profit_hit_ts:
+                first_threshold_hit = "stop_loss"
+                first_threshold_hit_timestamp = stop_loss_hit["timestamp"]
+            elif take_profit_hit_ts < stop_loss_hit_ts:
+                first_threshold_hit = "take_profit"
+                first_threshold_hit_timestamp = take_profit_hit["timestamp"]
+            else:
+                first_threshold_hit = "both"
+                first_threshold_hit_timestamp = stop_loss_hit["timestamp"]
+        elif stop_loss_hit is not None:
+            first_threshold_hit = "stop_loss"
+            first_threshold_hit_timestamp = stop_loss_hit["timestamp"]
+        elif take_profit_hit is not None:
+            first_threshold_hit = "take_profit"
+            first_threshold_hit_timestamp = take_profit_hit["timestamp"]
+
         payload = clean_json_value(
             {
                 "symbol": context["symbol"],
                 "timeframe": timeframe,
                 "as_of": anchor_timestamp,
                 "horizon_days": days,
+                "side": side,
                 "anchor_price": {
                     "close": anchor_close,
                     "timestamp": anchor_timestamp,
@@ -385,6 +444,15 @@ class AnalyticsService:
                     "price_at_horizon_timestamp": end_bar["timestamp"],
                     "return_at_horizon_pct": (float(end_bar["close"]) / anchor_close) - 1.0 if anchor_close else None,
                     "source_timeframe": price_timeframe,
+                    "side": side,
+                    "stop_loss_pct": stop_loss_pct,
+                    "stop_loss_price": stop_loss_price,
+                    "stop_loss_hit_timestamp": stop_loss_hit["timestamp"] if stop_loss_hit is not None else None,
+                    "take_profit_pct": take_profit_pct,
+                    "take_profit_price": take_profit_price,
+                    "take_profit_hit_timestamp": take_profit_hit["timestamp"] if take_profit_hit is not None else None,
+                    "first_threshold_hit": first_threshold_hit,
+                    "first_threshold_hit_timestamp": first_threshold_hit_timestamp,
                 },
             }
         )
