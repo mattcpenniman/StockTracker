@@ -2643,9 +2643,11 @@ def get_stocks_api() -> Response:
     if limit is not None and not df.empty:
         df = df.head(limit).copy()
 
+    next_earnings_map = _load_next_earnings_map()
     rows = []
     if not df.empty:
         for _, r in df.iterrows():
+            symbol = str(r.get("symbol", "")).upper()
             reward_score = float(r.get("reward_score")) if pd.notna(r.get("reward_score")) else DEFAULT_SCORE
             risk_score = float(r.get("risk_score")) if pd.notna(r.get("risk_score")) else DEFAULT_SCORE
             confidence_score = (
@@ -2653,7 +2655,7 @@ def get_stocks_api() -> Response:
             )
             rows.append(
                 {
-                    "symbol": str(r.get("symbol", "")).upper(),
+                    "symbol": symbol,
                     "forecast_price": float(r["forecast_price"]) if pd.notna(r.get("forecast_price")) else None,
                     "reward_score": reward_score,
                     "risk_score": risk_score,
@@ -2661,6 +2663,7 @@ def get_stocks_api() -> Response:
                     "classification": str(r.get("classification", DEFAULT_CLASSIFICATION)),
                     "opportunity_score": _opportunity_score(reward_score, risk_score, confidence_score),
                     "updated_date": str(r.get("updated_date", "")),
+                    "next_earnings": next_earnings_map.get(symbol),
                 }
             )
     return jsonify(
@@ -2831,7 +2834,7 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
         <p>Possible event types include <code>breakout</code>, <code>breakdown</code>, price crosses vs. <code>SMA 20/50/200</code>, <code>macd_bullish_cross</code>, <code>macd_bearish_cross</code>, <code>rsi_enters_overbought</code>, <code>rsi_enters_oversold</code>, <code>new_high_20</code>, <code>new_low_20</code>, <code>new_high_55</code>, <code>new_low_55</code>, <code>volume_spike</code>, and <code>volatility_spike</code>.</p>
 
         <h2>GET /api/stocks</h2>
-        <p>Returns the latest stored row per stock from PostgreSQL. Optional query parameters: <code>symbol</code> and <code>limit</code>.</p>
+        <p>Returns the latest stored row per stock from PostgreSQL, including <code>updated_date</code> and <code>next_earnings</code>. Optional query parameters: <code>symbol</code> and <code>limit</code>.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/stocks"
 curl -s "http://127.0.0.1:5000/api/stocks?symbol=AAPL"
 curl -s "http://127.0.0.1:5000/api/stocks?limit=10"</code></pre>
