@@ -275,6 +275,32 @@ def _read_df() -> pd.DataFrame:
     return df
 
 
+def _latest_bar_times(symbols: List[str], timeframe: str = "1Day") -> Dict[str, str | None]:
+    out: Dict[str, str | None] = {str(symbol).upper(): None for symbol in symbols}
+    if not symbols:
+        return out
+
+    _init_db_if_needed()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT sm.symbol, max(sb.bar_time)
+                FROM symbol_metadata sm
+                LEFT JOIN stock_bars sb ON sb.symbol_id = sm.id AND sb.timeframe = %s
+                WHERE sm.symbol = ANY(%s)
+                GROUP BY sm.symbol
+                """,
+                (timeframe, symbols),
+            )
+            rows = cur.fetchall()
+
+    for symbol, latest_bar_time in rows:
+        symbol_key = str(symbol).upper()
+        out[symbol_key] = latest_bar_time.astimezone(timezone.utc).isoformat() if latest_bar_time else None
+    return out
+
+
 def _score_field(row: Dict, key: str, symbol: str) -> float:
     raw = row.get(key, DEFAULT_SCORE)
     try:
@@ -1507,6 +1533,36 @@ def index() -> Response:
         return String(av).localeCompare(String(bv));
       }}
 
+      function formatLastBarDate(value) {{
+        if (!value) return '—';
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return String(value);
+        return parsed.toLocaleDateString();
+      }}
+
+      async function updateBars(symbol, btn) {{
+        if (!symbol || !btn) return;
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = 'Updating...';
+        try {{
+          const res = await fetch(`/api/chart/${{encodeURIComponent(symbol)}}/sync`, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ timeframe: '1Day', force_full: false, limit: 1 }}),
+          }});
+          const payload = await res.json();
+          if (!res.ok || !payload.ok) {{
+            throw new Error(payload.error || 'Failed to update bars.');
+          }}
+          await fetchData();
+        }} catch (err) {{
+          alert(err.message || String(err));
+          btn.disabled = false;
+          btn.textContent = old;
+        }}
+      }}
+
       function renderTable() {{
         const data = [...ROWS].sort((a,b) => byKey(a,b,SORT_KEY) * (SORT_ASC ? 1 : -1));
         const tbody = document.getElementById('tbody');
@@ -1521,6 +1577,7 @@ def index() -> Response:
           const macdSignal = r.macd_signal || 'Neutral';
           const macdClass = (macdSignal === 'Bull cross' || macdSignal === 'Positive') ? 'pos' : ((macdSignal === 'Bear cross' || macdSignal === 'Negative') ? 'neg' : 'muted');
           const next_earnings = (r.next_earnings == null || r.next_earnings === '') ? '—' : r.next_earnings;
+          const last_bar = formatLastBarDate(r.latest_bar_time);
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
           const trendClass = r.trend_state === 'Bullish' ? 'pos' : (r.trend_state === 'Bearish' ? 'neg' : 'muted');
 
@@ -1541,6 +1598,8 @@ def index() -> Response:
             <td class=\"num\">${{Number(r.opportunity_score).toFixed(1)}}</td>
             <td class="date">${{r.updated_date || ''}}</td>
             <td class="date">${{next_earnings}}</td>
+            <td class="date">${{last_bar}}</td>
+            <td class="action"><button type="button" class="inline-btn secondary" onclick="updateBars('${{r.symbol}}', this)">Update Bars</button></td>
           `;
           tbody.appendChild(tr);
         }}
@@ -1664,12 +1723,14 @@ def index() -> Response:
         font-weight: 600;
       }}
       button.secondary {{ background: #243447; }}
+      button.inline-btn {{ margin-top: 0; padding: 7px 10px; white-space: nowrap; }}
       .row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
       table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
       th, td {{ border-bottom: 1px solid var(--border); padding: 10px 8px; text-align: left; }}
       th {{ color: var(--muted); font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }}
       td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
       td.date, th.date {{ white-space: nowrap; }}
+      td.action, th.action {{ text-align: right; white-space: nowrap; }}
       .pos {{ color: var(--good); }}
       .neg {{ color: var(--bad); }}
       a {{ color: var(--accent); text-decoration: none; }}
@@ -1760,6 +1821,8 @@ def index() -> Response:
                   <th class=\"num\" data-key=\"opportunity_score\" onclick=\"sortBy('opportunity_score')\">Opportunity</th>
                   <th class=\"date\" data-key=\"updated_date\" onclick=\"sortBy('updated_date')\">Updated</th>
                   <th class=\"date\" data-key=\"next_earnings\" onclick=\"sortBy('next_earnings')\">Next Earnings</th>
+                  <th class=\"date\" data-key=\"latest_bar_time\" onclick=\"sortBy('latest_bar_time')\">Last Bar</th>
+                  <th class=\"action\">Bars</th>
                 </tr>
               </thead>
               <tbody id=\"tbody\"></tbody>
@@ -1796,6 +1859,7 @@ def data() -> Response:
     trend_map: Dict[str, str] = _trend_states(symbols)
     rsi_14_map: Dict[str, float | None] = _rsi_14_values(symbols)
     macd_signal_map: Dict[str, str] = _macd_signals(symbols)
+    latest_bar_map: Dict[str, str | None] = _latest_bar_times(symbols, "1Day")
 
     rows = []
     if not df.empty:
@@ -1841,6 +1905,7 @@ def data() -> Response:
                     "rsi_14": rsi_14_map.get(sym),
                     "macd_signal": macd_signal_map.get(sym, "Neutral"),
                     "trend_state": trend_map.get(sym, "Neutral"),
+                    "latest_bar_time": latest_bar_map.get(sym),
                 }
             )
 
