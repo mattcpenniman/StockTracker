@@ -1336,16 +1336,16 @@ def index() -> Response:
           tr.innerHTML = `
             <td><a href=\"/chart/${{r.symbol}}\" class=\"symbol-link\"><code>${{r.symbol}}</code></a></td>
             <td class=\"num\">${{forecast_price}}</td>
+            <td class=\"num\">${{current_price}}</td>
+            <td class=\"num ${{colorClass}}\">${{diff_dollar}}</td>
+            <td class=\"num ${{colorClass}}\">${{diff_pct}}</td>
             <td class=\"num\">${{Number(r.reward_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.risk_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.confidence_score).toFixed(1)}}</td>
             <td>${{r.classification}}</td>
             <td class=\"num\">${{Number(r.opportunity_score).toFixed(1)}}</td>
-            <td>${{r.updated_date || ''}}</td>
-            <td>${{next_earnings}}</td>
-            <td class=\"num\">${{current_price}}</td>
-            <td class=\"num ${{colorClass}}\">${{diff_dollar}}</td>
-            <td class=\"num ${{colorClass}}\">${{diff_pct}}</td>
+            <td class="date">${{r.updated_date || ''}}</td>
+            <td class="date">${{next_earnings}}</td>
           `;
           tbody.appendChild(tr);
         }}
@@ -1474,6 +1474,7 @@ def index() -> Response:
       th, td {{ border-bottom: 1px solid var(--border); padding: 10px 8px; text-align: left; }}
       th {{ color: var(--muted); font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }}
       td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+      td.date, th.date {{ white-space: nowrap; }}
       .pos {{ color: var(--good); }}
       .neg {{ color: var(--bad); }}
       a {{ color: var(--accent); text-decoration: none; }}
@@ -1551,16 +1552,16 @@ def index() -> Response:
                 <tr>
                   <th data-key=\"symbol\" onclick=\"sortBy('symbol')\">Symbol</th>
                   <th class=\"num\" data-key=\"forecast_price\" onclick=\"sortBy('forecast_price')\">Forecast ($)</th>
+                  <th class=\"num\" data-key=\"current_price\" onclick=\"sortBy('current_price')\">Current ($)</th>
+                  <th class=\"num\" data-key=\"diff_dollar\" onclick=\"sortBy('diff_dollar')\">Δ $</th>
+                  <th class=\"num\" data-key=\"diff_pct\" onclick=\"sortBy('diff_pct')\">Δ %</th>
                   <th class=\"num\" data-key=\"reward_score\" onclick=\"sortBy('reward_score')\">Reward</th>
                   <th class=\"num\" data-key=\"risk_score\" onclick=\"sortBy('risk_score')\">Risk</th>
                   <th class=\"num\" data-key=\"confidence_score\" onclick=\"sortBy('confidence_score')\">Confidence</th>
                   <th data-key=\"classification\" onclick=\"sortBy('classification')\">Class</th>
                   <th class=\"num\" data-key=\"opportunity_score\" onclick=\"sortBy('opportunity_score')\">Opportunity</th>
-                  <th data-key=\"updated_date\" onclick=\"sortBy('updated_date')\">Updated</th>
-                  <th data-key=\"next_earnings\" onclick=\"sortBy('next_earnings')\">Next Earnings</th>
-                  <th class=\"num\" data-key=\"current_price\" onclick=\"sortBy('current_price')\">Current ($)</th>
-                  <th class=\"num\" data-key=\"diff_dollar\" onclick=\"sortBy('diff_dollar')\">Δ $</th>
-                  <th class=\"num\" data-key=\"diff_pct\" onclick=\"sortBy('diff_pct')\">Δ %</th>
+                  <th class=\"date\" data-key=\"updated_date\" onclick=\"sortBy('updated_date')\">Updated</th>
+                  <th class=\"date\" data-key=\"next_earnings\" onclick=\"sortBy('next_earnings')\">Next Earnings</th>
                 </tr>
               </thead>
               <tbody id=\"tbody\"></tbody>
