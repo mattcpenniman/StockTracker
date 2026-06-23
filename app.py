@@ -1851,7 +1851,9 @@ def chart_page(symbol: str) -> Response:
             <label class="toggle"><input id="ma-50" type="checkbox" /> 50</label>
             <label class="toggle"><input id="ma-200" type="checkbox" /> 200</label>
             <label class="toggle"><input id="ema-20" type="checkbox" /> EMA 20</label>
+            <label class="toggle"><input id="bollinger-20" type="checkbox" /> Bollinger 20</label>
             <label class="toggle"><input id="volume-bars" type="checkbox" checked /> Volume</label>
+            <label class="toggle"><input id="rsi-14" type="checkbox" /> RSI 14</label>
           </div>
           <div class="toolbar-group">
             <button id="pan-left-btn" class="secondary" type="button">Earlier</button>
@@ -1933,6 +1935,7 @@ def chart_page(symbol: str) -> Response:
       const EMA_OVERLAYS = [
         {{ period: 20, id: 'ema-20', color: '#2dd4bf' }},
       ];
+      const BOLLINGER_20 = {{ period: 20, id: 'bollinger-20', color: '#7cc4ff' }};
 
       function fmtDate(value) {{
         if (!value) return '-';
@@ -2048,6 +2051,22 @@ def chart_page(symbol: str) -> Response:
         return !!document.getElementById('volume-bars')?.checked;
       }}
 
+      function showRsi14() {{
+        return !!document.getElementById('rsi-14')?.checked;
+      }}
+
+      function showBollinger20() {{
+        return !!document.getElementById(BOLLINGER_20.id)?.checked;
+      }}
+
+      function bollingerStatus(close, band) {{
+        if (!band) return `warming up; needs ${{BOLLINGER_20.period}} bars`;
+        const price = Number(close);
+        if (price > Number(band.upper)) return 'above upper band';
+        if (price < Number(band.lower)) return 'below lower band';
+        return 'inside channel';
+      }}
+
       function movingAverageValues(bars, period) {{
         const values = [];
         let sum = 0;
@@ -2072,6 +2091,63 @@ def chart_page(symbol: str) -> Response:
         return values;
       }}
 
+      function bollingerValues(bars, period = 20, deviations = 2) {{
+        const values = [];
+        let sum = 0;
+        let sumSquares = 0;
+        bars.forEach((bar, idx) => {{
+          const close = Number(bar.c);
+          sum += close;
+          sumSquares += close * close;
+          if (idx >= period) {{
+            const outgoing = Number(bars[idx - period].c);
+            sum -= outgoing;
+            sumSquares -= outgoing * outgoing;
+          }}
+          if (idx < period - 1) {{
+            values.push(null);
+            return;
+          }}
+          const middle = sum / period;
+          const variance = Math.max((sumSquares / period) - (middle * middle), 0);
+          const stdDev = Math.sqrt(variance);
+          values.push({{
+            middle,
+            upper: middle + (deviations * stdDev),
+            lower: middle - (deviations * stdDev),
+          }});
+        }});
+        return values;
+      }}
+
+      function rsiValues(bars, period = 14) {{
+        const values = Array(bars.length).fill(null);
+        if (bars.length <= period) return values;
+
+        let gainSum = 0;
+        let lossSum = 0;
+        for (let idx = 1; idx <= period; idx++) {{
+          const change = Number(bars[idx].c) - Number(bars[idx - 1].c);
+          if (change >= 0) gainSum += change;
+          else lossSum += Math.abs(change);
+        }}
+
+        let avgGain = gainSum / period;
+        let avgLoss = lossSum / period;
+        values[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + (avgGain / avgLoss)));
+
+        for (let idx = period + 1; idx < bars.length; idx++) {{
+          const change = Number(bars[idx].c) - Number(bars[idx - 1].c);
+          const gain = Math.max(change, 0);
+          const loss = Math.max(-change, 0);
+          avgGain = ((avgGain * (period - 1)) + gain) / period;
+          avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+          values[idx] = avgLoss === 0 ? 100 : 100 - (100 / (1 + (avgGain / avgLoss)));
+        }}
+
+        return values;
+      }}
+
       function drawLineSeries(values, pointX, pointY, color, width = 2) {{
         ctx.beginPath();
         let started = false;
@@ -2090,6 +2166,30 @@ def chart_page(symbol: str) -> Response:
         ctx.strokeStyle = color;
         ctx.lineWidth = width;
         ctx.stroke();
+      }}
+
+      function drawBollingerChannel(values, pointX, pointY) {{
+        const points = values
+          .map((band, idx) => band ? {{ idx, upper: Number(band.upper), lower: Number(band.lower) }} : null)
+          .filter((point) => point && !Number.isNaN(point.upper) && !Number.isNaN(point.lower));
+        if (!points.length) return;
+
+        ctx.beginPath();
+        points.forEach((point, idx) => {{
+          const x = pointX(point.idx);
+          const y = pointY(point.upper);
+          if (idx === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }});
+        [...points].reverse().forEach((point) => {{
+          ctx.lineTo(pointX(point.idx), pointY(point.lower));
+        }});
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(124, 196, 255, 0.12)';
+        ctx.fill();
+
+        drawLineSeries(values.map((band) => band ? band.upper : null), pointX, pointY, 'rgba(124, 196, 255, 0.78)', 1.5);
+        drawLineSeries(values.map((band) => band ? band.lower : null), pointX, pointY, 'rgba(124, 196, 255, 0.78)', 1.5);
       }}
 
       function drawCandlesticks(bars, pointX, pointY, slotWidth) {{
@@ -2146,6 +2246,39 @@ def chart_page(symbol: str) -> Response:
         }});
       }}
 
+      function drawRsiPanel(rsiValuesForViewport, pointX, padLeft, padRight, top, height) {{
+        const bottom = top + height;
+        const pointRsiY = (value) => top + ((100 - value) / 100) * height;
+
+        ctx.fillStyle = 'rgba(7, 17, 28, 0.62)';
+        ctx.fillRect(padLeft, top, canvas.width - padLeft - padRight, height);
+        ctx.strokeStyle = 'rgba(159, 176, 192, 0.22)';
+        ctx.strokeRect(padLeft, top, canvas.width - padLeft - padRight, height);
+
+        ctx.font = '12px Georgia';
+        [70, 50, 30].forEach((level) => {{
+          const y = pointRsiY(level);
+          ctx.strokeStyle = level === 50 ? 'rgba(159, 176, 192, 0.28)' : 'rgba(253, 176, 34, 0.32)';
+          ctx.setLineDash(level === 50 ? [] : [5, 5]);
+          ctx.beginPath();
+          ctx.moveTo(padLeft, y);
+          ctx.lineTo(canvas.width - padRight, y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = '#9fb0c0';
+          ctx.fillText(String(level), 16, y + 4);
+        }});
+
+        drawLineSeries(rsiValuesForViewport, pointX, pointRsiY, '#f97066', 2);
+
+        ctx.fillStyle = '#f97066';
+        ctx.fillRect(padLeft, top - 14, 18, 3);
+        ctx.fillStyle = '#d7f0ff';
+        ctx.fillText('RSI 14', padLeft + 24, top - 9);
+
+        return {{ top, bottom, pointRsiY }};
+      }}
+
       function drawChart(bars, startIndex = 0) {{
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         if (!bars.length) {{
@@ -2158,6 +2291,10 @@ def chart_page(symbol: str) -> Response:
         const highs = bars.map((b) => Number(b.h));
         const lows = bars.map((b) => Number(b.l));
         const averageSource = ALL_BARS.length ? ALL_BARS : bars;
+        const showRsi = showRsi14();
+        const rsiSeries = showRsi
+          ? rsiValues(averageSource, 14).slice(startIndex, startIndex + bars.length)
+          : [];
         const enabledMovingAverages = getEnabledMovingAverages().map((ma) => ({{
           ...ma,
           values: movingAverageValues(averageSource, ma.period).slice(startIndex, startIndex + bars.length),
@@ -2166,22 +2303,29 @@ def chart_page(symbol: str) -> Response:
           ...ema,
           values: emaValues(averageSource, ema.period).slice(startIndex, startIndex + bars.length),
         }}));
+        const bollingerSeries = showBollinger20()
+          ? bollingerValues(averageSource, BOLLINGER_20.period).slice(startIndex, startIndex + bars.length)
+          : [];
         const overlays = enabledMovingAverages.concat(enabledEmas);
         const overlayValues = overlays.flatMap((overlay) => overlay.values.filter((value) => value != null));
-        const max = Math.max(...highs, ...overlayValues);
-        const min = Math.min(...lows, ...overlayValues);
+        const bollingerRangeValues = bollingerSeries.flatMap((band) => band ? [band.upper, band.lower] : []);
+        const max = Math.max(...highs, ...overlayValues, ...bollingerRangeValues);
+        const min = Math.min(...lows, ...overlayValues, ...bollingerRangeValues);
         const padLeft = 52;
         const padRight = 22;
         const padTop = 24;
         const padBottom = 38;
+        const rsiGap = showRsi ? 30 : 0;
+        const rsiHeight = showRsi ? Math.max(96, Math.min(150, Math.round(canvas.height * 0.22))) : 0;
+        const priceBottom = canvas.height - padBottom - rsiHeight - rsiGap;
         const w = canvas.width - padLeft - padRight;
-        const h = canvas.height - padTop - padBottom;
+        const h = Math.max(120, priceBottom - padTop);
         const range = Math.max(max - min, 0.0001);
         const pointX = (idx) => padLeft + ((bars.length === 1 ? 0.5 : idx / (bars.length - 1)) * w);
         const pointY = (value) => padTop + ((max - value) / range) * h;
 
         clampHoverIndex(bars);
-        LAST_DRAW_STATE = {{ bars, padLeft, padRight, padTop, padBottom, w, h, max, min, range, pointX, pointY }};
+        LAST_DRAW_STATE = {{ bars, rsiSeries, bollingerSeries, padLeft, padRight, padTop, padBottom, w, h, max, min, range, pointX, pointY }};
 
         ctx.strokeStyle = 'rgba(159, 176, 192, 0.18)';
         ctx.lineWidth = 1;
@@ -2202,8 +2346,12 @@ def chart_page(symbol: str) -> Response:
           ctx.fillText(fmtPrice(value), 8, y + 4);
         }}
 
+        if (bollingerSeries.length) {{
+          drawBollingerChannel(bollingerSeries, pointX, pointY);
+        }}
+
         if (showVolumeBars()) {{
-          drawVolumeBars(bars, pointX, padLeft, padRight, canvas.height - padBottom, bars.length > 1 ? w / (bars.length - 1) : w);
+          drawVolumeBars(bars, pointX, padLeft, padRight, priceBottom, bars.length > 1 ? w / (bars.length - 1) : w);
         }}
 
         if (chartType === 'candles') {{
@@ -2217,9 +2365,22 @@ def chart_page(symbol: str) -> Response:
 
         overlays.forEach((overlay) => drawLineSeries(overlay.values, pointX, pointY, overlay.color, 2));
 
-        if (overlays.length) {{
+        if (showRsi) {{
+          const rsiPanel = drawRsiPanel(rsiSeries, pointX, padLeft, padRight, priceBottom + rsiGap, rsiHeight);
+          LAST_DRAW_STATE.rsiPanel = rsiPanel;
+        }}
+
+        if (overlays.length || bollingerSeries.length) {{
           ctx.font = '12px Georgia';
           let legendX = padLeft;
+          if (bollingerSeries.length) {{
+            const label = 'Bollinger 20';
+            ctx.fillStyle = BOLLINGER_20.color;
+            ctx.fillRect(legendX, padTop - 14, 18, 3);
+            ctx.fillStyle = '#d7f0ff';
+            ctx.fillText(label, legendX + 24, padTop - 9);
+            legendX += ctx.measureText(label).width + 58;
+          }}
           overlays.forEach((overlay) => {{
             const label = `${{overlay.id.startsWith('ema') ? 'EMA' : 'MA'}} ${{overlay.period}}`;
             ctx.fillStyle = overlay.color;
@@ -2252,16 +2413,26 @@ def chart_page(symbol: str) -> Response:
           const hovered = bars[HOVER_INDEX];
           const hoverX = pointX(HOVER_INDEX);
           const hoverY = pointY(Number(hovered.c));
+          const rsiValue = rsiSeries[HOVER_INDEX];
+          const bollingerValue = bollingerSeries[HOVER_INDEX];
 
           ctx.strokeStyle = 'rgba(215, 240, 255, 0.55)';
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
           ctx.moveTo(hoverX, padTop);
-          ctx.lineTo(hoverX, canvas.height - padBottom);
+          ctx.lineTo(hoverX, showRsi && LAST_DRAW_STATE.rsiPanel ? LAST_DRAW_STATE.rsiPanel.bottom : priceBottom);
           ctx.moveTo(padLeft, hoverY);
           ctx.lineTo(canvas.width - padRight, hoverY);
           ctx.stroke();
           ctx.setLineDash([]);
+
+          if (showRsi && LAST_DRAW_STATE.rsiPanel && rsiValue != null) {{
+            const rsiY = LAST_DRAW_STATE.rsiPanel.pointRsiY(Number(rsiValue));
+            ctx.fillStyle = '#f97066';
+            ctx.beginPath();
+            ctx.arc(hoverX, rsiY, 4, 0, Math.PI * 2);
+            ctx.fill();
+          }}
 
           ctx.fillStyle = '#d7f0ff';
           ctx.beginPath();
@@ -2269,7 +2440,11 @@ def chart_page(symbol: str) -> Response:
           ctx.fill();
 
           const tooltipDate = formatAxisLabel(hovered.t);
-          const tooltipText = `${{tooltipDate}}  O ${{fmtPrice(hovered.o)}}  H ${{fmtPrice(hovered.h)}}  L ${{fmtPrice(hovered.l)}}  C ${{fmtPrice(hovered.c)}}`;
+          const rsiText = showRsi && rsiValue != null ? `  RSI ${{fmtPrice(rsiValue)}}` : '';
+          const bollingerText = showBollinger20()
+            ? `  BB20 ${{bollingerStatus(hovered.c, bollingerValue)}}${{bollingerValue ? ` U ${{fmtPrice(bollingerValue.upper)}} L ${{fmtPrice(bollingerValue.lower)}}` : ''}}`
+            : '';
+          const tooltipText = `${{tooltipDate}}  O ${{fmtPrice(hovered.o)}}  H ${{fmtPrice(hovered.h)}}  L ${{fmtPrice(hovered.l)}}  C ${{fmtPrice(hovered.c)}}${{rsiText}}${{bollingerText}}`;
           ctx.font = '12px Georgia';
           const tooltipWidth = ctx.measureText(tooltipText).width + 18;
           const tooltipHeight = 24;
@@ -2293,20 +2468,36 @@ def chart_page(symbol: str) -> Response:
         const lastBar = visibleBars.length ? visibleBars[visibleBars.length - 1] : null;
         const firstBar = visibleBars.length ? visibleBars[0] : null;
         const hoveredBar = (HOVER_INDEX != null && visibleBars[HOVER_INDEX]) ? visibleBars[HOVER_INDEX] : null;
+        const visibleRsiValues = showRsi14()
+          ? rsiValues(ALL_BARS, 14).slice(viewportStart, viewportStart + visibleBars.length)
+          : [];
+        const visibleBollingerValues = showBollinger20()
+          ? bollingerValues(ALL_BARS, BOLLINGER_20.period).slice(viewportStart, viewportStart + visibleBars.length)
+          : [];
+        const latestRsi = visibleRsiValues.length ? visibleRsiValues[visibleRsiValues.length - 1] : null;
+        const hoveredRsi = hoveredBar && HOVER_INDEX != null ? visibleRsiValues[HOVER_INDEX] : null;
+        const latestBollinger = visibleBollingerValues.length ? visibleBollingerValues[visibleBollingerValues.length - 1] : null;
+        const hoveredBollinger = hoveredBar && HOVER_INDEX != null ? visibleBollingerValues[HOVER_INDEX] : null;
         const chartLabel = getChartType() === 'candles' ? 'candlestick' : 'line';
         const indicatorLabels = getEnabledMovingAverages()
           .map((ma) => `MA${{ma.period}}`)
           .concat(getEnabledEmas().map((ema) => `EMA${{ema.period}}`));
+        if (showBollinger20()) indicatorLabels.push('BB20');
         if (showVolumeBars()) indicatorLabels.push('volume');
+        if (showRsi14()) indicatorLabels.push('RSI14');
         const indicatorLabel = indicatorLabels.join(', ') || 'no overlays';
+        const rsiSummary = showRsi14() && latestRsi != null ? ` Latest RSI14: ${{fmtPrice(latestRsi)}}.` : '';
+        const bollingerSummary = showBollinger20()
+          ? ` Latest BB20: ${{bollingerStatus(lastBar?.c, latestBollinger)}}${{latestBollinger ? `; upper ${{fmtPrice(latestBollinger.upper)}}, middle ${{fmtPrice(latestBollinger.middle)}}, lower ${{fmtPrice(latestBollinger.lower)}}` : ''}}.`
+          : '';
         document.getElementById('chart-summary').textContent = visibleBars.length
-          ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}} as a ${{chartLabel}} chart with ${{indicatorLabel}}.`
+          ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}} as a ${{chartLabel}} chart with ${{indicatorLabel}}.${{rsiSummary}}${{bollingerSummary}}`
           : `No ${{CURRENT_TIMEFRAME}} bars stored for ${{SYMBOL}}.`;
         document.getElementById('range-summary').textContent = visibleBars.length
           ? `Viewport: ${{formatAxisLabel(firstBar.t)}} to ${{formatAxisLabel(lastBar.t)}}`
           : 'No viewport available yet.';
         document.getElementById('hover-summary').textContent = hoveredBar
-          ? `Hovered bar: ${{fmtDate(hoveredBar.t)}} | Close $${{fmtPrice(hoveredBar.c)}} | High $${{fmtPrice(hoveredBar.h)}} | Low $${{fmtPrice(hoveredBar.l)}}`
+          ? `Hovered bar: ${{fmtDate(hoveredBar.t)}} | Close $${{fmtPrice(hoveredBar.c)}} | High $${{fmtPrice(hoveredBar.h)}} | Low $${{fmtPrice(hoveredBar.l)}}${{hoveredRsi != null ? ` | RSI14 ${{fmtPrice(hoveredRsi)}}` : ''}}${{showBollinger20() ? ` | BB20 ${{bollingerStatus(hoveredBar.c, hoveredBollinger)}}${{hoveredBollinger ? ` U ${{fmtPrice(hoveredBollinger.upper)}} M ${{fmtPrice(hoveredBollinger.middle)}} L ${{fmtPrice(hoveredBollinger.lower)}}` : ''}}` : ''}}`
           : 'Hover over the chart to inspect a bar.';
         document.getElementById('last-close').textContent = lastBar ? fmtPrice(lastBar.c) : '-';
         document.getElementById('bar-count').textContent = String(ALL_BARS.length);
@@ -2459,7 +2650,9 @@ def chart_page(symbol: str) -> Response:
         EMA_OVERLAYS.forEach((ema) => {{
           document.getElementById(ema.id).addEventListener('change', renderViewport);
         }});
+        document.getElementById(BOLLINGER_20.id).addEventListener('change', renderViewport);
         document.getElementById('volume-bars').addEventListener('change', renderViewport);
+        document.getElementById('rsi-14').addEventListener('change', renderViewport);
         document.getElementById('reload-btn').addEventListener('click', () => loadChart({{ autoSync: false, showReloadMessage: true }}).catch((err) => setStatus(err.message, true)));
         document.getElementById('sync-btn').addEventListener('click', syncNow);
         document.getElementById('pan-left-btn').addEventListener('click', () => panViewport(-1));
