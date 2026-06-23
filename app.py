@@ -523,6 +523,66 @@ def _trend_states(symbols: List[str]) -> Dict[str, str]:
     return out
 
 
+def _rsi_14_values(symbols: List[str]) -> Dict[str, float | None]:
+    out: Dict[str, float | None] = {str(symbol).upper(): None for symbol in symbols}
+    if not out:
+        return out
+
+    _init_db_if_needed()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol, close
+                FROM (
+                    SELECT sm.symbol, sb.bar_time, sb.close,
+                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
+                    FROM symbol_metadata sm
+                    JOIN stock_bars sb ON sb.symbol_id = sm.id
+                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
+                ) bars
+                WHERE rn <= 250
+                ORDER BY symbol ASC, bar_time ASC
+                """,
+                (list(out.keys()),),
+            )
+            rows = cur.fetchall()
+
+    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
+    for symbol, close in rows:
+        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+
+    period = 14
+    for symbol, closes in closes_by_symbol.items():
+        if len(closes) <= period:
+            continue
+
+        gain_sum = 0.0
+        loss_sum = 0.0
+        for idx in range(1, period + 1):
+            change = closes[idx] - closes[idx - 1]
+            if change >= 0:
+                gain_sum += change
+            else:
+                loss_sum += abs(change)
+
+        avg_gain = gain_sum / period
+        avg_loss = loss_sum / period
+        rsi = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+
+        for idx in range(period + 1, len(closes)):
+            change = closes[idx] - closes[idx - 1]
+            gain = max(change, 0.0)
+            loss = max(-change, 0.0)
+            avg_gain = ((avg_gain * (period - 1)) + gain) / period
+            avg_loss = ((avg_loss * (period - 1)) + loss) / period
+            rsi = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+
+        out[symbol] = rsi
+
+    return out
+
+
 def _add_months(d: date, months: int) -> date:
     """Return a date shifted by N calendar months, clamping day to month end."""
     month_index = (d.month - 1) + months
@@ -1377,6 +1437,8 @@ def index() -> Response:
           const diff_pct = r.diff_pct == null ? '—' : (r.diff_pct).toFixed(2) + '%';
           const current_price = r.current_price == null ? '—' : r.current_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
           const forecast_price = r.forecast_price == null ? '—' : r.forecast_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+          const rsi_14 = r.rsi_14 == null ? '—' : Number(r.rsi_14).toFixed(1);
+          const rsiClass = r.rsi_14 == null ? 'muted' : (r.rsi_14 < 30 || (r.rsi_14 >= 50 && r.rsi_14 <= 70) ? 'pos' : (r.rsi_14 > 70 ? 'neg' : 'muted'));
           const next_earnings = (r.next_earnings == null || r.next_earnings === '') ? '—' : r.next_earnings;
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
           const trendClass = r.trend_state === 'Bullish' ? 'pos' : (r.trend_state === 'Bearish' ? 'neg' : 'muted');
@@ -1388,6 +1450,7 @@ def index() -> Response:
             <td class=\"num\">${{current_price}}</td>
             <td class=\"num ${{colorClass}}\">${{diff_dollar}}</td>
             <td class=\"num ${{colorClass}}\">${{diff_pct}}</td>
+            <td class=\"num ${{rsiClass}}\">${{rsi_14}}</td>
             <td class=\"${{trendClass}}\">${{r.trend_state || 'Neutral'}}</td>
             <td class=\"num\">${{Number(r.reward_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.risk_score).toFixed(1)}}</td>
@@ -1605,6 +1668,7 @@ def index() -> Response:
                   <th class=\"num\" data-key=\"current_price\" onclick=\"sortBy('current_price')\">Current ($)</th>
                   <th class=\"num\" data-key=\"diff_dollar\" onclick=\"sortBy('diff_dollar')\">Δ $</th>
                   <th class=\"num\" data-key=\"diff_pct\" onclick=\"sortBy('diff_pct')\">Δ %</th>
+                  <th class=\"num\" data-key=\"rsi_14\" onclick=\"sortBy('rsi_14')\">RSI 14</th>
                   <th data-key=\"trend_state\" onclick=\"sortBy('trend_state')\">Trend</th>
                   <th class=\"num\" data-key=\"reward_score\" onclick=\"sortBy('reward_score')\">Reward</th>
                   <th class=\"num\" data-key=\"risk_score\" onclick=\"sortBy('risk_score')\">Risk</th>
@@ -1647,6 +1711,7 @@ def data() -> Response:
     prices: Dict[str, float | None] = _fetch_current_prices(symbols)
     next_map: Dict[str, str] = _load_next_earnings_map()
     trend_map: Dict[str, str] = _trend_states(symbols)
+    rsi_14_map: Dict[str, float | None] = _rsi_14_values(symbols)
 
     rows = []
     if not df.empty:
@@ -1689,6 +1754,7 @@ def data() -> Response:
                     "current_price": cur,
                     "diff_dollar": diff_dollar,
                     "diff_pct": diff_pct,
+                    "rsi_14": rsi_14_map.get(sym),
                     "trend_state": trend_map.get(sym, "Neutral"),
                 }
             )
