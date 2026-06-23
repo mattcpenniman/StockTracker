@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 from flask import Flask, Response, jsonify, request
@@ -579,6 +579,81 @@ def _rsi_14_values(symbols: List[str]) -> Dict[str, float | None]:
             rsi = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
 
         out[symbol] = rsi
+
+    return out
+
+
+def _ema_number_values(values: Sequence[float | None], period: int) -> List[float | None]:
+    out: List[float | None] = []
+    multiplier = 2.0 / (period + 1.0)
+    ema = None
+    valid_count = 0
+    for value in values:
+        if value is None:
+            out.append(None)
+            continue
+        valid_count += 1
+        ema = value if ema is None else (value * multiplier) + (ema * (1.0 - multiplier))
+        out.append(ema if valid_count >= period else None)
+    return out
+
+
+def _macd_signals(symbols: List[str]) -> Dict[str, str]:
+    out = {str(symbol).upper(): "Neutral" for symbol in symbols}
+    if not out:
+        return out
+
+    _init_db_if_needed()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol, close
+                FROM (
+                    SELECT sm.symbol, sb.bar_time, sb.close,
+                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
+                    FROM symbol_metadata sm
+                    JOIN stock_bars sb ON sb.symbol_id = sm.id
+                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
+                ) bars
+                WHERE rn <= 250
+                ORDER BY symbol ASC, bar_time ASC
+                """,
+                (list(out.keys()),),
+            )
+            rows = cur.fetchall()
+
+    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
+    for symbol, close in rows:
+        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+
+    for symbol, closes in closes_by_symbol.items():
+        if len(closes) < 35:
+            continue
+
+        ema12 = _ema_number_values(closes, 12)
+        ema26 = _ema_number_values(closes, 26)
+        macd_line = [
+            (fast - slow) if fast is not None and slow is not None else None
+            for fast, slow in zip(ema12, ema26)
+        ]
+        signal_line = _ema_number_values(macd_line, 9)
+        hist = [
+            (macd - signal) if macd is not None and signal is not None else None
+            for macd, signal in zip(macd_line, signal_line)
+        ]
+        previous = hist[-2]
+        latest = hist[-1]
+        if previous is None or latest is None:
+            continue
+        if previous <= 0 and latest > 0:
+            out[symbol] = "Bull cross"
+        elif previous >= 0 and latest < 0:
+            out[symbol] = "Bear cross"
+        elif latest > 0:
+            out[symbol] = "Positive"
+        elif latest < 0:
+            out[symbol] = "Negative"
 
     return out
 
@@ -1424,6 +1499,10 @@ def index() -> Response:
           const trendOrder = {{ Bearish: -1, Neutral: 0, Bullish: 1 }};
           return (trendOrder[av] ?? 0) - (trendOrder[bv] ?? 0);
         }}
+        if (key === 'macd_signal') {{
+          const macdOrder = {{ 'Bear cross': -2, Negative: -1, Neutral: 0, Positive: 1, 'Bull cross': 2 }};
+          return (macdOrder[av] ?? 0) - (macdOrder[bv] ?? 0);
+        }}
         if (typeof av === 'number' && typeof bv === 'number') return av - bv;
         return String(av).localeCompare(String(bv));
       }}
@@ -1439,6 +1518,8 @@ def index() -> Response:
           const forecast_price = r.forecast_price == null ? '—' : r.forecast_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
           const rsi_14 = r.rsi_14 == null ? '—' : Number(r.rsi_14).toFixed(1);
           const rsiClass = r.rsi_14 == null ? 'muted' : (r.rsi_14 < 30 || (r.rsi_14 >= 50 && r.rsi_14 <= 70) ? 'pos' : (r.rsi_14 > 70 ? 'neg' : 'muted'));
+          const macdSignal = r.macd_signal || 'Neutral';
+          const macdClass = (macdSignal === 'Bull cross' || macdSignal === 'Positive') ? 'pos' : ((macdSignal === 'Bear cross' || macdSignal === 'Negative') ? 'neg' : 'muted');
           const next_earnings = (r.next_earnings == null || r.next_earnings === '') ? '—' : r.next_earnings;
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
           const trendClass = r.trend_state === 'Bullish' ? 'pos' : (r.trend_state === 'Bearish' ? 'neg' : 'muted');
@@ -1451,6 +1532,7 @@ def index() -> Response:
             <td class=\"num ${{colorClass}}\">${{diff_dollar}}</td>
             <td class=\"num ${{colorClass}}\">${{diff_pct}}</td>
             <td class=\"num ${{rsiClass}}\">${{rsi_14}}</td>
+            <td class=\"${{macdClass}}\">${{macdSignal}}</td>
             <td class=\"${{trendClass}}\">${{r.trend_state || 'Neutral'}}</td>
             <td class=\"num\">${{Number(r.reward_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.risk_score).toFixed(1)}}</td>
@@ -1669,6 +1751,7 @@ def index() -> Response:
                   <th class=\"num\" data-key=\"diff_dollar\" onclick=\"sortBy('diff_dollar')\">Δ $</th>
                   <th class=\"num\" data-key=\"diff_pct\" onclick=\"sortBy('diff_pct')\">Δ %</th>
                   <th class=\"num\" data-key=\"rsi_14\" onclick=\"sortBy('rsi_14')\">RSI 14</th>
+                  <th data-key=\"macd_signal\" onclick=\"sortBy('macd_signal')\">MACD</th>
                   <th data-key=\"trend_state\" onclick=\"sortBy('trend_state')\">Trend</th>
                   <th class=\"num\" data-key=\"reward_score\" onclick=\"sortBy('reward_score')\">Reward</th>
                   <th class=\"num\" data-key=\"risk_score\" onclick=\"sortBy('risk_score')\">Risk</th>
@@ -1712,6 +1795,7 @@ def data() -> Response:
     next_map: Dict[str, str] = _load_next_earnings_map()
     trend_map: Dict[str, str] = _trend_states(symbols)
     rsi_14_map: Dict[str, float | None] = _rsi_14_values(symbols)
+    macd_signal_map: Dict[str, str] = _macd_signals(symbols)
 
     rows = []
     if not df.empty:
@@ -1755,6 +1839,7 @@ def data() -> Response:
                     "diff_dollar": diff_dollar,
                     "diff_pct": diff_pct,
                     "rsi_14": rsi_14_map.get(sym),
+                    "macd_signal": macd_signal_map.get(sym, "Neutral"),
                     "trend_state": trend_map.get(sym, "Neutral"),
                 }
             )
