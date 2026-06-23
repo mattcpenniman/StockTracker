@@ -100,6 +100,91 @@ def _opportunity_score(reward_score: float, risk_score: float, confidence_score:
     return (reward_score * 4.0) + ((10.0 - risk_score) * 4.0) + (confidence_score * 2.0)
 
 
+def _action_score(row: Dict) -> float:
+    if (
+        row.get("rsi_14") is None
+        and row.get("dist_ma20_pct") is None
+        and row.get("dist_ma50_pct") is None
+        and row.get("trend_state") in (None, "Neutral")
+        and row.get("macd_signal") in (None, "Neutral")
+    ):
+        return 0.0
+
+    score = 0.0
+
+    diff_pct = row.get("diff_pct")
+    if diff_pct is not None:
+        try:
+            score += max(0.0, min(float(diff_pct), 30.0))
+        except Exception:
+            pass
+
+    trend_state = row.get("trend_state")
+    if trend_state == "Bullish":
+        score += 20.0
+    elif trend_state == "Neutral":
+        score += 10.0
+
+    ma_stack = str(row.get("ma_stack") or "")
+    dist_ma20_pct = row.get("dist_ma20_pct")
+    dist_ma50_pct = row.get("dist_ma50_pct")
+    if ma_stack.startswith("Price > MA20 > MA50 > MA200"):
+        score += 15.0
+    elif dist_ma20_pct is not None and dist_ma50_pct is not None:
+        try:
+            if float(dist_ma20_pct) > 0 and float(dist_ma50_pct) > 0:
+                score += 10.0
+            elif float(dist_ma50_pct) > 0:
+                score += 6.0
+        except Exception:
+            pass
+    elif dist_ma50_pct is not None:
+        try:
+            if float(dist_ma50_pct) > 0:
+                score += 6.0
+        except Exception:
+            pass
+
+    rsi_14 = row.get("rsi_14")
+    if rsi_14 is not None:
+        try:
+            rsi = float(rsi_14)
+            if 50.0 <= rsi <= 65.0:
+                score += 15.0
+            elif 45.0 <= rsi < 50.0 or 65.0 < rsi <= 70.0:
+                score += 10.0
+            elif 30.0 <= rsi < 45.0:
+                score += 6.0
+            elif rsi > 70.0:
+                score += 3.0
+            elif rsi < 30.0:
+                score += 5.0
+        except Exception:
+            pass
+
+    macd_signal = row.get("macd_signal")
+    if macd_signal == "Bull cross":
+        score += 15.0
+    elif macd_signal == "Positive":
+        score += 10.0
+    elif macd_signal == "Neutral":
+        score += 5.0
+    elif macd_signal == "Negative":
+        score += 2.0
+
+    if dist_ma20_pct is not None:
+        try:
+            dist_ma20 = float(dist_ma20_pct)
+            if dist_ma20 > 12.0:
+                score -= 10.0
+            elif dist_ma20 > 8.0:
+                score -= 5.0
+        except Exception:
+            pass
+
+    return round(max(0.0, min(score, 100.0)), 1)
+
+
 def _get_conn():
     if psycopg2 is None:
         raise RuntimeError("Missing dependency: psycopg2-binary is required for PostgreSQL access.")
@@ -1550,7 +1635,7 @@ def index() -> Response:
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
     <title>Stock Forecast Tracker</title>
     <script>
-      let SORT_KEY = 'opportunity_score';
+      let SORT_KEY = 'action_score';
       let SORT_ASC = false;
       let ROWS = [];
 
@@ -1660,6 +1745,8 @@ def index() -> Response:
           const diff_pct = r.diff_pct == null ? '—' : (r.diff_pct).toFixed(2) + '%';
           const current_price = r.current_price == null ? '—' : r.current_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
           const forecast_price = r.forecast_price == null ? '—' : r.forecast_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+          const actionScore = r.action_score == null ? '—' : Number(r.action_score).toFixed(1);
+          const actionClass = r.action_score == null ? 'muted' : (r.action_score >= 75 ? 'pos' : (r.action_score < 40 ? 'neg' : ''));
           const rsi_14 = r.rsi_14 == null ? '—' : Number(r.rsi_14).toFixed(1);
           const rsiClass = r.rsi_14 == null ? 'muted' : (r.rsi_14 < 30 || (r.rsi_14 >= 50 && r.rsi_14 <= 70) ? 'pos' : (r.rsi_14 > 70 ? 'neg' : 'muted'));
           const macdSignal = r.macd_signal || 'Neutral';
@@ -1689,6 +1776,7 @@ def index() -> Response:
             <td class=\"num\">${{Number(r.risk_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.confidence_score).toFixed(1)}}</td>
             <td>${{r.classification}}</td>
+            <td class=\"num ${{actionClass}}\">${{actionScore}}</td>
             <td class=\"num\">${{Number(r.opportunity_score).toFixed(1)}}</td>
             <td class="date">${{r.updated_date || ''}}</td>
             <td class="date">${{next_earnings}}</td>
@@ -1920,6 +2008,7 @@ def index() -> Response:
                   <th class=\"num\" data-key=\"risk_score\" onclick=\"sortBy('risk_score')\">Risk</th>
                   <th class=\"num\" data-key=\"confidence_score\" onclick=\"sortBy('confidence_score')\">Confidence</th>
                   <th data-key=\"classification\" onclick=\"sortBy('classification')\">Class</th>
+                  <th class=\"num\" data-key=\"action_score\" onclick=\"sortBy('action_score')\">Action</th>
                   <th class=\"num\" data-key=\"opportunity_score\" onclick=\"sortBy('opportunity_score')\">Opportunity</th>
                   <th class=\"date\" data-key=\"updated_date\" onclick=\"sortBy('updated_date')\">Updated</th>
                   <th class=\"date\" data-key=\"next_earnings\" onclick=\"sortBy('next_earnings')\">Next Earnings</th>
@@ -1992,28 +2081,28 @@ def data() -> Response:
                 except Exception:
                     diff_pct = None
 
-            rows.append(
-                {
-                    "symbol": sym,
-                    "forecast_price": fpx,
-                    "reward_score": reward_score,
-                    "risk_score": risk_score,
-                    "confidence_score": confidence_score,
-                    "classification": classification,
-                    "opportunity_score": _opportunity_score(reward_score, risk_score, confidence_score),
-                    "updated_date": str(r.get("updated_date", "")),
-                    "next_earnings": next_map.get(sym),
-                    "current_price": cur,
-                    "diff_dollar": diff_dollar,
-                    "diff_pct": diff_pct,
-                    "rsi_14": rsi_14_map.get(sym),
-                    "macd_signal": macd_signal_map.get(sym, "Neutral"),
-                    "trend_state": trend_map.get(sym, "Neutral"),
-                    "dist_ma20_pct": ma_distances.get("dist_ma20_pct"),
-                    "dist_ma50_pct": ma_distances.get("dist_ma50_pct"),
-                    "latest_bar_time": latest_bar_map.get(sym),
-                }
-            )
+            row_data = {
+                "symbol": sym,
+                "forecast_price": fpx,
+                "reward_score": reward_score,
+                "risk_score": risk_score,
+                "confidence_score": confidence_score,
+                "classification": classification,
+                "opportunity_score": _opportunity_score(reward_score, risk_score, confidence_score),
+                "updated_date": str(r.get("updated_date", "")),
+                "next_earnings": next_map.get(sym),
+                "current_price": cur,
+                "diff_dollar": diff_dollar,
+                "diff_pct": diff_pct,
+                "rsi_14": rsi_14_map.get(sym),
+                "macd_signal": macd_signal_map.get(sym, "Neutral"),
+                "trend_state": trend_map.get(sym, "Neutral"),
+                "dist_ma20_pct": ma_distances.get("dist_ma20_pct"),
+                "dist_ma50_pct": ma_distances.get("dist_ma50_pct"),
+                "latest_bar_time": latest_bar_map.get(sym),
+            }
+            row_data["action_score"] = _action_score(row_data)
+            rows.append(row_data)
 
     return jsonify({"rows": rows})
 
