@@ -1718,7 +1718,7 @@ def chart_page(symbol: str) -> Response:
       canvas {{
         display: block;
         width: 100%;
-        height: 380px;
+        height: 560px;
       }}
       .stats {{
         display: grid;
@@ -1743,12 +1743,18 @@ def chart_page(symbol: str) -> Response:
         font-size: 20px;
         font-variant-numeric: tabular-nums;
       }}
-      button, select {{
+      button, select, input {{
         border-radius: 12px;
         border: 1px solid var(--border);
         background: #112033;
         color: var(--text);
         padding: 10px 14px;
+      }}
+      input[type="checkbox"] {{
+        width: 16px;
+        height: 16px;
+        padding: 0;
+        accent-color: var(--accent);
       }}
       button {{
         background: var(--accent);
@@ -1775,6 +1781,14 @@ def chart_page(symbol: str) -> Response:
         flex-wrap: wrap;
         gap: 8px;
         align-items: center;
+      }}
+      .toggle {{
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 14px;
+        white-space: nowrap;
       }}
       .status {{
         margin-top: 14px;
@@ -1825,6 +1839,21 @@ def chart_page(symbol: str) -> Response:
             </select>
           </div>
           <div class="toolbar-group">
+            <label class="muted" for="chart-type">Chart</label>
+            <select id="chart-type">
+              <option value="line">Line</option>
+              <option value="candles" selected>Candlesticks</option>
+            </select>
+          </div>
+          <div class="toolbar-group" aria-label="Moving average overlays">
+            <span class="muted">MA</span>
+            <label class="toggle"><input id="ma-20" type="checkbox" checked /> 20</label>
+            <label class="toggle"><input id="ma-50" type="checkbox" /> 50</label>
+            <label class="toggle"><input id="ma-200" type="checkbox" /> 200</label>
+            <label class="toggle"><input id="ema-20" type="checkbox" /> EMA 20</label>
+            <label class="toggle"><input id="volume-bars" type="checkbox" checked /> Volume</label>
+          </div>
+          <div class="toolbar-group">
             <button id="pan-left-btn" class="secondary" type="button">Earlier</button>
             <button id="pan-right-btn" class="secondary" type="button">Later</button>
             <button id="zoom-in-btn" class="secondary" type="button">Zoom In</button>
@@ -1844,7 +1873,7 @@ def chart_page(symbol: str) -> Response:
           <div id="range-summary" class="chart-help">Preparing chart viewport...</div>
           <div id="hover-summary" class="chart-help">Hover over the chart to inspect a bar.</div>
           <div class="canvas-wrap">
-            <canvas id="chart" width="960" height="380"></canvas>
+            <canvas id="chart" width="1120" height="560"></canvas>
           </div>
           <div class="chart-help">Mouse wheel zooms. Drag horizontally to pan. Use Earlier/Later to move through older bars.</div>
           <div id="empty-state" class="status empty" style="display:none;">No bars available yet.</div>
@@ -1896,6 +1925,14 @@ def chart_page(symbol: str) -> Response:
       let LAST_DRAW_STATE = null;
       let HAS_OLDER_BARS = false;
       let FETCHING_OLDER_BARS = false;
+      const MOVING_AVERAGES = [
+        {{ period: 20, id: 'ma-20', color: '#fdb022' }},
+        {{ period: 50, id: 'ma-50', color: '#b692f6' }},
+        {{ period: 200, id: 'ma-200', color: '#12b76a' }},
+      ];
+      const EMA_OVERLAYS = [
+        {{ period: 20, id: 'ema-20', color: '#2dd4bf' }},
+      ];
 
       function fmtDate(value) {{
         if (!value) return '-';
@@ -1968,8 +2005,12 @@ def chart_page(symbol: str) -> Response:
       function getVisibleBars() {{
         clampViewport();
         if (!ALL_BARS.length) return [];
-        const start = Math.max(0, VIEW_END - WINDOW_SIZE);
-        return ALL_BARS.slice(start, VIEW_END);
+        return ALL_BARS.slice(getVisibleStart(), VIEW_END);
+      }}
+
+      function getVisibleStart() {{
+        clampViewport();
+        return ALL_BARS.length ? Math.max(0, VIEW_END - WINDOW_SIZE) : 0;
       }}
 
       function clampHoverIndex(bars) {{
@@ -1981,18 +2022,144 @@ def chart_page(symbol: str) -> Response:
         HOVER_INDEX = Math.max(0, Math.min(HOVER_INDEX, bars.length - 1));
       }}
 
-      function drawChart(bars) {{
+      function getChartType() {{
+        return document.getElementById('chart-type')?.value || 'line';
+      }}
+
+      function getEnabledMovingAverages() {{
+        return MOVING_AVERAGES.filter((ma) => document.getElementById(ma.id)?.checked);
+      }}
+
+      function getEnabledEmas() {{
+        return EMA_OVERLAYS.filter((ema) => document.getElementById(ema.id)?.checked);
+      }}
+
+      function showVolumeBars() {{
+        return !!document.getElementById('volume-bars')?.checked;
+      }}
+
+      function movingAverageValues(bars, period) {{
+        const values = [];
+        let sum = 0;
+        bars.forEach((bar, idx) => {{
+          sum += Number(bar.c);
+          if (idx >= period) sum -= Number(bars[idx - period].c);
+          values.push(idx >= period - 1 ? sum / period : null);
+        }});
+        return values;
+      }}
+
+      function emaValues(bars, period) {{
+        const values = [];
+        const multiplier = 2 / (period + 1);
+        let ema = null;
+        bars.forEach((bar, idx) => {{
+          const close = Number(bar.c);
+          if (idx === 0) ema = close;
+          else ema = (close * multiplier) + (ema * (1 - multiplier));
+          values.push(idx >= period - 1 ? ema : null);
+        }});
+        return values;
+      }}
+
+      function drawLineSeries(values, pointX, pointY, color, width = 2) {{
+        ctx.beginPath();
+        let started = false;
+        values.forEach((value, idx) => {{
+          if (value == null || Number.isNaN(Number(value))) return;
+          const x = pointX(idx);
+          const y = pointY(Number(value));
+          if (!started) {{
+            ctx.moveTo(x, y);
+            started = true;
+          }} else {{
+            ctx.lineTo(x, y);
+          }}
+        }});
+        if (!started) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.stroke();
+      }}
+
+      function drawCandlesticks(bars, pointX, pointY, slotWidth) {{
+        const bodyWidth = Math.max(3, Math.min(14, slotWidth * 0.62));
+        bars.forEach((bar, idx) => {{
+          const open = Number(bar.o);
+          const close = Number(bar.c);
+          const high = Number(bar.h);
+          const low = Number(bar.l);
+          const x = pointX(idx);
+          const highY = pointY(high);
+          const lowY = pointY(low);
+          const openY = pointY(open);
+          const closeY = pointY(close);
+          const rising = close >= open;
+          const color = rising ? '#17b26a' : '#f04438';
+          const bodyTop = Math.min(openY, closeY);
+          const bodyHeight = Math.max(2, Math.abs(closeY - openY));
+
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(x, highY);
+          ctx.lineTo(x, lowY);
+          ctx.stroke();
+
+          ctx.fillStyle = rising ? 'rgba(23, 178, 106, 0.8)' : 'rgba(240, 68, 56, 0.82)';
+          ctx.strokeStyle = color;
+          ctx.fillRect(x - (bodyWidth / 2), bodyTop, bodyWidth, bodyHeight);
+          ctx.strokeRect(x - (bodyWidth / 2), bodyTop, bodyWidth, bodyHeight);
+        }});
+      }}
+
+      function drawVolumeBars(bars, pointX, padLeft, padRight, plotBottom, slotWidth) {{
+        const volumes = bars.map((bar) => Number(bar.v || 0));
+        const maxVolume = Math.max(...volumes, 1);
+        const volumeHeight = 62;
+        const volumeTop = plotBottom - volumeHeight;
+        const barWidth = Math.max(2, Math.min(12, slotWidth * 0.58));
+
+        ctx.strokeStyle = 'rgba(159, 176, 192, 0.16)';
+        ctx.beginPath();
+        ctx.moveTo(padLeft, volumeTop);
+        ctx.lineTo(canvas.width - padRight, volumeTop);
+        ctx.stroke();
+
+        bars.forEach((bar, idx) => {{
+          const volume = Number(bar.v || 0);
+          const height = Math.max(1, (volume / maxVolume) * volumeHeight);
+          const rising = Number(bar.c) >= Number(bar.o);
+          const x = pointX(idx);
+          ctx.fillStyle = rising ? 'rgba(23, 178, 106, 0.22)' : 'rgba(240, 68, 56, 0.22)';
+          ctx.fillRect(x - (barWidth / 2), plotBottom - height, barWidth, height);
+        }});
+      }}
+
+      function drawChart(bars, startIndex = 0) {{
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         if (!bars.length) {{
           clearCanvas();
           return;
         }}
 
+        const chartType = getChartType();
         const closes = bars.map((b) => Number(b.c));
         const highs = bars.map((b) => Number(b.h));
         const lows = bars.map((b) => Number(b.l));
-        const max = Math.max(...highs);
-        const min = Math.min(...lows);
+        const averageSource = ALL_BARS.length ? ALL_BARS : bars;
+        const enabledMovingAverages = getEnabledMovingAverages().map((ma) => ({{
+          ...ma,
+          values: movingAverageValues(averageSource, ma.period).slice(startIndex, startIndex + bars.length),
+        }}));
+        const enabledEmas = getEnabledEmas().map((ema) => ({{
+          ...ema,
+          values: emaValues(averageSource, ema.period).slice(startIndex, startIndex + bars.length),
+        }}));
+        const overlays = enabledMovingAverages.concat(enabledEmas);
+        const overlayValues = overlays.flatMap((overlay) => overlay.values.filter((value) => value != null));
+        const max = Math.max(...highs, ...overlayValues);
+        const min = Math.min(...lows, ...overlayValues);
         const padLeft = 52;
         const padRight = 22;
         const padTop = 24;
@@ -2025,19 +2192,33 @@ def chart_page(symbol: str) -> Response:
           ctx.fillText(fmtPrice(value), 8, y + 4);
         }}
 
-        ctx.beginPath();
-        closes.forEach((value, idx) => {{
-          const x = pointX(idx);
-          const y = pointY(value);
-          if (idx === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }});
-        const gradient = ctx.createLinearGradient(0, padTop, 0, canvas.height - padBottom);
-        gradient.addColorStop(0, '#7cc4ff');
-        gradient.addColorStop(1, '#2e90fa');
-        ctx.strokeStyle = gradient;
-        ctx.lineWidth = 3;
-        ctx.stroke();
+        if (showVolumeBars()) {{
+          drawVolumeBars(bars, pointX, padLeft, padRight, canvas.height - padBottom, bars.length > 1 ? w / (bars.length - 1) : w);
+        }}
+
+        if (chartType === 'candles') {{
+          drawCandlesticks(bars, pointX, pointY, bars.length > 1 ? w / (bars.length - 1) : w);
+        }} else {{
+          const gradient = ctx.createLinearGradient(0, padTop, 0, canvas.height - padBottom);
+          gradient.addColorStop(0, '#7cc4ff');
+          gradient.addColorStop(1, '#2e90fa');
+          drawLineSeries(closes, pointX, pointY, gradient, 3);
+        }}
+
+        overlays.forEach((overlay) => drawLineSeries(overlay.values, pointX, pointY, overlay.color, 2));
+
+        if (overlays.length) {{
+          ctx.font = '12px Georgia';
+          let legendX = padLeft;
+          overlays.forEach((overlay) => {{
+            const label = `${{overlay.id.startsWith('ema') ? 'EMA' : 'MA'}} ${{overlay.period}}`;
+            ctx.fillStyle = overlay.color;
+            ctx.fillRect(legendX, padTop - 14, 18, 3);
+            ctx.fillStyle = '#d7f0ff';
+            ctx.fillText(label, legendX + 24, padTop - 9);
+            legendX += ctx.measureText(label).width + 58;
+          }});
+        }}
 
         ctx.fillStyle = '#d7f0ff';
         ctx.font = '12px Georgia';
@@ -2078,8 +2259,7 @@ def chart_page(symbol: str) -> Response:
           ctx.fill();
 
           const tooltipDate = formatAxisLabel(hovered.t);
-          const tooltipPrice = fmtPrice(hovered.c);
-          const tooltipText = `${{tooltipDate}}  Close ${{tooltipPrice}}`;
+          const tooltipText = `${{tooltipDate}}  O ${{fmtPrice(hovered.o)}}  H ${{fmtPrice(hovered.h)}}  L ${{fmtPrice(hovered.l)}}  C ${{fmtPrice(hovered.c)}}`;
           ctx.font = '12px Georgia';
           const tooltipWidth = ctx.measureText(tooltipText).width + 18;
           const tooltipHeight = 24;
@@ -2095,15 +2275,22 @@ def chart_page(symbol: str) -> Response:
       }}
 
       function renderViewport() {{
+        const viewportStart = getVisibleStart();
         const visibleBars = getVisibleBars();
-        drawChart(visibleBars);
+        drawChart(visibleBars, viewportStart);
         document.getElementById('empty-state').style.display = visibleBars.length ? 'none' : 'block';
 
         const lastBar = visibleBars.length ? visibleBars[visibleBars.length - 1] : null;
         const firstBar = visibleBars.length ? visibleBars[0] : null;
         const hoveredBar = (HOVER_INDEX != null && visibleBars[HOVER_INDEX]) ? visibleBars[HOVER_INDEX] : null;
+        const chartLabel = getChartType() === 'candles' ? 'candlestick' : 'line';
+        const indicatorLabels = getEnabledMovingAverages()
+          .map((ma) => `MA${{ma.period}}`)
+          .concat(getEnabledEmas().map((ema) => `EMA${{ema.period}}`));
+        if (showVolumeBars()) indicatorLabels.push('volume');
+        const indicatorLabel = indicatorLabels.join(', ') || 'no overlays';
         document.getElementById('chart-summary').textContent = visibleBars.length
-          ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}}.`
+          ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}} as a ${{chartLabel}} chart with ${{indicatorLabel}}.`
           : `No ${{CURRENT_TIMEFRAME}} bars stored for ${{SYMBOL}}.`;
         document.getElementById('range-summary').textContent = visibleBars.length
           ? `Viewport: ${{formatAxisLabel(firstBar.t)}} to ${{formatAxisLabel(lastBar.t)}}`
@@ -2251,6 +2438,14 @@ def chart_page(symbol: str) -> Response:
 
       window.addEventListener('DOMContentLoaded', async () => {{
         document.getElementById('timeframe').addEventListener('change', () => loadChart({{ autoSync: true }}).catch((err) => setStatus(err.message, true)));
+        document.getElementById('chart-type').addEventListener('change', renderViewport);
+        MOVING_AVERAGES.forEach((ma) => {{
+          document.getElementById(ma.id).addEventListener('change', renderViewport);
+        }});
+        EMA_OVERLAYS.forEach((ema) => {{
+          document.getElementById(ema.id).addEventListener('change', renderViewport);
+        }});
+        document.getElementById('volume-bars').addEventListener('change', renderViewport);
         document.getElementById('reload-btn').addEventListener('click', () => loadChart({{ autoSync: false, showReloadMessage: true }}).catch((err) => setStatus(err.message, true)));
         document.getElementById('sync-btn').addEventListener('click', syncNow);
         document.getElementById('pan-left-btn').addEventListener('click', () => panViewport(-1));
