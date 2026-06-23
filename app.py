@@ -1673,9 +1673,9 @@ def chart_page(symbol: str) -> Response:
         font-family: Georgia, 'Times New Roman', serif;
       }}
       .wrap {{
-        max-width: 1200px;
+        max-width: min(1800px, calc(100vw - 24px));
         margin: 24px auto;
-        padding: 0 16px 40px;
+        padding: 0 12px 40px;
       }}
       .top {{
         display: flex;
@@ -1693,7 +1693,7 @@ def chart_page(symbol: str) -> Response:
       .muted {{ color: var(--muted); }}
       .grid {{
         display: grid;
-        grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+        grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
         gap: 16px;
       }}
       @media (max-width: 920px) {{
@@ -1718,7 +1718,7 @@ def chart_page(symbol: str) -> Response:
       canvas {{
         display: block;
         width: 100%;
-        height: 560px;
+        height: clamp(520px, 68vh, 760px);
       }}
       .stats {{
         display: grid;
@@ -1949,6 +1949,16 @@ def chart_page(symbol: str) -> Response:
         el.style.display = message ? 'block' : 'none';
         el.textContent = message || '';
         el.classList.toggle('error', !!isError);
+      }}
+
+      function resizeCanvasToDisplay() {{
+        const rect = canvas.getBoundingClientRect();
+        const nextWidth = Math.max(320, Math.round(rect.width));
+        const nextHeight = Math.max(360, Math.round(rect.height));
+        if (canvas.width === nextWidth && canvas.height === nextHeight) return false;
+        canvas.width = nextWidth;
+        canvas.height = nextHeight;
+        return true;
       }}
 
       function clearCanvas() {{
@@ -2437,6 +2447,10 @@ def chart_page(symbol: str) -> Response:
       }}
 
       window.addEventListener('DOMContentLoaded', async () => {{
+        resizeCanvasToDisplay();
+        window.addEventListener('resize', () => {{
+          if (resizeCanvasToDisplay()) renderViewport();
+        }});
         document.getElementById('timeframe').addEventListener('change', () => loadChart({{ autoSync: true }}).catch((err) => setStatus(err.message, true)));
         document.getElementById('chart-type').addEventListener('change', renderViewport);
         MOVING_AVERAGES.forEach((ma) => {{
