@@ -1563,6 +1563,35 @@ def index() -> Response:
         }}
       }}
 
+      async function updateAllBars() {{
+        const btn = document.getElementById('update-all-bars');
+        const symbols = [...new Set(ROWS.map((row) => row.symbol).filter(Boolean))];
+        if (!btn || !symbols.length) return;
+        btn.disabled = true;
+        const old = btn.textContent;
+        try {{
+          for (let idx = 0; idx < symbols.length; idx += 1) {{
+            btn.textContent = `Updating ${{idx + 1}}/${{symbols.length}}...`;
+            const symbol = symbols[idx];
+            const res = await fetch(`/api/chart/${{encodeURIComponent(symbol)}}/sync`, {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ timeframe: '1Day', force_full: false, limit: 1 }}),
+            }});
+            const payload = await res.json();
+            if (!res.ok || !payload.ok) {{
+              throw new Error(`${{symbol}}: ${{payload.error || 'Failed to update bars.'}}`);
+            }}
+          }}
+          await fetchData();
+        }} catch (err) {{
+          alert(err.message || String(err));
+        }} finally {{
+          btn.disabled = false;
+          btn.textContent = old;
+        }}
+      }}
+
       function renderTable() {{
         const data = [...ROWS].sort((a,b) => byKey(a,b,SORT_KEY) * (SORT_ASC ? 1 : -1));
         const tbody = document.getElementById('tbody');
@@ -1661,6 +1690,7 @@ def index() -> Response:
       window.addEventListener('DOMContentLoaded', () => {{
         document.getElementById('form').addEventListener('submit', addOrUpdate);
         document.getElementById('refresh').addEventListener('click', fetchData);
+        document.getElementById('update-all-bars').addEventListener('click', updateAllBars);
         document.getElementById('earnings-form').addEventListener('submit', updateEarnings);
         fetchData();
       }});
@@ -1800,8 +1830,13 @@ def index() -> Response:
         </div>
 
         <div class=\"card\">
-          <h3 style=\"margin-top:0\">Tracked Forecasts</h3>
-          <div class=\"muted\">Opportunity = (Reward×4) + ((10-Risk)×4) + (Confidence×2). Click a symbol to open its chart and sync status.</div>
+          <div class=\"row\" style=\"justify-content:space-between; align-items:flex-start;\">
+            <div>
+              <h3 style=\"margin-top:0\">Tracked Forecasts</h3>
+              <div class=\"muted\">Opportunity = (Reward×4) + ((10-Risk)×4) + (Confidence×2). Click a symbol to open its chart and sync status.</div>
+            </div>
+            <button type=\"button\" id=\"update-all-bars\" class=\"secondary\">Update All Bars</button>
+          </div>
           <div class=\"table-wrap\">
             <table>
               <thead>
