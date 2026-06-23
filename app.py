@@ -479,6 +479,50 @@ def _load_next_earnings_map() -> Dict[str, str]:
     return {str(symbol).upper(): str(earnings_date) for symbol, earnings_date in rows}
 
 
+def _trend_states(symbols: List[str]) -> Dict[str, str]:
+    out = {str(symbol).upper(): "Neutral" for symbol in symbols}
+    if not out:
+        return out
+
+    _init_db_if_needed()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol, close
+                FROM (
+                    SELECT sm.symbol, sb.bar_time, sb.close,
+                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
+                    FROM symbol_metadata sm
+                    JOIN stock_bars sb ON sb.symbol_id = sm.id
+                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
+                ) bars
+                WHERE rn <= 220
+                ORDER BY symbol ASC, bar_time ASC
+                """,
+                (list(out.keys()),),
+            )
+            rows = cur.fetchall()
+
+    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
+    for symbol, close in rows:
+        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+
+    for symbol, closes in closes_by_symbol.items():
+        if len(closes) < 200:
+            continue
+        ma20 = sum(closes[-20:]) / 20.0
+        ma50 = sum(closes[-50:]) / 50.0
+        ma200 = sum(closes[-200:]) / 200.0
+        prev_ma20 = sum(closes[-21:-1]) / 20.0
+        latest_close = closes[-1]
+        if latest_close > ma20 > ma50 > ma200 and ma20 > prev_ma20:
+            out[symbol] = "Bullish"
+        elif latest_close < ma20 < ma50 < ma200 and ma20 < prev_ma20:
+            out[symbol] = "Bearish"
+    return out
+
+
 def _add_months(d: date, months: int) -> date:
     """Return a date shifted by N calendar months, clamping day to month end."""
     month_index = (d.month - 1) + months
@@ -1316,6 +1360,10 @@ def index() -> Response:
         if (av == null && bv == null) return 0;
         if (av == null) return 1;
         if (bv == null) return -1;
+        if (key === 'trend_state') {{
+          const trendOrder = {{ Bearish: -1, Neutral: 0, Bullish: 1 }};
+          return (trendOrder[av] ?? 0) - (trendOrder[bv] ?? 0);
+        }}
         if (typeof av === 'number' && typeof bv === 'number') return av - bv;
         return String(av).localeCompare(String(bv));
       }}
@@ -1331,6 +1379,7 @@ def index() -> Response:
           const forecast_price = r.forecast_price == null ? '—' : r.forecast_price.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
           const next_earnings = (r.next_earnings == null || r.next_earnings === '') ? '—' : r.next_earnings;
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
+          const trendClass = r.trend_state === 'Bullish' ? 'pos' : (r.trend_state === 'Bearish' ? 'neg' : 'muted');
 
           const tr = document.createElement('tr');
           tr.innerHTML = `
@@ -1339,6 +1388,7 @@ def index() -> Response:
             <td class=\"num\">${{current_price}}</td>
             <td class=\"num ${{colorClass}}\">${{diff_dollar}}</td>
             <td class=\"num ${{colorClass}}\">${{diff_pct}}</td>
+            <td class=\"${{trendClass}}\">${{r.trend_state || 'Neutral'}}</td>
             <td class=\"num\">${{Number(r.reward_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.risk_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.confidence_score).toFixed(1)}}</td>
@@ -1555,6 +1605,7 @@ def index() -> Response:
                   <th class=\"num\" data-key=\"current_price\" onclick=\"sortBy('current_price')\">Current ($)</th>
                   <th class=\"num\" data-key=\"diff_dollar\" onclick=\"sortBy('diff_dollar')\">Δ $</th>
                   <th class=\"num\" data-key=\"diff_pct\" onclick=\"sortBy('diff_pct')\">Δ %</th>
+                  <th data-key=\"trend_state\" onclick=\"sortBy('trend_state')\">Trend</th>
                   <th class=\"num\" data-key=\"reward_score\" onclick=\"sortBy('reward_score')\">Reward</th>
                   <th class=\"num\" data-key=\"risk_score\" onclick=\"sortBy('risk_score')\">Risk</th>
                   <th class=\"num\" data-key=\"confidence_score\" onclick=\"sortBy('confidence_score')\">Confidence</th>
@@ -1595,6 +1646,7 @@ def data() -> Response:
 
     prices: Dict[str, float | None] = _fetch_current_prices(symbols)
     next_map: Dict[str, str] = _load_next_earnings_map()
+    trend_map: Dict[str, str] = _trend_states(symbols)
 
     rows = []
     if not df.empty:
@@ -1637,6 +1689,7 @@ def data() -> Response:
                     "current_price": cur,
                     "diff_dollar": diff_dollar,
                     "diff_pct": diff_pct,
+                    "trend_state": trend_map.get(sym, "Neutral"),
                 }
             )
 
