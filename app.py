@@ -301,6 +301,58 @@ def _latest_bar_times(symbols: List[str], timeframe: str = "1Day") -> Dict[str, 
     return out
 
 
+def _ma_distance_pcts(
+    symbols: List[str], reference_prices: Dict[str, float | None]
+) -> Dict[str, Dict[str, float | None]]:
+    out: Dict[str, Dict[str, float | None]] = {
+        str(symbol).upper(): {"dist_ma20_pct": None, "dist_ma50_pct": None} for symbol in symbols
+    }
+    if not out:
+        return out
+
+    _init_db_if_needed()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol, close
+                FROM (
+                    SELECT sm.symbol, sb.bar_time, sb.close,
+                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
+                    FROM symbol_metadata sm
+                    JOIN stock_bars sb ON sb.symbol_id = sm.id
+                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
+                ) bars
+                WHERE rn <= 50
+                ORDER BY symbol ASC, bar_time ASC
+                """,
+                (list(out.keys()),),
+            )
+            rows = cur.fetchall()
+
+    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
+    for symbol, close in rows:
+        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+
+    for symbol, closes in closes_by_symbol.items():
+        reference_price = reference_prices.get(symbol)
+        if reference_price is None and closes:
+            reference_price = closes[-1]
+        if reference_price is None:
+            continue
+
+        if len(closes) >= 20:
+            ma20 = sum(closes[-20:]) / 20.0
+            if ma20:
+                out[symbol]["dist_ma20_pct"] = ((reference_price - ma20) / ma20) * 100.0
+        if len(closes) >= 50:
+            ma50 = sum(closes[-50:]) / 50.0
+            if ma50:
+                out[symbol]["dist_ma50_pct"] = ((reference_price - ma50) / ma50) * 100.0
+
+    return out
+
+
 def _score_field(row: Dict, key: str, symbol: str) -> float:
     raw = row.get(key, DEFAULT_SCORE)
     try:
@@ -1540,6 +1592,13 @@ def index() -> Response:
         return parsed.toLocaleDateString();
       }}
 
+      function formatSignedPct(value) {{
+        if (value == null) return '—';
+        const num = Number(value);
+        if (Number.isNaN(num)) return '—';
+        return `${{num >= 0 ? '+' : ''}}${{num.toFixed(2)}}%`;
+      }}
+
       async function updateBars(symbol, btn) {{
         if (!symbol || !btn) return;
         btn.disabled = true;
@@ -1605,6 +1664,10 @@ def index() -> Response:
           const rsiClass = r.rsi_14 == null ? 'muted' : (r.rsi_14 < 30 || (r.rsi_14 >= 50 && r.rsi_14 <= 70) ? 'pos' : (r.rsi_14 > 70 ? 'neg' : 'muted'));
           const macdSignal = r.macd_signal || 'Neutral';
           const macdClass = (macdSignal === 'Bull cross' || macdSignal === 'Positive') ? 'pos' : ((macdSignal === 'Bear cross' || macdSignal === 'Negative') ? 'neg' : 'muted');
+          const distMa20 = formatSignedPct(r.dist_ma20_pct);
+          const distMa50 = formatSignedPct(r.dist_ma50_pct);
+          const distMa20Class = r.dist_ma20_pct == null ? 'muted' : (r.dist_ma20_pct >= 0 ? 'pos' : 'neg');
+          const distMa50Class = r.dist_ma50_pct == null ? 'muted' : (r.dist_ma50_pct >= 0 ? 'pos' : 'neg');
           const next_earnings = (r.next_earnings == null || r.next_earnings === '') ? '—' : r.next_earnings;
           const last_bar = formatLastBarDate(r.latest_bar_time);
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
@@ -1620,6 +1683,8 @@ def index() -> Response:
             <td class=\"num ${{rsiClass}}\">${{rsi_14}}</td>
             <td class=\"${{macdClass}}\">${{macdSignal}}</td>
             <td class=\"${{trendClass}}\">${{r.trend_state || 'Neutral'}}</td>
+            <td class=\"num ${{distMa20Class}}\">${{distMa20}}</td>
+            <td class=\"num ${{distMa50Class}}\">${{distMa50}}</td>
             <td class=\"num\">${{Number(r.reward_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.risk_score).toFixed(1)}}</td>
             <td class=\"num\">${{Number(r.confidence_score).toFixed(1)}}</td>
@@ -1849,6 +1914,8 @@ def index() -> Response:
                   <th class=\"num\" data-key=\"rsi_14\" onclick=\"sortBy('rsi_14')\">RSI 14</th>
                   <th data-key=\"macd_signal\" onclick=\"sortBy('macd_signal')\">MACD</th>
                   <th data-key=\"trend_state\" onclick=\"sortBy('trend_state')\">Trend</th>
+                  <th class=\"num\" data-key=\"dist_ma20_pct\" onclick=\"sortBy('dist_ma20_pct')\">vs MA20</th>
+                  <th class=\"num\" data-key=\"dist_ma50_pct\" onclick=\"sortBy('dist_ma50_pct')\">vs MA50</th>
                   <th class=\"num\" data-key=\"reward_score\" onclick=\"sortBy('reward_score')\">Reward</th>
                   <th class=\"num\" data-key=\"risk_score\" onclick=\"sortBy('risk_score')\">Risk</th>
                   <th class=\"num\" data-key=\"confidence_score\" onclick=\"sortBy('confidence_score')\">Confidence</th>
@@ -1895,6 +1962,7 @@ def data() -> Response:
     rsi_14_map: Dict[str, float | None] = _rsi_14_values(symbols)
     macd_signal_map: Dict[str, str] = _macd_signals(symbols)
     latest_bar_map: Dict[str, str | None] = _latest_bar_times(symbols, "1Day")
+    ma_distance_map = _ma_distance_pcts(symbols, prices)
 
     rows = []
     if not df.empty:
@@ -1913,6 +1981,7 @@ def data() -> Response:
                 float(r.get("confidence_score")) if pd.notna(r.get("confidence_score")) else DEFAULT_SCORE
             )
             classification = str(r.get("classification", DEFAULT_CLASSIFICATION))
+            ma_distances = ma_distance_map.get(sym, {})
 
             diff_dollar = None
             diff_pct = None
@@ -1940,6 +2009,8 @@ def data() -> Response:
                     "rsi_14": rsi_14_map.get(sym),
                     "macd_signal": macd_signal_map.get(sym, "Neutral"),
                     "trend_state": trend_map.get(sym, "Neutral"),
+                    "dist_ma20_pct": ma_distances.get("dist_ma20_pct"),
+                    "dist_ma50_pct": ma_distances.get("dist_ma50_pct"),
                     "latest_bar_time": latest_bar_map.get(sym),
                 }
             )
