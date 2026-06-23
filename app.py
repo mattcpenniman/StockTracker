@@ -1854,6 +1854,8 @@ def chart_page(symbol: str) -> Response:
             <label class="toggle"><input id="bollinger-20" type="checkbox" /> Bollinger 20</label>
             <label class="toggle"><input id="volume-bars" type="checkbox" checked /> Volume</label>
             <label class="toggle"><input id="rsi-14" type="checkbox" /> RSI 14</label>
+            <label class="toggle"><input id="macd" type="checkbox" /> MACD</label>
+            <label class="toggle"><input id="support-resistance" type="checkbox" /> Support/Resistance</label>
           </div>
           <div class="toolbar-group">
             <button id="pan-left-btn" class="secondary" type="button">Earlier</button>
@@ -1924,9 +1926,11 @@ def chart_page(symbol: str) -> Response:
       let CURRENT_TIMEFRAME = '1Day';
       let DRAG_STATE = null;
       let HOVER_INDEX = null;
+      let HOVER_CANVAS_X = null;
       let LAST_DRAW_STATE = null;
       let HAS_OLDER_BARS = false;
       let FETCHING_OLDER_BARS = false;
+      let SR_CACHE = {{ signature: '', levels: [] }};
       const MOVING_AVERAGES = [
         {{ period: 20, id: 'ma-20', color: '#fdb022' }},
         {{ period: 50, id: 'ma-50', color: '#b692f6' }},
@@ -1945,6 +1949,17 @@ def chart_page(symbol: str) -> Response:
       function fmtPrice(value) {{
         if (value == null || Number.isNaN(Number(value))) return '-';
         return Number(value).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+      }}
+
+      function fmtVolume(value) {{
+        if (value == null || Number.isNaN(Number(value))) return '-';
+        return Number(value).toLocaleString(undefined, {{ maximumFractionDigits: 0 }});
+      }}
+
+      function fmtPct(value) {{
+        if (value == null || Number.isNaN(Number(value))) return '-';
+        const sign = Number(value) > 0 ? '+' : '';
+        return `${{sign}}${{Number(value).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}%`;
       }}
 
       function setStatus(message, isError = false) {{
@@ -2055,8 +2070,134 @@ def chart_page(symbol: str) -> Response:
         return !!document.getElementById('rsi-14')?.checked;
       }}
 
+      function showMacd() {{
+        return !!document.getElementById('macd')?.checked;
+      }}
+
       function showBollinger20() {{
         return !!document.getElementById(BOLLINGER_20.id)?.checked;
+      }}
+
+      function showSupportResistance() {{
+        return !!document.getElementById('support-resistance')?.checked;
+      }}
+
+      function supportResistanceTolerance(bars) {{
+        if (!bars.length) return 0;
+        const highs = bars.map((bar) => Number(bar.h)).filter((value) => !Number.isNaN(value));
+        const lows = bars.map((bar) => Number(bar.l)).filter((value) => !Number.isNaN(value));
+        if (!highs.length || !lows.length) return 0;
+        const priceRange = Math.max(...highs) - Math.min(...lows);
+        const avgRange = bars.reduce((sum, bar) => sum + Math.max(Number(bar.h) - Number(bar.l), 0), 0) / bars.length;
+        return Math.max(avgRange * 0.8, priceRange * 0.003, 0.01);
+      }}
+
+      function supportResistanceLevels() {{
+        const bars = ALL_BARS;
+        const signature = `${{CURRENT_TIMEFRAME}}|${{bars.length}}|${{bars[0]?.t || ''}}|${{bars[bars.length - 1]?.t || ''}}`;
+        if (SR_CACHE.signature === signature) return SR_CACHE.levels;
+        if (bars.length < 8) {{
+          SR_CACHE = {{ signature, levels: [] }};
+          return SR_CACHE.levels;
+        }}
+        const tolerance = supportResistanceTolerance(bars);
+        if (!tolerance) {{
+          SR_CACHE = {{ signature, levels: [] }};
+          return SR_CACHE.levels;
+        }}
+        const pivotSpan = bars.length > 1000 ? 3 : 2;
+        const pivots = [];
+
+        for (let idx = pivotSpan; idx < bars.length - pivotSpan; idx++) {{
+          const high = Number(bars[idx].h);
+          const low = Number(bars[idx].l);
+          if (Number.isNaN(high) || Number.isNaN(low)) continue;
+
+          let isSwingHigh = true;
+          let isSwingLow = true;
+          for (let offset = 1; offset <= pivotSpan; offset++) {{
+            if (high < Number(bars[idx - offset].h) || high < Number(bars[idx + offset].h)) isSwingHigh = false;
+            if (low > Number(bars[idx - offset].l) || low > Number(bars[idx + offset].l)) isSwingLow = false;
+          }}
+          if (isSwingHigh) pivots.push({{ price: high, idx, side: 'resistance' }});
+          if (isSwingLow) pivots.push({{ price: low, idx, side: 'support' }});
+        }}
+        if (!pivots.length) {{
+          SR_CACHE = {{ signature, levels: [] }};
+          return SR_CACHE.levels;
+        }}
+
+        const clusters = [];
+        pivots
+          .sort((a, b) => a.price - b.price)
+          .forEach((pivot) => {{
+            const cluster = clusters.find((item) => Math.abs(item.price - pivot.price) <= tolerance);
+            const weight = 1 + (pivot.idx / Math.max(bars.length - 1, 1));
+            if (!cluster) {{
+              clusters.push({{
+                price: pivot.price,
+                weightTotal: weight,
+                pivotCount: 1,
+                highCount: pivot.side === 'resistance' ? 1 : 0,
+                lowCount: pivot.side === 'support' ? 1 : 0,
+                latestPivotIndex: pivot.idx,
+              }});
+              return;
+            }}
+            cluster.price = ((cluster.price * cluster.weightTotal) + (pivot.price * weight)) / (cluster.weightTotal + weight);
+            cluster.weightTotal += weight;
+            cluster.pivotCount += 1;
+            cluster.highCount += pivot.side === 'resistance' ? 1 : 0;
+            cluster.lowCount += pivot.side === 'support' ? 1 : 0;
+            cluster.latestPivotIndex = Math.max(cluster.latestPivotIndex, pivot.idx);
+          }});
+
+        const referenceClose = Number(bars[bars.length - 1]?.c);
+        const levels = clusters.map((cluster) => {{
+          let touchCount = 0;
+          let latestTouchIndex = cluster.latestPivotIndex;
+          bars.forEach((bar, idx) => {{
+            const high = Number(bar.h);
+            const low = Number(bar.l);
+            const close = Number(bar.c);
+            const reacted = Math.abs(high - cluster.price) <= tolerance
+              || Math.abs(low - cluster.price) <= tolerance
+              || Math.abs(close - cluster.price) <= tolerance;
+            if (reacted) {{
+              touchCount += 1;
+              latestTouchIndex = idx;
+            }}
+          }});
+          const recentReaction = latestTouchIndex / Math.max(bars.length - 1, 1);
+          const side = !Number.isNaN(referenceClose)
+            ? (cluster.price <= referenceClose ? 'support' : 'resistance')
+            : (cluster.highCount >= cluster.lowCount ? 'resistance' : 'support');
+          return {{
+            price: cluster.price,
+            side,
+            touches: touchCount,
+            score: (touchCount * 10) + (cluster.pivotCount * 4) + (recentReaction * 8),
+            latestTouchIndex,
+          }};
+        }}).sort((a, b) => b.score - a.score);
+        SR_CACHE = {{ signature, levels }};
+        return SR_CACHE.levels;
+      }}
+
+      function nearestSupportResistance(levels, referencePrice) {{
+        const price = Number(referencePrice);
+        if (!levels.length || Number.isNaN(price)) return {{ support: null, resistance: null }};
+        const supports = levels.filter((level) => level.price <= price).sort((a, b) => price - a.price - (price - b.price));
+        const resistances = levels.filter((level) => level.price >= price).sort((a, b) => a.price - price - (b.price - price));
+        return {{ support: supports[0] || null, resistance: resistances[0] || null }};
+      }}
+
+      function formatSrDistance(label, level, referencePrice) {{
+        const price = Number(referencePrice);
+        if (!level || Number.isNaN(price)) return `${{label}} -`;
+        const distance = Math.abs(price - level.price);
+        const pct = price ? (distance / price) * 100 : 0;
+        return `${{label}} $${{fmtPrice(level.price)}} (${{fmtPrice(distance)}}, ${{fmtPrice(pct)}}%)`;
       }}
 
       function bollingerStatus(close, band) {{
@@ -2076,6 +2217,41 @@ def chart_page(symbol: str) -> Response:
           values.push(idx >= period - 1 ? sum / period : null);
         }});
         return values;
+      }}
+
+      function volumeAverageValues(bars, period = 20) {{
+        const values = [];
+        let sum = 0;
+        bars.forEach((bar, idx) => {{
+          sum += Number(bar.v || 0);
+          if (idx >= period) sum -= Number(bars[idx - period].v || 0);
+          values.push(idx >= period - 1 ? sum / period : null);
+        }});
+        return values;
+      }}
+
+      function drawHoverInfoBox(lines, padLeft, padTop, padRight) {{
+        if (!lines.length) return;
+        ctx.save();
+        ctx.font = '12px Georgia';
+        const lineHeight = 17;
+        const paddingX = 10;
+        const paddingY = 8;
+        const maxTextWidth = Math.max(...lines.map((line) => ctx.measureText(line.text).width));
+        const boxWidth = Math.min(canvas.width - padLeft - padRight - 16, Math.max(260, maxTextWidth + (paddingX * 2)));
+        const boxHeight = (lines.length * lineHeight) + (paddingY * 2);
+        const boxX = padLeft + 8;
+        const boxY = padTop + 8;
+
+        ctx.fillStyle = 'rgba(7, 17, 28, 0.94)';
+        ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+        ctx.strokeStyle = 'rgba(124, 196, 255, 0.55)';
+        ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+        lines.forEach((line, idx) => {{
+          ctx.fillStyle = line.color || '#d7f0ff';
+          ctx.fillText(line.text, boxX + paddingX, boxY + paddingY + 12 + (idx * lineHeight), boxWidth - (paddingX * 2));
+        }});
+        ctx.restore();
       }}
 
       function emaValues(bars, period) {{
@@ -2148,6 +2324,42 @@ def chart_page(symbol: str) -> Response:
         return values;
       }}
 
+      function emaNumberValues(numbers, period) {{
+        const values = [];
+        const multiplier = 2 / (period + 1);
+        let ema = null;
+        let validCount = 0;
+        numbers.forEach((raw) => {{
+          const value = Number(raw);
+          if (raw == null || Number.isNaN(value)) {{
+            values.push(null);
+            return;
+          }}
+          validCount += 1;
+          ema = ema == null ? value : (value * multiplier) + (ema * (1 - multiplier));
+          values.push(validCount >= period ? ema : null);
+        }});
+        return values;
+      }}
+
+      function macdValues(bars) {{
+        const closes = bars.map((bar) => Number(bar.c));
+        const ema12 = emaNumberValues(closes, 12);
+        const ema26 = emaNumberValues(closes, 26);
+        const macdLine = closes.map((_, idx) => (
+          ema12[idx] != null && ema26[idx] != null ? ema12[idx] - ema26[idx] : null
+        ));
+        const signalLine = emaNumberValues(macdLine, 9);
+        return macdLine.map((macd, idx) => {{
+          const signal = signalLine[idx];
+          return {{
+            macd,
+            signal,
+            hist: macd != null && signal != null ? macd - signal : null,
+          }};
+        }});
+      }}
+
       function drawLineSeries(values, pointX, pointY, color, width = 2) {{
         ctx.beginPath();
         let started = false;
@@ -2190,6 +2402,42 @@ def chart_page(symbol: str) -> Response:
 
         drawLineSeries(values.map((band) => band ? band.upper : null), pointX, pointY, 'rgba(124, 196, 255, 0.78)', 1.5);
         drawLineSeries(values.map((band) => band ? band.lower : null), pointX, pointY, 'rgba(124, 196, 255, 0.78)', 1.5);
+      }}
+
+      function drawSupportResistanceLevels(levels, pointY, padLeft, padRight, min, max) {{
+        const visibleLevels = levels
+          .filter((level) => level.price >= min && level.price <= max)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 10)
+          .sort((a, b) => b.price - a.price);
+        if (!visibleLevels.length) return;
+
+        ctx.save();
+        ctx.font = '12px Georgia';
+        visibleLevels.forEach((level) => {{
+          const y = pointY(level.price);
+          const color = level.side === 'support' ? '#17b26a' : '#f97066';
+          ctx.strokeStyle = level.side === 'support' ? 'rgba(23, 178, 106, 0.72)' : 'rgba(249, 112, 102, 0.72)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([7, 5]);
+          ctx.beginPath();
+          ctx.moveTo(padLeft, y);
+          ctx.lineTo(canvas.width - padRight, y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          const label = `${{level.side === 'support' ? 'Support' : 'Resistance'}} $${{fmtPrice(level.price)}}`;
+          const labelWidth = ctx.measureText(label).width + 12;
+          const labelX = Math.max(padLeft + 6, canvas.width - padRight - labelWidth - 4);
+          const labelY = Math.max(18, Math.min(y - 9, canvas.height - 56));
+          ctx.fillStyle = 'rgba(7, 17, 28, 0.86)';
+          ctx.fillRect(labelX, labelY, labelWidth, 20);
+          ctx.strokeStyle = level.side === 'support' ? 'rgba(23, 178, 106, 0.45)' : 'rgba(249, 112, 102, 0.45)';
+          ctx.strokeRect(labelX, labelY, labelWidth, 20);
+          ctx.fillStyle = color;
+          ctx.fillText(label, labelX + 6, labelY + 14);
+        }});
+        ctx.restore();
       }}
 
       function drawCandlesticks(bars, pointX, pointY, slotWidth) {{
@@ -2279,6 +2527,54 @@ def chart_page(symbol: str) -> Response:
         return {{ top, bottom, pointRsiY }};
       }}
 
+      function drawMacdPanel(macdSeries, pointX, padLeft, padRight, top, height, slotWidth) {{
+        const bottom = top + height;
+        const values = macdSeries.flatMap((item) => item ? [item.macd, item.signal, item.hist] : []).filter((value) => value != null && !Number.isNaN(Number(value)));
+        const max = Math.max(0, ...values);
+        const min = Math.min(0, ...values);
+        const range = Math.max(max - min, 0.0001);
+        const pointMacdY = (value) => top + ((max - value) / range) * height;
+        const zeroY = pointMacdY(0);
+        const barWidth = Math.max(2, Math.min(12, slotWidth * 0.58));
+
+        ctx.fillStyle = 'rgba(7, 17, 28, 0.62)';
+        ctx.fillRect(padLeft, top, canvas.width - padLeft - padRight, height);
+        ctx.strokeStyle = 'rgba(159, 176, 192, 0.22)';
+        ctx.strokeRect(padLeft, top, canvas.width - padLeft - padRight, height);
+
+        ctx.strokeStyle = 'rgba(159, 176, 192, 0.38)';
+        ctx.beginPath();
+        ctx.moveTo(padLeft, zeroY);
+        ctx.lineTo(canvas.width - padRight, zeroY);
+        ctx.stroke();
+
+        macdSeries.forEach((item, idx) => {{
+          if (!item || item.hist == null || Number.isNaN(Number(item.hist))) return;
+          const hist = Number(item.hist);
+          const x = pointX(idx);
+          const y = pointMacdY(hist);
+          ctx.fillStyle = hist >= 0 ? 'rgba(23, 178, 106, 0.58)' : 'rgba(240, 68, 56, 0.58)';
+          ctx.fillRect(x - (barWidth / 2), Math.min(y, zeroY), barWidth, Math.max(1, Math.abs(zeroY - y)));
+        }});
+
+        drawLineSeries(macdSeries.map((item) => item ? item.macd : null), pointX, pointMacdY, '#7cc4ff', 2);
+        drawLineSeries(macdSeries.map((item) => item ? item.signal : null), pointX, pointMacdY, '#fdb022', 2);
+
+        ctx.font = '12px Georgia';
+        ctx.fillStyle = '#7cc4ff';
+        ctx.fillRect(padLeft, top - 14, 18, 3);
+        ctx.fillStyle = '#d7f0ff';
+        ctx.fillText('MACD', padLeft + 24, top - 9);
+        ctx.fillStyle = '#fdb022';
+        ctx.fillRect(padLeft + 78, top - 14, 18, 3);
+        ctx.fillStyle = '#d7f0ff';
+        ctx.fillText('Signal', padLeft + 102, top - 9);
+        ctx.fillStyle = '#9fb0c0';
+        ctx.fillText('0', 16, zeroY + 4);
+
+        return {{ top, bottom, pointMacdY }};
+      }}
+
       function drawChart(bars, startIndex = 0) {{
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         if (!bars.length) {{
@@ -2292,8 +2588,12 @@ def chart_page(symbol: str) -> Response:
         const lows = bars.map((b) => Number(b.l));
         const averageSource = ALL_BARS.length ? ALL_BARS : bars;
         const showRsi = showRsi14();
+        const showMacdPanel = showMacd();
         const rsiSeries = showRsi
           ? rsiValues(averageSource, 14).slice(startIndex, startIndex + bars.length)
+          : [];
+        const macdSeries = showMacdPanel
+          ? macdValues(averageSource).slice(startIndex, startIndex + bars.length)
           : [];
         const enabledMovingAverages = getEnabledMovingAverages().map((ma) => ({{
           ...ma,
@@ -2306,6 +2606,10 @@ def chart_page(symbol: str) -> Response:
         const bollingerSeries = showBollinger20()
           ? bollingerValues(averageSource, BOLLINGER_20.period).slice(startIndex, startIndex + bars.length)
           : [];
+        const volumeAverageSeries = showVolumeBars()
+          ? volumeAverageValues(averageSource, 20).slice(startIndex, startIndex + bars.length)
+          : [];
+        const srLevels = showSupportResistance() ? supportResistanceLevels() : [];
         const overlays = enabledMovingAverages.concat(enabledEmas);
         const overlayValues = overlays.flatMap((overlay) => overlay.values.filter((value) => value != null));
         const bollingerRangeValues = bollingerSeries.flatMap((band) => band ? [band.upper, band.lower] : []);
@@ -2315,17 +2619,25 @@ def chart_page(symbol: str) -> Response:
         const padRight = 22;
         const padTop = 24;
         const padBottom = 38;
-        const rsiGap = showRsi ? 30 : 0;
+        const lowerPanelCount = (showRsi ? 1 : 0) + (showMacdPanel ? 1 : 0);
+        const lowerPanelGap = lowerPanelCount ? 30 : 0;
         const rsiHeight = showRsi ? Math.max(96, Math.min(150, Math.round(canvas.height * 0.22))) : 0;
-        const priceBottom = canvas.height - padBottom - rsiHeight - rsiGap;
+        const macdHeight = showMacdPanel ? Math.max(110, Math.min(160, Math.round(canvas.height * 0.24))) : 0;
+        const lowerPanelHeight = rsiHeight + macdHeight + Math.max(0, lowerPanelCount - 1) * lowerPanelGap;
+        const priceBottom = canvas.height - padBottom - lowerPanelHeight - (lowerPanelCount ? lowerPanelGap : 0);
         const w = canvas.width - padLeft - padRight;
         const h = Math.max(120, priceBottom - padTop);
         const range = Math.max(max - min, 0.0001);
         const pointX = (idx) => padLeft + ((bars.length === 1 ? 0.5 : idx / (bars.length - 1)) * w);
         const pointY = (value) => padTop + ((max - value) / range) * h;
 
+        LAST_DRAW_STATE = {{ bars, rsiSeries, macdSeries, bollingerSeries, srLevels, padLeft, padRight, padTop, padBottom, w, h, max, min, range, pointX, pointY }};
+        if (HOVER_CANVAS_X != null) {{
+          const relative = (HOVER_CANVAS_X - padLeft) / Math.max(w, 1);
+          const idx = Math.round(relative * Math.max(bars.length - 1, 0));
+          HOVER_INDEX = Math.max(0, Math.min(bars.length - 1, idx));
+        }}
         clampHoverIndex(bars);
-        LAST_DRAW_STATE = {{ bars, rsiSeries, bollingerSeries, padLeft, padRight, padTop, padBottom, w, h, max, min, range, pointX, pointY }};
 
         ctx.strokeStyle = 'rgba(159, 176, 192, 0.18)';
         ctx.lineWidth = 1;
@@ -2350,6 +2662,10 @@ def chart_page(symbol: str) -> Response:
           drawBollingerChannel(bollingerSeries, pointX, pointY);
         }}
 
+        if (srLevels.length) {{
+          drawSupportResistanceLevels(srLevels, pointY, padLeft, padRight, min, max);
+        }}
+
         if (showVolumeBars()) {{
           drawVolumeBars(bars, pointX, padLeft, padRight, priceBottom, bars.length > 1 ? w / (bars.length - 1) : w);
         }}
@@ -2365,9 +2681,15 @@ def chart_page(symbol: str) -> Response:
 
         overlays.forEach((overlay) => drawLineSeries(overlay.values, pointX, pointY, overlay.color, 2));
 
+        let lowerPanelTop = priceBottom + (lowerPanelCount ? lowerPanelGap : 0);
         if (showRsi) {{
-          const rsiPanel = drawRsiPanel(rsiSeries, pointX, padLeft, padRight, priceBottom + rsiGap, rsiHeight);
+          const rsiPanel = drawRsiPanel(rsiSeries, pointX, padLeft, padRight, lowerPanelTop, rsiHeight);
           LAST_DRAW_STATE.rsiPanel = rsiPanel;
+          lowerPanelTop = rsiPanel.bottom + lowerPanelGap;
+        }}
+        if (showMacdPanel) {{
+          const macdPanel = drawMacdPanel(macdSeries, pointX, padLeft, padRight, lowerPanelTop, macdHeight, bars.length > 1 ? w / (bars.length - 1) : w);
+          LAST_DRAW_STATE.macdPanel = macdPanel;
         }}
 
         if (overlays.length || bollingerSeries.length) {{
@@ -2413,14 +2735,22 @@ def chart_page(symbol: str) -> Response:
           const hovered = bars[HOVER_INDEX];
           const hoverX = pointX(HOVER_INDEX);
           const hoverY = pointY(Number(hovered.c));
+          const absoluteHoverIndex = startIndex + HOVER_INDEX;
+          const prevBar = absoluteHoverIndex > 0 ? ALL_BARS[absoluteHoverIndex - 1] : null;
+          const closeChangePct = prevBar && Number(prevBar.c)
+            ? ((Number(hovered.c) - Number(prevBar.c)) / Number(prevBar.c)) * 100
+            : null;
           const rsiValue = rsiSeries[HOVER_INDEX];
+          const macdValue = macdSeries[HOVER_INDEX];
           const bollingerValue = bollingerSeries[HOVER_INDEX];
+          const volumeAverageValue = volumeAverageSeries[HOVER_INDEX];
+          const hoverLineBottom = LAST_DRAW_STATE.macdPanel?.bottom || LAST_DRAW_STATE.rsiPanel?.bottom || priceBottom;
 
           ctx.strokeStyle = 'rgba(215, 240, 255, 0.55)';
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
           ctx.moveTo(hoverX, padTop);
-          ctx.lineTo(hoverX, showRsi && LAST_DRAW_STATE.rsiPanel ? LAST_DRAW_STATE.rsiPanel.bottom : priceBottom);
+          ctx.lineTo(hoverX, hoverLineBottom);
           ctx.moveTo(padLeft, hoverY);
           ctx.lineTo(canvas.width - padRight, hoverY);
           ctx.stroke();
@@ -2434,28 +2764,52 @@ def chart_page(symbol: str) -> Response:
             ctx.fill();
           }}
 
+          if (showMacdPanel && LAST_DRAW_STATE.macdPanel && macdValue?.macd != null) {{
+            const macdY = LAST_DRAW_STATE.macdPanel.pointMacdY(Number(macdValue.macd));
+            ctx.fillStyle = '#7cc4ff';
+            ctx.beginPath();
+            ctx.arc(hoverX, macdY, 4, 0, Math.PI * 2);
+            ctx.fill();
+          }}
+
           ctx.fillStyle = '#d7f0ff';
           ctx.beginPath();
           ctx.arc(hoverX, hoverY, 4, 0, Math.PI * 2);
           ctx.fill();
 
-          const tooltipDate = formatAxisLabel(hovered.t);
-          const rsiText = showRsi && rsiValue != null ? `  RSI ${{fmtPrice(rsiValue)}}` : '';
-          const bollingerText = showBollinger20()
-            ? `  BB20 ${{bollingerStatus(hovered.c, bollingerValue)}}${{bollingerValue ? ` U ${{fmtPrice(bollingerValue.upper)}} L ${{fmtPrice(bollingerValue.lower)}}` : ''}}`
-            : '';
-          const tooltipText = `${{tooltipDate}}  O ${{fmtPrice(hovered.o)}}  H ${{fmtPrice(hovered.h)}}  L ${{fmtPrice(hovered.l)}}  C ${{fmtPrice(hovered.c)}}${{rsiText}}${{bollingerText}}`;
-          ctx.font = '12px Georgia';
-          const tooltipWidth = ctx.measureText(tooltipText).width + 18;
-          const tooltipHeight = 24;
-          const tooltipX = Math.min(canvas.width - padRight - tooltipWidth, Math.max(padLeft, hoverX + 12));
-          const tooltipY = Math.max(padTop + 4, hoverY - 30);
-          ctx.fillStyle = 'rgba(7, 17, 28, 0.92)';
-          ctx.fillRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
-          ctx.strokeStyle = 'rgba(124, 196, 255, 0.45)';
-          ctx.strokeRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
-          ctx.fillStyle = '#d7f0ff';
-          ctx.fillText(tooltipText, tooltipX + 9, tooltipY + 16);
+          const tooltipLines = [
+            {{ text: `${{fmtDate(hovered.t)}}`, color: '#ffffff' }},
+            {{ text: `O $${{fmtPrice(hovered.o)}}  H $${{fmtPrice(hovered.h)}}  L $${{fmtPrice(hovered.l)}}  C $${{fmtPrice(hovered.c)}}`, color: '#d7f0ff' }},
+            {{ text: `Vol ${{fmtVolume(hovered.v)}}  Close chg ${{fmtPct(closeChangePct)}}`, color: closeChangePct == null ? '#9fb0c0' : (closeChangePct >= 0 ? '#17b26a' : '#f97066') }},
+          ];
+          overlays.forEach((overlay) => {{
+            const value = overlay.values[HOVER_INDEX];
+            const label = `${{overlay.id.startsWith('ema') ? 'EMA' : 'MA'}}${{overlay.period}}`;
+            tooltipLines.push({{ text: `${{label}} $${{fmtPrice(value)}}`, color: overlay.color }});
+          }});
+          if (showVolumeBars()) {{
+            tooltipLines.push({{ text: `Vol avg20 ${{fmtVolume(volumeAverageValue)}}`, color: '#9fb0c0' }});
+          }}
+          if (showBollinger20()) {{
+            tooltipLines.push({{
+              text: bollingerValue
+                ? `BB20 U $${{fmtPrice(bollingerValue.upper)}}  M $${{fmtPrice(bollingerValue.middle)}}  L $${{fmtPrice(bollingerValue.lower)}} (${{bollingerStatus(hovered.c, bollingerValue)}})`
+                : `BB20 ${{bollingerStatus(hovered.c, bollingerValue)}}`,
+              color: BOLLINGER_20.color,
+            }});
+          }}
+          if (showRsi && rsiValue != null) {{
+            tooltipLines.push({{ text: `RSI14 ${{fmtPrice(rsiValue)}}`, color: '#f97066' }});
+          }}
+          if (showMacdPanel && macdValue?.macd != null) {{
+            tooltipLines.push({{ text: `MACD ${{fmtPrice(macdValue.macd)}}  Sig ${{fmtPrice(macdValue.signal)}}  Hist ${{fmtPrice(macdValue.hist)}}`, color: '#7cc4ff' }});
+          }}
+          const nearestSr = showSupportResistance() ? nearestSupportResistance(srLevels, hovered.c) : {{ support: null, resistance: null }};
+          if (showSupportResistance()) {{
+            tooltipLines.push({{ text: `S/R ${{formatSrDistance('S', nearestSr.support, hovered.c)}}`, color: '#17b26a' }});
+            tooltipLines.push({{ text: `S/R ${{formatSrDistance('R', nearestSr.resistance, hovered.c)}}`, color: '#f97066' }});
+          }}
+          drawHoverInfoBox(tooltipLines, padLeft, padTop, padRight);
         }}
       }}
 
@@ -2471,11 +2825,17 @@ def chart_page(symbol: str) -> Response:
         const visibleRsiValues = showRsi14()
           ? rsiValues(ALL_BARS, 14).slice(viewportStart, viewportStart + visibleBars.length)
           : [];
+        const visibleMacdValues = showMacd()
+          ? macdValues(ALL_BARS).slice(viewportStart, viewportStart + visibleBars.length)
+          : [];
         const visibleBollingerValues = showBollinger20()
           ? bollingerValues(ALL_BARS, BOLLINGER_20.period).slice(viewportStart, viewportStart + visibleBars.length)
           : [];
+        const srLevels = showSupportResistance() ? supportResistanceLevels() : [];
         const latestRsi = visibleRsiValues.length ? visibleRsiValues[visibleRsiValues.length - 1] : null;
         const hoveredRsi = hoveredBar && HOVER_INDEX != null ? visibleRsiValues[HOVER_INDEX] : null;
+        const latestMacd = visibleMacdValues.length ? visibleMacdValues[visibleMacdValues.length - 1] : null;
+        const hoveredMacd = hoveredBar && HOVER_INDEX != null ? visibleMacdValues[HOVER_INDEX] : null;
         const latestBollinger = visibleBollingerValues.length ? visibleBollingerValues[visibleBollingerValues.length - 1] : null;
         const hoveredBollinger = hoveredBar && HOVER_INDEX != null ? visibleBollingerValues[HOVER_INDEX] : null;
         const chartLabel = getChartType() === 'candles' ? 'candlestick' : 'line';
@@ -2485,19 +2845,29 @@ def chart_page(symbol: str) -> Response:
         if (showBollinger20()) indicatorLabels.push('BB20');
         if (showVolumeBars()) indicatorLabels.push('volume');
         if (showRsi14()) indicatorLabels.push('RSI14');
+        if (showMacd()) indicatorLabels.push('MACD');
+        if (showSupportResistance()) indicatorLabels.push('support/resistance');
         const indicatorLabel = indicatorLabels.join(', ') || 'no overlays';
         const rsiSummary = showRsi14() && latestRsi != null ? ` Latest RSI14: ${{fmtPrice(latestRsi)}}.` : '';
+        const macdSummary = showMacd() && latestMacd?.macd != null
+          ? ` Latest MACD: ${{fmtPrice(latestMacd.macd)}} signal ${{fmtPrice(latestMacd.signal)}} histogram ${{fmtPrice(latestMacd.hist)}}.`
+          : '';
         const bollingerSummary = showBollinger20()
           ? ` Latest BB20: ${{bollingerStatus(lastBar?.c, latestBollinger)}}${{latestBollinger ? `; upper ${{fmtPrice(latestBollinger.upper)}}, middle ${{fmtPrice(latestBollinger.middle)}}, lower ${{fmtPrice(latestBollinger.lower)}}` : ''}}.`
           : '';
+        const latestSr = showSupportResistance() ? nearestSupportResistance(srLevels, lastBar?.c) : {{ support: null, resistance: null }};
+        const hoveredSr = showSupportResistance() ? nearestSupportResistance(srLevels, hoveredBar?.c) : {{ support: null, resistance: null }};
+        const srSummary = showSupportResistance() && lastBar
+          ? ` Nearest S/R: ${{formatSrDistance('support', latestSr.support, lastBar.c)}}; ${{formatSrDistance('resistance', latestSr.resistance, lastBar.c)}}.`
+          : '';
         document.getElementById('chart-summary').textContent = visibleBars.length
-          ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}} as a ${{chartLabel}} chart with ${{indicatorLabel}}.${{rsiSummary}}${{bollingerSummary}}`
+          ? `Showing ${{visibleBars.length}} of ${{ALL_BARS.length}} loaded ${{CURRENT_TIMEFRAME}} bars for ${{SYMBOL}} as a ${{chartLabel}} chart with ${{indicatorLabel}}.${{rsiSummary}}${{macdSummary}}${{bollingerSummary}}${{srSummary}}`
           : `No ${{CURRENT_TIMEFRAME}} bars stored for ${{SYMBOL}}.`;
         document.getElementById('range-summary').textContent = visibleBars.length
           ? `Viewport: ${{formatAxisLabel(firstBar.t)}} to ${{formatAxisLabel(lastBar.t)}}`
           : 'No viewport available yet.';
         document.getElementById('hover-summary').textContent = hoveredBar
-          ? `Hovered bar: ${{fmtDate(hoveredBar.t)}} | Close $${{fmtPrice(hoveredBar.c)}} | High $${{fmtPrice(hoveredBar.h)}} | Low $${{fmtPrice(hoveredBar.l)}}${{hoveredRsi != null ? ` | RSI14 ${{fmtPrice(hoveredRsi)}}` : ''}}${{showBollinger20() ? ` | BB20 ${{bollingerStatus(hoveredBar.c, hoveredBollinger)}}${{hoveredBollinger ? ` U ${{fmtPrice(hoveredBollinger.upper)}} M ${{fmtPrice(hoveredBollinger.middle)}} L ${{fmtPrice(hoveredBollinger.lower)}}` : ''}}` : ''}}`
+          ? `Hovered bar: ${{fmtDate(hoveredBar.t)}} | Close $${{fmtPrice(hoveredBar.c)}} | High $${{fmtPrice(hoveredBar.h)}} | Low $${{fmtPrice(hoveredBar.l)}}${{hoveredRsi != null ? ` | RSI14 ${{fmtPrice(hoveredRsi)}}` : ''}}${{showMacd() && hoveredMacd?.macd != null ? ` | MACD ${{fmtPrice(hoveredMacd.macd)}} Sig ${{fmtPrice(hoveredMacd.signal)}} Hist ${{fmtPrice(hoveredMacd.hist)}}` : ''}}${{showBollinger20() ? ` | BB20 ${{bollingerStatus(hoveredBar.c, hoveredBollinger)}}${{hoveredBollinger ? ` U ${{fmtPrice(hoveredBollinger.upper)}} M ${{fmtPrice(hoveredBollinger.middle)}} L ${{fmtPrice(hoveredBollinger.lower)}}` : ''}}` : ''}}${{showSupportResistance() ? ` | S/R ${{formatSrDistance('support', hoveredSr.support, hoveredBar.c)}}; ${{formatSrDistance('resistance', hoveredSr.resistance, hoveredBar.c)}}` : ''}}`
           : 'Hover over the chart to inspect a bar.';
         document.getElementById('last-close').textContent = lastBar ? fmtPrice(lastBar.c) : '-';
         document.getElementById('bar-count').textContent = String(ALL_BARS.length);
@@ -2653,6 +3023,8 @@ def chart_page(symbol: str) -> Response:
         document.getElementById(BOLLINGER_20.id).addEventListener('change', renderViewport);
         document.getElementById('volume-bars').addEventListener('change', renderViewport);
         document.getElementById('rsi-14').addEventListener('change', renderViewport);
+        document.getElementById('macd').addEventListener('change', renderViewport);
+        document.getElementById('support-resistance').addEventListener('change', renderViewport);
         document.getElementById('reload-btn').addEventListener('click', () => loadChart({{ autoSync: false, showReloadMessage: true }}).catch((err) => setStatus(err.message, true)));
         document.getElementById('sync-btn').addEventListener('click', syncNow);
         document.getElementById('pan-left-btn').addEventListener('click', () => panViewport(-1));
@@ -2669,6 +3041,7 @@ def chart_page(symbol: str) -> Response:
         }});
         canvas.addEventListener('mouseleave', () => {{
           HOVER_INDEX = null;
+          HOVER_CANVAS_X = null;
           renderViewport();
         }});
         window.addEventListener('mouseup', () => {{
@@ -2678,6 +3051,7 @@ def chart_page(symbol: str) -> Response:
           if (DRAG_STATE || !LAST_DRAW_STATE || !LAST_DRAW_STATE.bars.length) return;
           const rect = canvas.getBoundingClientRect();
           const x = (event.clientX - rect.left) * (canvas.width / Math.max(rect.width, 1));
+          HOVER_CANVAS_X = x;
           const relative = (x - LAST_DRAW_STATE.padLeft) / Math.max(LAST_DRAW_STATE.w, 1);
           const idx = Math.round(relative * Math.max(LAST_DRAW_STATE.bars.length - 1, 0));
           HOVER_INDEX = Math.max(0, Math.min(LAST_DRAW_STATE.bars.length - 1, idx));
