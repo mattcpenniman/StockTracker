@@ -515,6 +515,18 @@ def _market_snapshot_needs_sync(snapshot: Dict, max_age_days: int) -> bool:
     if max_age_days < 0:
         return False
 
+    bars = snapshot.get("bars") or []
+    if not bars:
+        return True
+
+    latest_bar_time = _parse_market_timestamp(bars[-1].get("t"))
+    if latest_bar_time is None:
+        return True
+
+    delayed_now = _utcnow() - timedelta(minutes=max(CHART_DELAY_MINUTES, 0))
+    if latest_bar_time <= delayed_now - timedelta(days=max_age_days):
+        return True
+
     sync_state = snapshot.get("sync_state") or {}
     synced_at = _parse_market_timestamp(
         sync_state.get("last_successful_sync_at") or sync_state.get("last_synced_at")
@@ -1255,6 +1267,17 @@ def _strip_symbol_and_timestamps(value):
 
 def _backfill_analytics_symbol_if_needed(symbol: str) -> None:
     _sync_market_data(symbol, "1Day", force_full=True, snapshot_limit=1)
+
+
+def _sync_current_analytics_data_if_needed(symbol: str, requested_timeframe: str) -> None:
+    timeframes = ["1Day"]
+    if requested_timeframe != "1Day":
+        timeframes.append(requested_timeframe)
+
+    for timeframe in timeframes:
+        snapshot = _get_market_snapshot(symbol, timeframe, 1)
+        if _market_snapshot_needs_sync(snapshot, CHART_LATEST_AUTO_SYNC_MAX_AGE_DAYS):
+            _sync_market_data(symbol, timeframe, force_full=False, snapshot_limit=1)
 
 
 # ----------------- Routes ----------------------
@@ -2373,6 +2396,8 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
         normalized_timeframe = _normalize_analytics_timeframe(timeframe or request.args.get("timeframe"))
         settings = _analytics_settings_from_request()
         asof_dt = parse_asof(request.args.get("asof"))
+        if asof_dt is None:
+            _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
         desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
         if desired_price_timeframe != "1Day" and asof_dt is not None:
             try:
@@ -2444,6 +2469,8 @@ def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
         asof_dt = parse_asof(request.args.get("asof"))
         event_limit_raw = request.args.get("event_limit")
         event_limit = int(event_limit_raw) if event_limit_raw else settings.event_limit
+        if asof_dt is None:
+            _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
         payload = analytics_service.get_events(symbol, normalized_timeframe, asof_dt, settings, event_limit=event_limit)
         payload["ok"] = True
         payload["as_of"] = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)["as_of"]
@@ -2600,7 +2627,11 @@ def get_analytics_batch_state() -> Response:
         normalized_timeframe = _normalize_analytics_timeframe(payload.get("timeframe") or request.args.get("timeframe"))
         settings = _analytics_settings_from_request(payload)
         asof_dt = parse_asof(str(payload.get("asof") or request.args.get("asof") or "").strip() or None)
-        batch = analytics_service.get_batch_state([str(item).strip().upper() for item in symbols], normalized_timeframe, asof_dt, settings)
+        normalized_symbols = [str(item).strip().upper() for item in symbols]
+        if asof_dt is None:
+            for symbol in normalized_symbols:
+                _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
+        batch = analytics_service.get_batch_state(normalized_symbols, normalized_timeframe, asof_dt, settings)
         batch["ok"] = True
         if hide_ts:
             batch = _strip_symbol_and_timestamps(batch)

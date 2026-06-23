@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import unittest
-from datetime import timezone
-from unittest.mock import Mock
+from datetime import datetime, timezone
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from app import _state_payload_has_desired_price_anchor
+from app import app as flask_app, _market_snapshot_needs_sync, _state_payload_has_desired_price_anchor
 from analytics.config import AnalyticsSettings
 from analytics.indicators import compute_feature_frame
 from analytics.regimes import (
@@ -534,6 +534,34 @@ class ServiceTests(unittest.TestCase):
 
 
 class StateEndpointHelperTests(unittest.TestCase):
+
+    def test_market_snapshot_needs_sync_when_latest_bar_is_stale_despite_fresh_sync(self) -> None:
+        snapshot = {
+            "bars": [{"t": "2026-03-27T04:00:00Z"}],
+            "sync_state": {"last_successful_sync_at": "2026-06-09T00:00:00Z"},
+        }
+
+        with patch("app._utcnow", return_value=datetime(2026, 6, 9, tzinfo=timezone.utc)):
+            self.assertTrue(_market_snapshot_needs_sync(snapshot, 5))
+
+    @patch("app.analytics_service")
+    @patch("app._sync_current_analytics_data_if_needed")
+    def test_current_state_endpoint_refreshes_before_reading_payload(self, mock_sync, mock_service) -> None:
+        mock_service.get_symbol_state.return_value = {
+            "symbol": "NVDA",
+            "timeframe": "1Day",
+            "as_of": "2026-06-08T04:00:00Z",
+            "data_quality": {},
+            "price": {},
+        }
+
+        with flask_app.test_client() as client:
+            response = client.get("/api/state/NVDA")
+
+        self.assertEqual(response.status_code, 200)
+        mock_sync.assert_called_once_with("NVDA", "1Day")
+        self.assertTrue(mock_service.get_symbol_state.called)
+
     def test_intraday_anchor_accepts_same_day_bar(self) -> None:
         payload = {
             "price": {"timestamp": "2024-08-23T20:00:00Z"},
