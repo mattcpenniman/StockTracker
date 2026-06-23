@@ -1856,6 +1856,7 @@ def chart_page(symbol: str) -> Response:
             <label class="toggle"><input id="rsi-14" type="checkbox" /> RSI 14</label>
             <label class="toggle"><input id="macd" type="checkbox" /> MACD</label>
             <label class="toggle"><input id="support-resistance" type="checkbox" /> Support/Resistance</label>
+            <label class="toggle"><input id="trade-signals" type="checkbox" /> Signals</label>
           </div>
           <div class="toolbar-group">
             <button id="pan-left-btn" class="secondary" type="button">Earlier</button>
@@ -2080,6 +2081,14 @@ def chart_page(symbol: str) -> Response:
 
       function showSupportResistance() {{
         return !!document.getElementById('support-resistance')?.checked;
+      }}
+
+      function showTradeSignals() {{
+        return !!document.getElementById('trade-signals')?.checked;
+      }}
+
+      function signalSummary(signals) {{
+        return (signals || []).map((signal) => signal.label).join(', ');
       }}
 
       function supportResistanceTolerance(bars) {{
@@ -2360,6 +2369,83 @@ def chart_page(symbol: str) -> Response:
         }});
       }}
 
+      function tradeSignalValues(bars) {{
+        const signals = Array.from({{ length: bars.length }}, () => []);
+        if (!bars.length) return signals;
+
+        const ma20 = movingAverageValues(bars, 20);
+        const ma50 = movingAverageValues(bars, 50);
+        const rsi14 = rsiValues(bars, 14);
+        const macdSeries = macdValues(bars);
+        const addSignal = (idx, signal) => {{
+          signals[idx].push(signal);
+        }};
+
+        for (let idx = 1; idx < bars.length; idx++) {{
+          const close = Number(bars[idx].c);
+          const prevClose = Number(bars[idx - 1].c);
+          if (Number.isNaN(close) || Number.isNaN(prevClose)) continue;
+
+          if (idx >= 20) {{
+            const recentBars = bars.slice(idx - 20, idx);
+            const recentHigh = Math.max(...recentBars.map((bar) => Number(bar.h)).filter((value) => !Number.isNaN(value)));
+            const recentLow = Math.min(...recentBars.map((bar) => Number(bar.l)).filter((value) => !Number.isNaN(value)));
+            if (!Number.isNaN(recentHigh) && close > recentHigh) {{
+              addSignal(idx, {{ type: 'breakout', label: 'BO', side: 'up', color: '#17b26a', detail: `Breakout: close $${{fmtPrice(close)}} above 20-bar high $${{fmtPrice(recentHigh)}}` }});
+            }}
+            if (!Number.isNaN(recentLow) && close < recentLow) {{
+              addSignal(idx, {{ type: 'breakdown', label: 'BD', side: 'down', color: '#f04438', detail: `Breakdown: close $${{fmtPrice(close)}} below 20-bar low $${{fmtPrice(recentLow)}}` }});
+            }}
+          }}
+
+          const currMa50 = ma50[idx];
+          const prevMa50 = ma50[idx - 1];
+          if (currMa50 != null && prevMa50 != null) {{
+            if (prevClose <= prevMa50 && close > currMa50) {{
+              addSignal(idx, {{ type: 'trend-up', label: 'T+', side: 'up', color: '#b692f6', detail: `Trend change: close crossed above MA50 $${{fmtPrice(currMa50)}}` }});
+            }} else if (prevClose >= prevMa50 && close < currMa50) {{
+              addSignal(idx, {{ type: 'trend-down', label: 'T-', side: 'down', color: '#b692f6', detail: `Trend change: close crossed below MA50 $${{fmtPrice(currMa50)}}` }});
+            }}
+          }}
+
+          const currRsi = rsi14[idx];
+          const prevRsi = rsi14[idx - 1];
+          if (currRsi != null && prevRsi != null) {{
+            if (prevRsi <= 70 && currRsi > 70) {{
+              addSignal(idx, {{ type: 'overbought', label: 'OB', side: 'down', color: '#f97066', detail: `RSI14 crossed above 70: ${{fmtPrice(currRsi)}}` }});
+            }} else if (prevRsi >= 30 && currRsi < 30) {{
+              addSignal(idx, {{ type: 'oversold', label: 'OS', side: 'up', color: '#2dd4bf', detail: `RSI14 crossed below 30: ${{fmtPrice(currRsi)}}` }});
+            }}
+          }}
+
+          const currMacd = macdSeries[idx];
+          const prevMacd = macdSeries[idx - 1];
+          if (currMacd?.macd != null && currMacd?.signal != null && prevMacd?.macd != null && prevMacd?.signal != null) {{
+            const currDiff = Number(currMacd.macd) - Number(currMacd.signal);
+            const prevDiff = Number(prevMacd.macd) - Number(prevMacd.signal);
+            if (prevDiff <= 0 && currDiff > 0) {{
+              addSignal(idx, {{ type: 'macd-up', label: 'M+', side: 'up', color: '#7cc4ff', detail: `MACD crossed above signal: ${{fmtPrice(currMacd.macd)}} / ${{fmtPrice(currMacd.signal)}}` }});
+            }} else if (prevDiff >= 0 && currDiff < 0) {{
+              addSignal(idx, {{ type: 'macd-down', label: 'M-', side: 'down', color: '#7cc4ff', detail: `MACD crossed below signal: ${{fmtPrice(currMacd.macd)}} / ${{fmtPrice(currMacd.signal)}}` }});
+            }}
+          }}
+
+          const currMa20 = ma20[idx];
+          const prevMa20 = ma20[idx - 1];
+          if (currMa20 != null && currMa50 != null && prevMa20 != null && prevMa50 != null) {{
+            const currDiff = Number(currMa20) - Number(currMa50);
+            const prevDiff = Number(prevMa20) - Number(prevMa50);
+            if (prevDiff <= 0 && currDiff > 0) {{
+              addSignal(idx, {{ type: 'ma-up', label: 'X+', side: 'up', color: '#fdb022', detail: `MA20 crossed above MA50: $${{fmtPrice(currMa20)}} / $${{fmtPrice(currMa50)}}` }});
+            }} else if (prevDiff >= 0 && currDiff < 0) {{
+              addSignal(idx, {{ type: 'ma-down', label: 'X-', side: 'down', color: '#fdb022', detail: `MA20 crossed below MA50: $${{fmtPrice(currMa20)}} / $${{fmtPrice(currMa50)}}` }});
+            }}
+          }}
+        }}
+
+        return signals;
+      }}
+
       function drawLineSeries(values, pointX, pointY, color, width = 2) {{
         ctx.beginPath();
         let started = false;
@@ -2469,6 +2555,39 @@ def chart_page(symbol: str) -> Response:
           ctx.fillRect(x - (bodyWidth / 2), bodyTop, bodyWidth, bodyHeight);
           ctx.strokeRect(x - (bodyWidth / 2), bodyTop, bodyWidth, bodyHeight);
         }});
+      }}
+
+      function drawTradeSignalMarkers(signalSeries, bars, pointX, pointY, priceBottom) {{
+        if (!signalSeries.length) return;
+        ctx.save();
+        ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        signalSeries.forEach((signals, idx) => {{
+          if (!signals?.length || !bars[idx]) return;
+          const x = pointX(idx);
+          let aboveCount = 0;
+          let belowCount = 0;
+          signals.forEach((signal) => {{
+            const label = signal.label || '?';
+            const width = Math.max(18, ctx.measureText(label).width + 10);
+            const isBelow = signal.side === 'up';
+            const rawY = isBelow
+              ? pointY(Number(bars[idx].l)) + 12 + (belowCount++ * 17)
+              : pointY(Number(bars[idx].h)) - 12 - (aboveCount++ * 17);
+            const y = isBelow
+              ? Math.min(priceBottom - 10, rawY)
+              : Math.max(12, rawY);
+            ctx.fillStyle = 'rgba(7, 17, 28, 0.88)';
+            ctx.fillRect(x - (width / 2), y - 8, width, 16);
+            ctx.strokeStyle = signal.color || '#d7f0ff';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(x - (width / 2), y - 8, width, 16);
+            ctx.fillStyle = signal.color || '#d7f0ff';
+            ctx.fillText(label, x, y + 0.5);
+          }});
+        }});
+        ctx.restore();
       }}
 
       function drawVolumeBars(bars, pointX, padLeft, padRight, plotBottom, slotWidth) {{
@@ -2589,11 +2708,15 @@ def chart_page(symbol: str) -> Response:
         const averageSource = ALL_BARS.length ? ALL_BARS : bars;
         const showRsi = showRsi14();
         const showMacdPanel = showMacd();
+        const showSignals = showTradeSignals();
         const rsiSeries = showRsi
           ? rsiValues(averageSource, 14).slice(startIndex, startIndex + bars.length)
           : [];
         const macdSeries = showMacdPanel
           ? macdValues(averageSource).slice(startIndex, startIndex + bars.length)
+          : [];
+        const signalSeries = showSignals
+          ? tradeSignalValues(averageSource).slice(startIndex, startIndex + bars.length)
           : [];
         const enabledMovingAverages = getEnabledMovingAverages().map((ma) => ({{
           ...ma,
@@ -2631,7 +2754,7 @@ def chart_page(symbol: str) -> Response:
         const pointX = (idx) => padLeft + ((bars.length === 1 ? 0.5 : idx / (bars.length - 1)) * w);
         const pointY = (value) => padTop + ((max - value) / range) * h;
 
-        LAST_DRAW_STATE = {{ bars, rsiSeries, macdSeries, bollingerSeries, srLevels, padLeft, padRight, padTop, padBottom, w, h, max, min, range, pointX, pointY }};
+        LAST_DRAW_STATE = {{ bars, rsiSeries, macdSeries, signalSeries, bollingerSeries, srLevels, padLeft, padRight, padTop, padBottom, w, h, max, min, range, pointX, pointY }};
         if (HOVER_CANVAS_X != null) {{
           const relative = (HOVER_CANVAS_X - padLeft) / Math.max(w, 1);
           const idx = Math.round(relative * Math.max(bars.length - 1, 0));
@@ -2680,6 +2803,10 @@ def chart_page(symbol: str) -> Response:
         }}
 
         overlays.forEach((overlay) => drawLineSeries(overlay.values, pointX, pointY, overlay.color, 2));
+
+        if (showSignals) {{
+          drawTradeSignalMarkers(signalSeries, bars, pointX, pointY, priceBottom);
+        }}
 
         let lowerPanelTop = priceBottom + (lowerPanelCount ? lowerPanelGap : 0);
         if (showRsi) {{
@@ -2742,6 +2869,7 @@ def chart_page(symbol: str) -> Response:
             : null;
           const rsiValue = rsiSeries[HOVER_INDEX];
           const macdValue = macdSeries[HOVER_INDEX];
+          const signalValues = signalSeries[HOVER_INDEX] || [];
           const bollingerValue = bollingerSeries[HOVER_INDEX];
           const volumeAverageValue = volumeAverageSeries[HOVER_INDEX];
           const hoverLineBottom = LAST_DRAW_STATE.macdPanel?.bottom || LAST_DRAW_STATE.rsiPanel?.bottom || priceBottom;
@@ -2804,6 +2932,11 @@ def chart_page(symbol: str) -> Response:
           if (showMacdPanel && macdValue?.macd != null) {{
             tooltipLines.push({{ text: `MACD ${{fmtPrice(macdValue.macd)}}  Sig ${{fmtPrice(macdValue.signal)}}  Hist ${{fmtPrice(macdValue.hist)}}`, color: '#7cc4ff' }});
           }}
+          if (showSignals && signalValues.length) {{
+            signalValues.forEach((signal) => {{
+              tooltipLines.push({{ text: `Signal ${{signal.label}}: ${{signal.detail}}`, color: signal.color || '#d7f0ff' }});
+            }});
+          }}
           const nearestSr = showSupportResistance() ? nearestSupportResistance(srLevels, hovered.c) : {{ support: null, resistance: null }};
           if (showSupportResistance()) {{
             tooltipLines.push({{ text: `S/R ${{formatSrDistance('S', nearestSr.support, hovered.c)}}`, color: '#17b26a' }});
@@ -2828,6 +2961,9 @@ def chart_page(symbol: str) -> Response:
         const visibleMacdValues = showMacd()
           ? macdValues(ALL_BARS).slice(viewportStart, viewportStart + visibleBars.length)
           : [];
+        const visibleSignalValues = showTradeSignals()
+          ? tradeSignalValues(ALL_BARS).slice(viewportStart, viewportStart + visibleBars.length)
+          : [];
         const visibleBollingerValues = showBollinger20()
           ? bollingerValues(ALL_BARS, BOLLINGER_20.period).slice(viewportStart, viewportStart + visibleBars.length)
           : [];
@@ -2836,6 +2972,8 @@ def chart_page(symbol: str) -> Response:
         const hoveredRsi = hoveredBar && HOVER_INDEX != null ? visibleRsiValues[HOVER_INDEX] : null;
         const latestMacd = visibleMacdValues.length ? visibleMacdValues[visibleMacdValues.length - 1] : null;
         const hoveredMacd = hoveredBar && HOVER_INDEX != null ? visibleMacdValues[HOVER_INDEX] : null;
+        const hoveredSignals = hoveredBar && HOVER_INDEX != null ? (visibleSignalValues[HOVER_INDEX] || []) : [];
+        const hoveredSignalText = signalSummary(hoveredSignals);
         const latestBollinger = visibleBollingerValues.length ? visibleBollingerValues[visibleBollingerValues.length - 1] : null;
         const hoveredBollinger = hoveredBar && HOVER_INDEX != null ? visibleBollingerValues[HOVER_INDEX] : null;
         const chartLabel = getChartType() === 'candles' ? 'candlestick' : 'line';
@@ -2847,6 +2985,7 @@ def chart_page(symbol: str) -> Response:
         if (showRsi14()) indicatorLabels.push('RSI14');
         if (showMacd()) indicatorLabels.push('MACD');
         if (showSupportResistance()) indicatorLabels.push('support/resistance');
+        if (showTradeSignals()) indicatorLabels.push('signals');
         const indicatorLabel = indicatorLabels.join(', ') || 'no overlays';
         const rsiSummary = showRsi14() && latestRsi != null ? ` Latest RSI14: ${{fmtPrice(latestRsi)}}.` : '';
         const macdSummary = showMacd() && latestMacd?.macd != null
@@ -2867,7 +3006,7 @@ def chart_page(symbol: str) -> Response:
           ? `Viewport: ${{formatAxisLabel(firstBar.t)}} to ${{formatAxisLabel(lastBar.t)}}`
           : 'No viewport available yet.';
         document.getElementById('hover-summary').textContent = hoveredBar
-          ? `Hovered bar: ${{fmtDate(hoveredBar.t)}} | Close $${{fmtPrice(hoveredBar.c)}} | High $${{fmtPrice(hoveredBar.h)}} | Low $${{fmtPrice(hoveredBar.l)}}${{hoveredRsi != null ? ` | RSI14 ${{fmtPrice(hoveredRsi)}}` : ''}}${{showMacd() && hoveredMacd?.macd != null ? ` | MACD ${{fmtPrice(hoveredMacd.macd)}} Sig ${{fmtPrice(hoveredMacd.signal)}} Hist ${{fmtPrice(hoveredMacd.hist)}}` : ''}}${{showBollinger20() ? ` | BB20 ${{bollingerStatus(hoveredBar.c, hoveredBollinger)}}${{hoveredBollinger ? ` U ${{fmtPrice(hoveredBollinger.upper)}} M ${{fmtPrice(hoveredBollinger.middle)}} L ${{fmtPrice(hoveredBollinger.lower)}}` : ''}}` : ''}}${{showSupportResistance() ? ` | S/R ${{formatSrDistance('support', hoveredSr.support, hoveredBar.c)}}; ${{formatSrDistance('resistance', hoveredSr.resistance, hoveredBar.c)}}` : ''}}`
+          ? `Hovered bar: ${{fmtDate(hoveredBar.t)}} | Close $${{fmtPrice(hoveredBar.c)}} | High $${{fmtPrice(hoveredBar.h)}} | Low $${{fmtPrice(hoveredBar.l)}}${{hoveredRsi != null ? ` | RSI14 ${{fmtPrice(hoveredRsi)}}` : ''}}${{showMacd() && hoveredMacd?.macd != null ? ` | MACD ${{fmtPrice(hoveredMacd.macd)}} Sig ${{fmtPrice(hoveredMacd.signal)}} Hist ${{fmtPrice(hoveredMacd.hist)}}` : ''}}${{showTradeSignals() && hoveredSignalText ? ` | Signals ${{hoveredSignalText}}` : ''}}${{showBollinger20() ? ` | BB20 ${{bollingerStatus(hoveredBar.c, hoveredBollinger)}}${{hoveredBollinger ? ` U ${{fmtPrice(hoveredBollinger.upper)}} M ${{fmtPrice(hoveredBollinger.middle)}} L ${{fmtPrice(hoveredBollinger.lower)}}` : ''}}` : ''}}${{showSupportResistance() ? ` | S/R ${{formatSrDistance('support', hoveredSr.support, hoveredBar.c)}}; ${{formatSrDistance('resistance', hoveredSr.resistance, hoveredBar.c)}}` : ''}}`
           : 'Hover over the chart to inspect a bar.';
         document.getElementById('last-close').textContent = lastBar ? fmtPrice(lastBar.c) : '-';
         document.getElementById('bar-count').textContent = String(ALL_BARS.length);
@@ -3025,6 +3164,7 @@ def chart_page(symbol: str) -> Response:
         document.getElementById('rsi-14').addEventListener('change', renderViewport);
         document.getElementById('macd').addEventListener('change', renderViewport);
         document.getElementById('support-resistance').addEventListener('change', renderViewport);
+        document.getElementById('trade-signals').addEventListener('change', renderViewport);
         document.getElementById('reload-btn').addEventListener('click', () => loadChart({{ autoSync: false, showReloadMessage: true }}).catch((err) => setStatus(err.message, true)));
         document.getElementById('sync-btn').addEventListener('click', syncNow);
         document.getElementById('pan-left-btn').addEventListener('click', () => panViewport(-1));
