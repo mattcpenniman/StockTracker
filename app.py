@@ -4365,7 +4365,7 @@ curl -s "http://127.0.0.1:5000/api/state/NVDA/1Day?breakout_lookback=55&buffer_p
   -d '{"symbols":["NVDA","AAPL","MSFT"],"timeframe":"1D","asof":"2023-09-20"}'</code></pre>
 
         <h2>GET /api/portfolio/state</h2>
-        <p>Returns analytics state for every visible stock in the saved portfolio, where the portfolio is sourced from the stored forecast rows in <code>stock_forecasts</code>. Optional query parameters match <code>/api/state/&lt;symbol&gt;</code>, including <code>timeframe</code>, <code>asof</code>, <code>hidets</code>, and <code>include_hidden=1</code>. Symbols that cannot produce analytics are returned in <code>errors</code> instead of failing the whole request.</p>
+        <p>Returns analytics state for every visible stock in the saved portfolio, where the portfolio is sourced from the stored forecast rows in <code>stock_forecasts</code>. Optional query parameters match <code>/api/state/&lt;symbol&gt;</code>, including <code>timeframe</code>, <code>asof</code>, <code>hidets</code>, and <code>include_hidden=1</code>. Symbols that cannot produce analytics are returned in <code>errors</code> instead of failing the whole request. Each state also includes portfolio cross-sectional rank features and benchmark-relative returns against available <code>SPY</code> and <code>QQQ</code> data.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/portfolio/state?timeframe=1D&asof=2023-09-20"
 curl -s "http://127.0.0.1:5000/api/portfolio/state?timeframe=1D&asof=2023-09-20&include_hidden=1"</code></pre>
 
@@ -4375,6 +4375,7 @@ curl -s "http://127.0.0.1:5000/api/portfolio/state?timeframe=1D&asof=2023-09-20&
   "requested_asof": "2023-09-20T23:59:59.999999Z",
   "portfolio_symbol_count": 3,
   "count": 2,
+  "benchmarks": ["SPY", "QQQ"],
   "states": [
     {
       "symbol": "NVDA",
@@ -4383,13 +4384,28 @@ curl -s "http://127.0.0.1:5000/api/portfolio/state?timeframe=1D&asof=2023-09-20&
       "returns": {},
       "trend": {},
       "momentum": {},
-      "volatility": {},
-      "range": {},
+      "volatility": {
+        "atr_14_pct": 0.024,
+        "return_20_over_vol_20": 0.31
+      },
+      "range": {
+        "high_252": 502.66,
+        "distance_from_high_252_pct": -0.08
+      },
       "volume": {},
       "signals": {},
+      "portfolio": {
+        "rank_return_20": 0.8,
+        "rank_trend_strength": 0.7
+      },
+      "relative": {
+        "rel_return_spy_20": 0.04,
+        "rel_return_qqq_20": 0.02
+      },
       "data_quality": {}
     }
   ],
+  "benchmark_errors": [],
   "errors": [
     {
       "symbol": "MSFT",

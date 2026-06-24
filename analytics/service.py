@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from copy import deepcopy
 from typing import Any
 
 import pandas as pd
@@ -226,8 +227,11 @@ class AnalyticsService:
             },
             "volatility": {
                 "atr_14": latest.get("atr_14"),
+                "atr_14_pct": (atr_14 / anchor_close) if pd.notna(atr_14) and anchor_close else None,
                 "stddev_20": latest.get("stddev_20"),
                 "realized_vol_20": latest.get("realized_vol_20"),
+                "return_20_over_vol_20": latest.get("return_20_over_vol_20"),
+                "return_60_over_vol_20": latest.get("return_60_over_vol_20"),
                 "volatility_ratio": latest.get("volatility_ratio"),
                 "regime": volatility_regime,
             },
@@ -236,8 +240,12 @@ class AnalyticsService:
                 "low_20": latest.get("low_20"),
                 "high_55": latest.get("high_55"),
                 "low_55": latest.get("low_55"),
+                "high_252": latest.get("high_252"),
+                "low_252": latest.get("low_252"),
                 "distance_from_high_20_pct": distance_from_high_20_pct,
                 "distance_from_low_20_pct": distance_from_low_20_pct,
+                "distance_from_high_252_pct": ((anchor_close / latest.get("high_252")) - 1.0) if pd.notna(latest.get("high_252")) and latest.get("high_252") not in (0, 0.0) else None,
+                "distance_from_low_252_pct": ((anchor_close / latest.get("low_252")) - 1.0) if pd.notna(latest.get("low_252")) and latest.get("low_252") not in (0, 0.0) else None,
                 "distance_from_sma_20_pct": distance_from_sma_20_pct,
                 "distance_from_sma_50_pct": distance_from_sma_50_pct,
                 "distance_from_sma_200_pct": distance_from_sma_200_pct,
@@ -459,6 +467,74 @@ class AnalyticsService:
         self._future_cache.set(cache_key, payload)
         return payload
 
+    def _state_metric(self, state: dict[str, Any], path: tuple[str, str]) -> float | None:
+        section = state.get(path[0])
+        if not isinstance(section, dict):
+            return None
+        value = section.get(path[1])
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+
+    def _add_portfolio_ranks(self, states: list[dict[str, Any]]) -> None:
+        metric_paths = {
+            "return_20": ("returns", "r_20"),
+            "return_60": ("returns", "r_60"),
+            "rsi_14": ("momentum", "rsi_14"),
+            "trend_strength": ("trend", "trend_strength"),
+            "realized_vol_20": ("volatility", "realized_vol_20"),
+            "volume_ratio_20": ("volume", "volume_ratio_20"),
+        }
+
+        for state in states:
+            state.setdefault("portfolio", {})
+
+        for metric_name, path in metric_paths.items():
+            values = pd.Series(
+                {idx: self._state_metric(state, path) for idx, state in enumerate(states)},
+                dtype="float64",
+            ).dropna()
+            if values.empty:
+                continue
+            ranks = values.rank(method="average", pct=True)
+            for idx, rank in ranks.items():
+                states[int(idx)]["portfolio"][f"rank_{metric_name}"] = float(rank)
+
+    def _add_benchmark_relative_returns(
+        self,
+        states: list[dict[str, Any]],
+        timeframe: str,
+        asof_dt,
+        settings: AnalyticsSettings,
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        benchmarks = ("SPY", "QQQ")
+        state_by_symbol = {str(state.get("symbol", "")).upper(): state for state in states}
+        benchmark_states: dict[str, dict[str, Any]] = {}
+        benchmark_errors: list[dict[str, str]] = []
+
+        for benchmark in benchmarks:
+            if benchmark in state_by_symbol:
+                benchmark_states[benchmark] = state_by_symbol[benchmark]
+                continue
+            try:
+                benchmark_states[benchmark] = self.get_symbol_state(benchmark, timeframe, asof_dt, settings)
+            except AnalyticsNotFoundError as exc:
+                benchmark_errors.append({"symbol": benchmark, "error": str(exc)})
+
+        return_fields = ("r_1", "r_5", "r_20", "r_60")
+        for state in states:
+            relative = state.setdefault("relative", {})
+            for benchmark, benchmark_state in benchmark_states.items():
+                benchmark_returns = benchmark_state.get("returns", {}) if isinstance(benchmark_state.get("returns"), dict) else {}
+                state_returns = state.get("returns", {}) if isinstance(state.get("returns"), dict) else {}
+                for field in return_fields:
+                    state_return = state_returns.get(field)
+                    benchmark_return = benchmark_returns.get(field)
+                    if state_return is not None and benchmark_return is not None and pd.notna(state_return) and pd.notna(benchmark_return):
+                        relative[f"rel_return_{benchmark.lower()}_{field.removeprefix('r_')}"] = float(state_return) - float(benchmark_return)
+
+        return list(benchmark_states.keys()), benchmark_errors
+
     def get_batch_state(
         self,
         symbols: list[str],
@@ -471,16 +547,21 @@ class AnalyticsService:
 
         for symbol in symbols:
             try:
-                states.append(self.get_symbol_state(symbol, timeframe, asof_dt, settings))
+                states.append(deepcopy(self.get_symbol_state(symbol, timeframe, asof_dt, settings)))
             except AnalyticsNotFoundError as exc:
                 errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
+
+        self._add_portfolio_ranks(states)
+        benchmarks, benchmark_errors = self._add_benchmark_relative_returns(states, timeframe, asof_dt, settings)
 
         return clean_json_value(
             {
                 "timeframe": timeframe,
                 "requested_asof": isoformat_utc(asof_dt),
+                "benchmarks": benchmarks,
                 "states": states,
                 "errors": errors,
+                "benchmark_errors": benchmark_errors,
             }
         )
 

@@ -85,14 +85,19 @@ def compute_feature_frame(
     df["macd_hist"] = df["macd"] - df["macd_signal"]
 
     df["atr_14"] = _atr(df, 14)
+    df["atr_14_pct"] = df["atr_14"] / close.replace(0.0, pd.NA)
     df["stddev_20"] = returns.rolling(20, min_periods=20).std(ddof=0)
     annualization = math.sqrt(TRADING_PERIODS_PER_YEAR.get(timeframe, 252.0))
     df["realized_vol_20"] = df["stddev_20"] * annualization
+    df["return_20_over_vol_20"] = df["return_20"] / df["realized_vol_20"].replace(0.0, pd.NA)
+    df["return_60_over_vol_20"] = df["return_60"] / df["realized_vol_20"].replace(0.0, pd.NA)
 
     df["high_20"] = df["high"].rolling(20, min_periods=20).max()
     df["low_20"] = df["low"].rolling(20, min_periods=20).min()
     df["high_55"] = df["high"].rolling(55, min_periods=55).max()
     df["low_55"] = df["low"].rolling(55, min_periods=55).min()
+    df["high_252"] = df["high"].rolling(252, min_periods=252).max()
+    df["low_252"] = df["low"].rolling(252, min_periods=252).min()
 
     df["prior_high_breakout"] = df["high"].shift(1).rolling(settings.breakout_lookback, min_periods=settings.breakout_lookback).max()
     df["prior_low_breakdown"] = df["low"].shift(1).rolling(settings.breakout_lookback, min_periods=settings.breakout_lookback).min()
@@ -103,6 +108,8 @@ def compute_feature_frame(
 
     df["distance_from_high_20"] = (close / df["high_20"]) - 1.0
     df["distance_from_low_20"] = (close / df["low_20"]) - 1.0
+    df["distance_from_high_252"] = (close / df["high_252"]) - 1.0
+    df["distance_from_low_252"] = (close / df["low_252"]) - 1.0
     df["distance_from_sma_20"] = (close / df["sma_20"]) - 1.0
     df["distance_from_sma_50"] = (close / df["sma_50"]) - 1.0
     df["distance_from_sma_200"] = (close / df["sma_200"]) - 1.0

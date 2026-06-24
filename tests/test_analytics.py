@@ -61,7 +61,12 @@ class IndicatorTests(unittest.TestCase):
         self.assertAlmostEqual(latest["ema_26"], expected_ema26, places=6)
         self.assertGreater(latest["rsi_14"], 99.0)
         self.assertAlmostEqual(latest["atr_14"], 2.0, places=6)
+        self.assertAlmostEqual(latest["atr_14_pct"], 2.0 / bars["close"].iloc[-1], places=6)
         self.assertAlmostEqual(latest["macd"], latest["ema_12"] - latest["ema_26"], places=6)
+        self.assertAlmostEqual(latest["high_252"], bars["high"].tail(252).max(), places=6)
+        self.assertAlmostEqual(latest["low_252"], bars["low"].tail(252).min(), places=6)
+        self.assertAlmostEqual(latest["distance_from_high_252"], (bars["close"].iloc[-1] / bars["high"].tail(252).max()) - 1.0, places=6)
+        self.assertIn("return_20_over_vol_20", latest)
 
     def test_short_history_keeps_nulls_for_long_lookbacks(self) -> None:
         bars = _fixture_bars(10)
@@ -175,7 +180,73 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["trend"]["regime"], "uptrend")
         self.assertEqual(payload["state"]["trend"], "uptrend")
         self.assertIn("signal_bias", payload["state"])
+        self.assertIn("atr_14_pct", payload["volatility"])
+        self.assertIn("return_20_over_vol_20", payload["volatility"])
+        self.assertIn("distance_from_high_252_pct", payload["range"])
         self.assertTrue(payload["data_quality"]["has_sufficient_history_200"])
+
+    def test_batch_state_adds_portfolio_ranks_and_benchmark_relative_returns(self) -> None:
+        repo = Mock()
+
+        def context(symbol: str, symbol_id: int) -> dict:
+            return {
+                "symbol_id": symbol_id,
+                "symbol": symbol,
+                "exchange": "NYSE",
+                "asset_class": "us_equity",
+                "name": symbol,
+                "is_active": True,
+                "created_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+                "updated_at": pd.Timestamp("2023-01-01", tz="UTC").to_pydatetime(),
+                "last_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+                "last_successful_sync_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+                "last_quote_synced_at": None,
+                "last_bar_synced_at": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+                "latest_bar_time": pd.Timestamp("2023-09-20", tz="UTC").to_pydatetime(),
+                "latest_quote_time": None,
+                "sync_status": "idle",
+                "sync_error": None,
+            }
+
+        contexts = {
+            "AAA": context("AAA", 1),
+            "BBB": context("BBB", 2),
+            "SPY": context("SPY", 3),
+            "QQQ": context("QQQ", 4),
+        }
+
+        def bars_with_step(step: float) -> pd.DataFrame:
+            bars = _fixture_bars(260)
+            closes = pd.Series([100.0 + (idx * step) for idx in range(260)], dtype=float)
+            bars.loc[:, "close"] = closes
+            bars.loc[:, "open"] = closes - 0.5
+            bars.loc[:, "high"] = closes + 1.0
+            bars.loc[:, "low"] = closes - 1.0
+            return bars
+
+        bars_by_id = {
+            1: bars_with_step(1.0),
+            2: bars_with_step(2.0),
+            3: bars_with_step(0.5),
+            4: bars_with_step(1.5),
+        }
+        repo.fetch_symbol_context.side_effect = lambda symbol: contexts.get(str(symbol).upper())
+        repo.fetch_bars.side_effect = lambda symbol_id, timeframe, asof=None, start=None: bars_by_id[symbol_id]
+        service = AnalyticsService(repository=repo)
+
+        payload = service.get_batch_state(["AAA", "BBB"], "1Day", None, AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))
+        states = {state["symbol"]: state for state in payload["states"]}
+
+        self.assertEqual(payload["benchmarks"], ["SPY", "QQQ"])
+        self.assertEqual(payload["benchmark_errors"], [])
+        self.assertGreater(states["BBB"]["portfolio"]["rank_return_20"], states["AAA"]["portfolio"]["rank_return_20"])
+        self.assertIn("rank_rsi_14", states["AAA"]["portfolio"])
+        self.assertIn("rel_return_spy_20", states["AAA"]["relative"])
+        self.assertAlmostEqual(
+            states["AAA"]["relative"]["rel_return_spy_20"],
+            states["AAA"]["returns"]["r_20"] - service.get_symbol_state("SPY", "1Day", None, AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))["returns"]["r_20"],
+            places=6,
+        )
 
     def test_intraday_asof_uses_daily_indicators_and_intraday_price(self) -> None:
         repo = Mock()
