@@ -17,8 +17,9 @@ from analytics.regimes import (
     classify_volatility_regime,
 )
 from analytics.serializers import serialize_events
-from analytics.service import AnalyticsService
+from analytics.service import AnalyticsNotFoundError, AnalyticsService
 from analytics.signals import compute_signal_columns, generate_events
+from analytics.utils import parse_asof
 
 
 def _fixture_bars(count: int = 260) -> pd.DataFrame:
@@ -532,6 +533,29 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["future_state"]["first_threshold_hit"], "take_profit")
         self.assertEqual(payload["future_state"]["first_threshold_hit_timestamp"], "2023-09-17T12:45:00Z")
 
+    def test_service_builds_batch_future_state_payload(self) -> None:
+        service = AnalyticsService(repository=Mock())
+        service.get_future_state = Mock(
+            side_effect=[
+                {"symbol": "NVDA", "future_state": {"return_at_horizon_pct": 0.05}},
+                AnalyticsNotFoundError("Symbol 'MSFT' was not found in symbol_metadata."),
+            ]
+        )
+
+        payload = service.get_batch_future_state(
+            ["NVDA", "MSFT"],
+            "1Day",
+            pd.Timestamp("2023-09-20", tz="UTC"),
+            20,
+        )
+
+        self.assertEqual(payload["timeframe"], "1Day")
+        self.assertEqual(payload["requested_asof"], "2023-09-20T00:00:00Z")
+        self.assertEqual(payload["horizon_days"], 20)
+        self.assertEqual(len(payload["future_states"]), 1)
+        self.assertEqual(payload["future_states"][0]["symbol"], "NVDA")
+        self.assertEqual(payload["errors"][0]["symbol"], "MSFT")
+
 
 class StateEndpointHelperTests(unittest.TestCase):
 
@@ -561,6 +585,75 @@ class StateEndpointHelperTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         mock_sync.assert_called_once_with("NVDA", "1Day")
         self.assertTrue(mock_service.get_symbol_state.called)
+
+    @patch("app.analytics_service")
+    @patch("app._read_df")
+    def test_portfolio_state_endpoint_uses_visible_portfolio_symbols(self, mock_read_df, mock_service) -> None:
+        mock_read_df.return_value = pd.DataFrame(
+            {
+                "symbol": ["NVDA", "MSFT", "TSLA"],
+                "hidden": [False, True, False],
+            }
+        )
+        mock_service.get_batch_state.return_value = {
+            "timeframe": "1Day",
+            "requested_asof": "2023-09-20T23:59:59.999999Z",
+            "states": [{"symbol": "NVDA"}, {"symbol": "TSLA"}],
+            "errors": [],
+        }
+
+        with flask_app.test_client() as client:
+            response = client.get("/api/portfolio/state?timeframe=1D&asof=2023-09-20")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["portfolio_symbol_count"], 2)
+        self.assertEqual(payload["count"], 2)
+        mock_service.get_batch_state.assert_called_once()
+        self.assertEqual(mock_service.get_batch_state.call_args.args[0], ["NVDA", "TSLA"])
+
+    @patch("app.analytics_service")
+    @patch("app._read_df")
+    def test_portfolio_future_state_endpoint_requires_asof_and_days(self, mock_read_df, mock_service) -> None:
+        mock_read_df.return_value = pd.DataFrame({"symbol": ["NVDA"], "hidden": [False]})
+
+        with flask_app.test_client() as client:
+            missing_days = client.get("/api/portfolio/futurestate?asof=2023-09-20")
+            missing_asof = client.get("/api/portfolio/futurestate?days=20")
+
+        self.assertEqual(missing_days.status_code, 400)
+        self.assertEqual(missing_asof.status_code, 400)
+        self.assertFalse(mock_service.get_batch_future_state.called)
+
+    @patch("app.analytics_service")
+    @patch("app._read_df")
+    def test_portfolio_future_state_endpoint_uses_portfolio_symbols(self, mock_read_df, mock_service) -> None:
+        mock_read_df.return_value = pd.DataFrame(
+            {
+                "symbol": ["NVDA", "MSFT"],
+                "hidden": [False, True],
+            }
+        )
+        mock_service.get_batch_future_state.return_value = {
+            "timeframe": "1Day",
+            "requested_asof": "2023-09-20T23:59:59.999999Z",
+            "horizon_days": 20,
+            "side": "long",
+            "future_states": [{"symbol": "NVDA"}],
+            "errors": [],
+        }
+
+        with flask_app.test_client() as client:
+            response = client.get("/api/portfolio/futurestate?timeframe=1D&asof=2023-09-20&days=20")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["portfolio_symbol_count"], 1)
+        self.assertEqual(payload["count"], 1)
+        mock_service.get_batch_future_state.assert_called_once()
+        self.assertEqual(mock_service.get_batch_future_state.call_args.args[:4], (["NVDA"], "1Day", parse_asof("2023-09-20"), 20))
 
     def test_intraday_anchor_accepts_same_day_bar(self) -> None:
         payload = {

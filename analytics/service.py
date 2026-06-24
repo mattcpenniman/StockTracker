@@ -484,6 +484,46 @@ class AnalyticsService:
             }
         )
 
+    def get_batch_future_state(
+        self,
+        symbols: list[str],
+        timeframe: str,
+        asof_dt,
+        days: int,
+        stop_loss_pct: float | None = None,
+        take_profit_pct: float | None = None,
+        side: str = "long",
+    ) -> dict[str, Any]:
+        future_states: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+
+        for symbol in symbols:
+            try:
+                future_states.append(
+                    self.get_future_state(
+                        symbol,
+                        timeframe,
+                        asof_dt,
+                        days,
+                        stop_loss_pct=stop_loss_pct,
+                        take_profit_pct=take_profit_pct,
+                        side=side,
+                    )
+                )
+            except AnalyticsNotFoundError as exc:
+                errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
+
+        return clean_json_value(
+            {
+                "timeframe": timeframe,
+                "requested_asof": isoformat_utc(asof_dt),
+                "horizon_days": days,
+                "side": side,
+                "future_states": future_states,
+                "errors": errors,
+            }
+        )
+
     def health(self) -> dict[str, Any]:
         ok = self.repository.ping()
         return {"ok": ok, "service": "analytics", "database": "connected" if ok else "disconnected"}

@@ -1607,6 +1607,18 @@ def _parse_bool_query_param(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _portfolio_symbols(include_hidden: bool = False) -> List[str]:
+    df = _read_df()
+    if df.empty:
+        return []
+    if not include_hidden:
+        df = df[~df["hidden"].astype(bool)].copy()
+    if df.empty:
+        return []
+    symbols = df["symbol"].dropna().astype(str).str.upper().str.strip().tolist()
+    return [symbol for symbol in dict.fromkeys(symbols) if symbol]
+
+
 def _strip_symbol_and_timestamps(value):
     if isinstance(value, dict):
         out = {}
@@ -4106,6 +4118,102 @@ def get_analytics_batch_state() -> Response:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.get("/api/portfolio/state")
+def get_portfolio_analytics_state() -> Response:
+    try:
+        hide_ts = _parse_bool_query_param("hidets", default=False)
+        include_hidden = _parse_bool_query_param("include_hidden", default=False)
+        symbols = _portfolio_symbols(include_hidden=include_hidden)
+        normalized_timeframe = _normalize_analytics_timeframe(request.args.get("timeframe"))
+        settings = _analytics_settings_from_request()
+        asof_dt = parse_asof(request.args.get("asof"))
+        if asof_dt is None:
+            for symbol in symbols:
+                _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
+        batch = analytics_service.get_batch_state(symbols, normalized_timeframe, asof_dt, settings)
+        batch["ok"] = True
+        batch["portfolio_symbol_count"] = len(symbols)
+        batch["count"] = len(batch.get("states", []))
+        if hide_ts:
+            batch = _strip_symbol_and_timestamps(batch)
+        return jsonify(batch)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/api/portfolio/futurestate")
+def get_portfolio_analytics_future_state() -> Response:
+    days_raw = (request.args.get("days") or request.args.get("horizon_days") or "").strip()
+    if not days_raw:
+        return jsonify({"ok": False, "error": "'days' is required."}), 400
+
+    try:
+        days = int(days_raw)
+    except ValueError:
+        return jsonify({"ok": False, "error": "'days' must be an integer."}), 400
+
+    stop_loss_pct = None
+    take_profit_pct = None
+    side = (request.args.get("side") or "long").strip().lower() or "long"
+    stop_loss_raw = (request.args.get("stoploss") or request.args.get("stop_loss") or "").strip()
+    take_profit_raw = (request.args.get("takeprofit") or request.args.get("take_profit") or "").strip()
+    if stop_loss_raw:
+        try:
+            stop_loss_pct = float(stop_loss_raw)
+        except ValueError:
+            return jsonify({"ok": False, "error": "'stoploss' must be a number."}), 400
+    if take_profit_raw:
+        try:
+            take_profit_pct = float(take_profit_raw)
+        except ValueError:
+            return jsonify({"ok": False, "error": "'takeprofit' must be a number."}), 400
+    if side not in {"long", "short"}:
+        return jsonify({"ok": False, "error": "'side' must be either 'long' or 'short'."}), 400
+
+    try:
+        hide_ts = _parse_bool_query_param("hidets", default=False)
+        include_hidden = _parse_bool_query_param("include_hidden", default=False)
+        symbols = _portfolio_symbols(include_hidden=include_hidden)
+        normalized_timeframe = _normalize_analytics_timeframe(request.args.get("timeframe"))
+        asof_dt = parse_asof(request.args.get("asof"))
+        if asof_dt is None:
+            return jsonify({"ok": False, "error": "'asof' is required."}), 400
+        desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
+        if desired_price_timeframe != "1Day":
+            for symbol in symbols:
+                try:
+                    _sync_market_data_window(
+                        symbol,
+                        desired_price_timeframe,
+                        start=asof_dt - timedelta(days=7),
+                        end=asof_dt + timedelta(days=max(1, days)),
+                        snapshot_limit=1,
+                    )
+                except Exception:
+                    pass
+        batch = analytics_service.get_batch_future_state(
+            symbols,
+            normalized_timeframe,
+            asof_dt,
+            days,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            side=side,
+        )
+        batch["ok"] = True
+        batch["portfolio_symbol_count"] = len(symbols)
+        batch["count"] = len(batch.get("future_states", []))
+        if hide_ts:
+            batch = _strip_symbol_and_timestamps(batch)
+        return jsonify(batch)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.get("/api/health/analytics")
 def analytics_health() -> Response:
     try:
@@ -4256,6 +4364,40 @@ curl -s "http://127.0.0.1:5000/api/state/NVDA/1Day?breakout_lookback=55&buffer_p
   -H "Content-Type: application/json" \
   -d '{"symbols":["NVDA","AAPL","MSFT"],"timeframe":"1D","asof":"2023-09-20"}'</code></pre>
 
+        <h2>GET /api/portfolio/state</h2>
+        <p>Returns analytics state for every visible stock in the saved portfolio, where the portfolio is sourced from the stored forecast rows in <code>stock_forecasts</code>. Optional query parameters match <code>/api/state/&lt;symbol&gt;</code>, including <code>timeframe</code>, <code>asof</code>, <code>hidets</code>, and <code>include_hidden=1</code>. Symbols that cannot produce analytics are returned in <code>errors</code> instead of failing the whole request.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/portfolio/state?timeframe=1D&asof=2023-09-20"
+curl -s "http://127.0.0.1:5000/api/portfolio/state?timeframe=1D&asof=2023-09-20&include_hidden=1"</code></pre>
+
+<pre><code>{
+  "ok": true,
+  "timeframe": "1Day",
+  "requested_asof": "2023-09-20T23:59:59.999999Z",
+  "portfolio_symbol_count": 3,
+  "count": 2,
+  "states": [
+    {
+      "symbol": "NVDA",
+      "as_of": "2023-09-20T00:00:00Z",
+      "price": {},
+      "returns": {},
+      "trend": {},
+      "momentum": {},
+      "volatility": {},
+      "range": {},
+      "volume": {},
+      "signals": {},
+      "data_quality": {}
+    }
+  ],
+  "errors": [
+    {
+      "symbol": "MSFT",
+      "error": "No bars available for symbol 'MSFT' on timeframe '1Day'."
+    }
+  ]
+}</code></pre>
+
         <h2>GET /api/events/&lt;symbol&gt;</h2>
         <p>Returns recent deterministic events for one symbol. Optional query parameters: <code>timeframe</code>, <code>asof</code>, <code>event_limit</code>, <code>breakout_lookback</code>, <code>buffer_pct</code>, <code>volume_confirmation</code>, <code>volume_multiple</code>.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/events/NVDA?timeframe=1D&event_limit=10"
@@ -4303,6 +4445,47 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
   }
 }</code></pre>
 
+        <h2>GET /api/portfolio/futurestate</h2>
+        <p>Returns realized forward performance for every visible stock in the saved portfolio from the same <code>asof</code> anchor. This is intended for labeling historical training examples after fetching technicals from <code>/api/portfolio/state</code>. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameters include <code>timeframe</code>, <code>hidets</code>, <code>include_hidden=1</code>, <code>side</code>, <code>stoploss</code>, and <code>takeprofit</code>. For <code>1Day</code>, <code>days</code> means future trading bars rather than calendar days.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/portfolio/futurestate?timeframe=1D&asof=2023-09-20&days=20"</code></pre>
+
+<pre><code>{
+  "ok": true,
+  "timeframe": "1Day",
+  "requested_asof": "2023-09-20T23:59:59.999999Z",
+  "horizon_days": 20,
+  "side": "long",
+  "portfolio_symbol_count": 3,
+  "count": 2,
+  "future_states": [
+    {
+      "symbol": "NVDA",
+      "as_of": "2023-09-20T00:00:00Z",
+      "anchor_price": {
+        "close": 444.1,
+        "timestamp": "2023-09-20T00:00:00Z",
+        "source_timeframe": "1Day"
+      },
+      "window": {
+        "future_bar_count": 20,
+        "complete_window": true,
+        "source_timeframe": "1Day"
+      },
+      "future_state": {
+        "max_return_pct": 0.061,
+        "min_return_pct": -0.0308,
+        "return_at_horizon_pct": 0.0554
+      }
+    }
+  ],
+  "errors": [
+    {
+      "symbol": "MSFT",
+      "error": "No future bars available for symbol 'MSFT' on timeframe '1Day' for the requested window."
+    }
+  ]
+}</code></pre>
+
         <h2>GET /api/metadata/&lt;symbol&gt;</h2>
         <p>Returns symbol metadata and data freshness fields from <code>symbol_metadata</code> and <code>symbol_sync_state</code>.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/metadata/NVDA"</code></pre>
@@ -4316,6 +4499,8 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
           <li><code>timeframe</code>: one of <code>1Day</code>, <code>1D</code>, <code>1Hour</code>, <code>15Min</code>, <code>5Min</code>, <code>1Min</code></li>
           <li><code>asof</code>: optional backdated cutoff; accepts <code>YYYY-MM-DD</code> or full ISO 8601 timestamps</li>
           <li><code>hidets</code>: optional boolean, default <code>false</code>; when true, removes <code>symbol</code> and timestamp-like fields from the response</li>
+          <li><code>include_hidden</code>: optional boolean for portfolio endpoints, default <code>false</code>; when true, includes hidden portfolio rows</li>
+          <li><code>days</code>: required by future-state endpoints; number of future bars to evaluate from the <code>asof</code> anchor</li>
           <li><code>event_limit</code>: optional max number of events returned, default <code>20</code></li>
           <li><code>breakout_lookback</code>: optional prior-bar lookback for breakout and breakdown rules, default <code>20</code></li>
           <li><code>buffer_pct</code>: optional breakout and breakdown buffer, default <code>0.0025</code></li>
