@@ -58,7 +58,7 @@ DATABASE_URL = os.environ.get(
     "postgresql://stock_user:stock_pass@localhost:5432/stock_tracker",
 )
 CSV_HEADERS = ["symbol", "forecast_price", "updated_date"]
-EXTENDED_HEADERS = CSV_HEADERS + ["reward_score", "risk_score", "confidence_score", "classification"]
+EXTENDED_HEADERS = CSV_HEADERS + ["reward_score", "risk_score", "confidence_score", "classification", "hidden"]
 _LOCK = threading.Lock()
 ALLOWED_CLASSIFICATIONS = {"buy", "hold/watch", "sell"}
 DEFAULT_SCORE = 5.0
@@ -204,7 +204,8 @@ def _init_db_if_needed() -> None:
                         reward_score DOUBLE PRECISION NOT NULL DEFAULT {DEFAULT_SCORE},
                         risk_score DOUBLE PRECISION NOT NULL DEFAULT {DEFAULT_SCORE},
                         confidence_score DOUBLE PRECISION NOT NULL DEFAULT {DEFAULT_SCORE},
-                        classification TEXT NOT NULL DEFAULT '{DEFAULT_CLASSIFICATION}'
+                        classification TEXT NOT NULL DEFAULT '{DEFAULT_CLASSIFICATION}',
+                        hidden BOOLEAN NOT NULL DEFAULT FALSE
                     )
                     """
                 )
@@ -219,6 +220,9 @@ def _init_db_if_needed() -> None:
                 )
                 cur.execute(
                     f"ALTER TABLE {DB_TABLE} ADD COLUMN IF NOT EXISTS classification TEXT NOT NULL DEFAULT '{DEFAULT_CLASSIFICATION}'"
+                )
+                cur.execute(
+                    f"ALTER TABLE {DB_TABLE} ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE"
                 )
                 cur.execute(
                     f"""
@@ -339,7 +343,7 @@ def _read_df() -> pd.DataFrame:
             cur.execute(
                 f"""
                 SELECT symbol, forecast_price, updated_date::TEXT,
-                       reward_score, risk_score, confidence_score, classification
+                       reward_score, risk_score, confidence_score, classification, hidden
                 FROM {DB_TABLE}
                 ORDER BY symbol ASC
                 """
@@ -357,6 +361,7 @@ def _read_df() -> pd.DataFrame:
     df["risk_score"] = pd.to_numeric(df["risk_score"], errors="coerce")
     df["confidence_score"] = pd.to_numeric(df["confidence_score"], errors="coerce")
     df["classification"] = df["classification"].astype(str).str.strip().str.lower()
+    df["hidden"] = df["hidden"].astype(bool)
     return df
 
 
@@ -501,6 +506,21 @@ def _upsert_stocks(rows: List[Dict]) -> int:
                 payload,
             )
     return len(payload)
+
+
+def _set_stock_hidden(symbol: str, hidden: bool) -> bool:
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        raise ValueError("Symbol is required.")
+
+    _init_db_if_needed()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {DB_TABLE} SET hidden = %s WHERE symbol = %s",
+                (hidden, symbol),
+            )
+            return cur.rowcount > 0
 
 
 def _parse_optional_float(value) -> float | None:
@@ -1638,13 +1658,23 @@ def index() -> Response:
       let SORT_KEY = 'action_score';
       let SORT_ASC = false;
       let ROWS = [];
+      let SHOW_HIDDEN = false;
 
       async function fetchData() {{
-        const res = await fetch('/data');
+        const params = new URLSearchParams();
+        if (SHOW_HIDDEN) params.set('include_hidden', '1');
+        const res = await fetch(`/data?${{params.toString()}}`);
         const payload = await res.json();
         ROWS = payload.rows || [];
         renderTable();
         document.getElementById('last-refreshed').textContent = new Date().toLocaleString();
+      }}
+
+      function toggleHiddenRows() {{
+        SHOW_HIDDEN = !SHOW_HIDDEN;
+        const btn = document.getElementById('show-hidden');
+        if (btn) btn.textContent = SHOW_HIDDEN ? 'Hide Hidden Rows' : 'Show Hidden Rows';
+        fetchData();
       }}
 
       function sortBy(key) {{
@@ -1707,6 +1737,29 @@ def index() -> Response:
         }}
       }}
 
+      async function setStockHidden(symbol, hidden, btn) {{
+        if (!symbol || !btn) return;
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = hidden ? 'Hiding...' : 'Restoring...';
+        try {{
+          const res = await fetch(`/api/stocks/${{encodeURIComponent(symbol)}}/hidden`, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ hidden }}),
+          }});
+          const payload = await res.json();
+          if (!res.ok || !payload.ok) {{
+            throw new Error(payload.error || 'Failed to update hidden status.');
+          }}
+          await fetchData();
+        }} catch (err) {{
+          alert(err.message || String(err));
+          btn.disabled = false;
+          btn.textContent = old;
+        }}
+      }}
+
       async function updateAllBars() {{
         const btn = document.getElementById('update-all-bars');
         const symbols = [...new Set(ROWS.map((row) => row.symbol).filter(Boolean))];
@@ -1759,8 +1812,11 @@ def index() -> Response:
           const last_bar = formatLastBarDate(r.latest_bar_time);
           const colorClass = r.diff_dollar == null ? '' : (r.diff_dollar >= 0 ? 'pos' : 'neg');
           const trendClass = r.trend_state === 'Bullish' ? 'pos' : (r.trend_state === 'Bearish' ? 'neg' : 'muted');
+          const hiddenAction = r.hidden ? 'Restore' : 'Hide';
+          const hiddenTarget = r.hidden ? 'false' : 'true';
 
           const tr = document.createElement('tr');
+          if (r.hidden) tr.classList.add('hidden-row');
           tr.innerHTML = `
             <td><a href=\"/chart/${{r.symbol}}\" class=\"symbol-link\"><code>${{r.symbol}}</code></a></td>
             <td class=\"num\">${{forecast_price}}</td>
@@ -1782,6 +1838,7 @@ def index() -> Response:
             <td class="date">${{next_earnings}}</td>
             <td class="date">${{last_bar}}</td>
             <td class="action"><button type="button" class="inline-btn secondary" onclick="updateBars('${{r.symbol}}', this)">Update Bars</button></td>
+            <td class="action"><button type="button" class="inline-btn secondary" onclick="setStockHidden('${{r.symbol}}', ${{hiddenTarget}}, this)">${{hiddenAction}}</button></td>
           `;
           tbody.appendChild(tr);
         }}
@@ -1844,6 +1901,7 @@ def index() -> Response:
         document.getElementById('form').addEventListener('submit', addOrUpdate);
         document.getElementById('refresh').addEventListener('click', fetchData);
         document.getElementById('update-all-bars').addEventListener('click', updateAllBars);
+        document.getElementById('show-hidden').addEventListener('click', toggleHiddenRows);
         document.getElementById('earnings-form').addEventListener('submit', updateEarnings);
         fetchData();
       }});
@@ -1907,6 +1965,7 @@ def index() -> Response:
       }}
       button.secondary {{ background: #243447; }}
       button.inline-btn {{ margin-top: 0; padding: 7px 10px; white-space: nowrap; }}
+      tr.hidden-row {{ opacity: 0.55; }}
       .row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
       table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
       th, td {{ border-bottom: 1px solid var(--border); padding: 10px 8px; text-align: left; }}
@@ -1988,7 +2047,10 @@ def index() -> Response:
               <h3 style=\"margin-top:0\">Tracked Forecasts</h3>
               <div class=\"muted\">Opportunity = (Reward×4) + ((10-Risk)×4) + (Confidence×2). Click a symbol to open its chart and sync status.</div>
             </div>
-            <button type=\"button\" id=\"update-all-bars\" class=\"secondary\">Update All Bars</button>
+            <div class=\"row\" style=\"justify-content:flex-end;\">
+              <button type=\"button\" id=\"show-hidden\" class=\"secondary\">Show Hidden Rows</button>
+              <button type=\"button\" id=\"update-all-bars\" class=\"secondary\">Update All Bars</button>
+            </div>
           </div>
           <div class=\"table-wrap\">
             <table>
@@ -2014,6 +2076,7 @@ def index() -> Response:
                   <th class=\"date\" data-key=\"next_earnings\" onclick=\"sortBy('next_earnings')\">Next Earnings</th>
                   <th class=\"date\" data-key=\"latest_bar_time\" onclick=\"sortBy('latest_bar_time')\">Last Bar</th>
                   <th class=\"action\">Bars</th>
+                  <th class=\"action\">Tracker</th>
                 </tr>
               </thead>
               <tbody id=\"tbody\"></tbody>
@@ -2040,9 +2103,28 @@ def add_symbol() -> Response:
     return jsonify({"ok": True})
 
 
+@app.post("/api/stocks/<symbol>/hidden")
+def set_stock_hidden(symbol: str) -> Response:
+    payload = request.get_json(force=True, silent=True) or {}
+    raw_hidden = payload.get("hidden", True)
+    hidden = raw_hidden if isinstance(raw_hidden, bool) else str(raw_hidden).strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        found = _set_stock_hidden(symbol, hidden)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Database error: {e}"}), 500
+    if not found:
+        return jsonify({"ok": False, "error": f"Unknown symbol: {str(symbol).strip().upper()}"}), 404
+    return jsonify({"ok": True, "symbol": str(symbol).strip().upper(), "hidden": hidden})
+
+
 @app.get("/data")
 def data() -> Response:
     df = _read_df()
+    include_hidden = (request.args.get("include_hidden") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if not include_hidden and not df.empty:
+        df = df[~df["hidden"].astype(bool)].copy()
     symbols = [] if df.empty else sorted(df["symbol"].dropna().astype(str).str.upper().unique().tolist())
 
     prices: Dict[str, float | None] = _fetch_current_prices(symbols)
@@ -2088,6 +2170,7 @@ def data() -> Response:
                 "risk_score": risk_score,
                 "confidence_score": confidence_score,
                 "classification": classification,
+                "hidden": bool(r.get("hidden")),
                 "opportunity_score": _opportunity_score(reward_score, risk_score, confidence_score),
                 "updated_date": str(r.get("updated_date", "")),
                 "next_earnings": next_map.get(sym),
@@ -4073,6 +4156,7 @@ def get_stocks_api() -> Response:
                     "risk_score": risk_score,
                     "confidence_score": confidence_score,
                     "classification": str(r.get("classification", DEFAULT_CLASSIFICATION)),
+                    "hidden": bool(r.get("hidden")),
                     "opportunity_score": _opportunity_score(reward_score, risk_score, confidence_score),
                     "updated_date": str(r.get("updated_date", "")),
                     "next_earnings": next_earnings_map.get(symbol),
@@ -4342,6 +4426,7 @@ def export_csv() -> Response:
                 risk_score,
                 confidence_score,
                 r.get("classification", DEFAULT_CLASSIFICATION),
+                bool(r.get("hidden")),
                 _opportunity_score(reward_score, risk_score, confidence_score),
             ]
         )
