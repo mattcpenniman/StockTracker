@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 
 from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
 from analytics.utils import parse_asof
+from live_prices import PriceCache, YahooQuotes
 
 # Load environment variables from a .env file in the same directory (if present)
 try:
@@ -28,12 +29,6 @@ try:
     _DOTENV_LOADED = load_dotenv(os.path.join(os.path.dirname(__file__), ".env")) or load_dotenv()
 except Exception:
     _DOTENV_LOADED = False
-
-# Try to import yfinance gracefully, with a friendly error later if missing
-try:
-    import yfinance as yf
-except Exception:  # pragma: no cover
-    yf = None
 
 # Try to import psycopg2 gracefully, with a friendly error later if missing
 try:
@@ -583,54 +578,19 @@ def _replace_earnings_rows(rows: List[Tuple[str, str, str, float | None, float |
     return len(rows)
 
 
-# -------- Price fetching (via yfinance) ---------
+# -------- Freshness-cached live regular-market prices ---------
+
+_live_prices = PriceCache(
+    YahooQuotes(timeout=float(os.environ.get("LIVE_PRICE_PROVIDER_TIMEOUT_SECONDS", "3"))),
+    ttl=float(os.environ.get("LIVE_PRICE_CACHE_SECONDS", "15")),
+    retry_seconds=float(os.environ.get("LIVE_PRICE_RETRY_SECONDS", "3")),
+    wait_seconds=float(os.environ.get("LIVE_PRICE_WAIT_SECONDS", "5")),
+)
+
 
 def _fetch_current_prices(symbols: List[str]) -> Dict[str, float | None]:
-    """Return a mapping of symbol -> last price (float) or None if unavailable.
-    Uses yfinance Tickers batch when possible for efficiency.
-    """
-    out: Dict[str, float | None] = {s: None for s in symbols}
-
-    if not symbols:
-        return out
-
-    if yf is None:
-        return out
-
-    try:
-        # Batch fetch via Tickers
-        tickers = yf.Tickers(" ".join(symbols))
-        for sym, t in tickers.tickers.items():
-            sym_u = sym.upper()
-            price = None
-            try:
-                fi = getattr(t, "fast_info", None)
-                if fi is not None:
-                    price = fi.get("last_price") or fi.get("last_price")
-                if price is None:
-                    hist = t.history(period="1d")
-                    if not hist.empty:
-                        price = float(hist["Close"].iloc[-1])
-            except Exception:
-                price = None
-            out[sym_u] = float(price) if price is not None else None
-    except Exception:
-        for sym in symbols:
-            price = None
-            try:
-                t = yf.Ticker(sym)
-                fi = getattr(t, "fast_info", None)
-                if fi is not None:
-                    price = fi.get("last_price")
-                if price is None:
-                    hist = t.history(period="1d")
-                    if not hist.empty:
-                        price = float(hist["Close"].iloc[-1])
-            except Exception:
-                price = None
-            out[sym] = float(price) if price is not None else None
-
-    return out
+    """Last regular-market quote, cached briefly; unavailable/expired = None."""
+    return _live_prices.get_prices(symbols)
 
 
 # ----------------- Next earnings helper ----------------------
