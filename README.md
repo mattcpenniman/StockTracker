@@ -122,6 +122,56 @@ export DATABASE_URL='postgresql://stock_user:stock_pass@localhost:5432/stock_tra
 python app.py
 ```
 
+### Dashboard live-price freshness (VEC-782)
+
+`/data` uses Yahoo's multi-symbol quote endpoint (up to 100 symbols/request)
+through yfinance's authenticated transport. Missing symbols or an unsupported
+batch endpoint fall back to at most eight concurrent Yahoo chart-metadata
+requests. Both paths use `regularMarketPrice`, the latest regular-market price,
+not a bid/ask midpoint, extended-hours price, or adjusted historical close.
+The old historical-close fallback is no longer substituted into `current_price`.
+Prices can represent the previous session on weekends/holidays or delayed feeds;
+cache freshness means time since retrieval, not time since the market traded.
+
+Configuration (seconds; finite positive values, restart to apply):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `LIVE_PRICE_CACHE_SECONDS` | 15 | Successful quote freshness window |
+| `LIVE_PRICE_RETRY_SECONDS` | 3 | Negative-cache duration after missing/failed quotes |
+| `LIVE_PRICE_PROVIDER_TIMEOUT_SECONDS` | 3 | Timeout passed to each yfinance transport call |
+| `LIVE_PRICE_WAIT_SECONDS` | 5 | Maximum quote wait per dashboard read |
+
+Fresh reads make no provider calls. Expired entries refresh on demand. One
+refresh runs per process, and concurrent/overlapping reads join it. A slow
+refresh may finish after a caller's wait deadline; subsequent callers still
+join it, with no queued duplicate refresh. Healthy quotes are published as they
+arrive, independently of missing/slow symbols. Transport authentication/retries
+can exceed a single socket timeout, but do not extend the dashboard's quote wait.
+After the deadline or refresh failure, unavailable/expired prices are `null`;
+expired values are never served as current. No scheduled refresh runs when idle.
+
+The existing per-symbol `diff_dollar`/`diff_pct` null behavior and MA-distance
+historical-close fallback remain in place. No historical fallback is labeled
+`current_price`. The cache is process-local (current Docker/local runtime runs
+one Flask process); multiple processes/replicas each have their own cache and
+refresh limit. Expired entries are pruned on refresh completion.
+
+Validation and reproducible database-backed `/data` benchmark:
+
+```bash
+python -m unittest discover -s tests
+ANALYTICS_TEST_DATABASE_URL='postgresql://user:password@host/db' python -m analytics.live_price_benchmark --repeats 20
+```
+
+The benchmark uses real PostgreSQL/Flask and controlled provider latency, counts
+quote requests, checks full JSON parity, and reports market quote age separately
+from retrieval freshness. It includes cold/warm reads and a slow-provider case.
+Recorded results and live transport evidence are in Vector document **DOC-214**
+(`vector doc show DOC-214`). At 100 symbols with controlled 10 ms/provider-call
+latency, median `/data` time fell from 1,488 ms to 451 ms cold / 458 ms warm;
+modeled quote requests fell from 100/read to one cold / zero warm.
+
 ## Run With Docker (Recommended)
 ```bash
 docker compose up --build -d
