@@ -118,6 +118,7 @@ class AnalyticsService:
 
         indicator_timeframe = "1Day"
         price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
+        # Keep full daily history: EMA/RSI initialization and YTD depend on it.
         bars = self.repository.fetch_bars(context["symbol_id"], indicator_timeframe, asof_dt)
         if bars.empty:
             raise AnalyticsNotFoundError(
@@ -128,7 +129,7 @@ class AnalyticsService:
         latest = features.iloc[-1]
         anchor_bar = latest
         if price_timeframe != indicator_timeframe:
-            anchor_bars = self.repository.fetch_bars(context["symbol_id"], price_timeframe, asof_dt)
+            anchor_bars = self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt)
             if anchor_bars.empty:
                 price_timeframe = indicator_timeframe
             else:
@@ -343,7 +344,7 @@ class AnalyticsService:
         if cached is not None:
             return cached
 
-        anchor_bars = self.repository.fetch_bars(context["symbol_id"], price_timeframe, asof_dt)
+        anchor_bars = self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt)
         if anchor_bars.empty:
             raise AnalyticsNotFoundError(
                 f"No anchor bar available for symbol '{context['symbol']}' on timeframe '{price_timeframe}' at the requested as-of."
@@ -352,17 +353,12 @@ class AnalyticsService:
         anchor_bar = anchor_bars.iloc[-1]
         anchor_timestamp = anchor_bar["timestamp"]
         anchor_close = float(anchor_bar["close"])
-        future_bars_all = self.repository.fetch_bars(
+        future_bars = self.repository.fetch_future_bars(
             context["symbol_id"],
             price_timeframe,
-            start=anchor_timestamp + pd.Timedelta(microseconds=1),
+            after=anchor_timestamp,
+            limit=days,
         )
-        if future_bars_all.empty:
-            raise AnalyticsNotFoundError(
-                f"No future bars available for symbol '{context['symbol']}' on timeframe '{price_timeframe}' for the requested window."
-            )
-
-        future_bars = future_bars_all.head(days).copy()
         if future_bars.empty:
             raise AnalyticsNotFoundError(
                 f"No future bars available for symbol '{context['symbol']}' on timeframe '{price_timeframe}' for the requested window."

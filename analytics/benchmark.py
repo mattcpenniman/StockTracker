@@ -45,6 +45,7 @@ def benchmark_endpoints(bars: pd.DataFrame, repeats: int) -> None:
     repo = Mock()
     repo.fetch_symbol_context.return_value = {"symbol_id": 1, "symbol": "NVDA", "sync_status": "idle"}
     repo.fetch_bars.side_effect = lambda symbol_id, timeframe, asof: bars if timeframe == "1Day" else intraday
+    repo.fetch_latest_bar.return_value = intraday
     print(f"Cold Flask test-client requests ({len(bars)} fixture bars; database/network/sync mocked)")
     with app.test_client() as client, patch("app._sync_current_analytics_data_if_needed"), patch("app._sync_market_data_window"):
         for url in urls:

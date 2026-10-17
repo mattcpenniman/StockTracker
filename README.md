@@ -66,6 +66,56 @@ examples through Flask with a fixture repository and a fresh cache per request.
 It validates JSON parity and includes route/service/serialization overhead, while
 mocking database and market-data network calls; it is not a live-server benchmark.
 
+### Bounded analytics price reads (VEC-780)
+
+Price anchors use an inclusive latest-at-or-before query (`ORDER BY bar_time DESC
+LIMIT 1`). Future labels read only the next requested trading bars, strictly
+after the anchor, in ascending time order. State indicators retain their full
+daily history for EMA/RSI initialization and YTD parity.
+
+Run PostgreSQL parity tests and the database-backed benchmark with a database
+account allowed to create schemas. Each run creates and removes a private schema
+using the app's production DDL and indexes:
+
+```bash
+export ANALYTICS_TEST_DATABASE_URL='postgresql://user:password@localhost:5432/test_database'
+python -m unittest tests/test_analytics.py tests/test_price_reads.py
+ANALYTICS_BACKEND=python python -m analytics.io_benchmark --repeats 20
+```
+
+Local measurement on 2026-10-17: PostgreSQL 16 in Docker, Python 3.12/pandas
+backend, 10,000 daily + 200,000 intraday bars for one synthetic symbol. Requests
+use real Flask routes and PostgreSQL connections, fresh service caches, warm
+database/OS caches, and mocked market-data sync. One warmup pair is excluded;
+20 measured before/after pairs alternate order and assert identical JSON.
+The before adapter reproduces the prior full-history reads and Python-side
+window truncation. These are local measurements, not live-server results.
+
+| Endpoint / anchor | Queries before → after | Rows transferred before → after | Median ms before → after | p95 ms before → after |
+| --- | --- | --- | --- | --- |
+| State, daily midnight | 2 → 2 | 8,348 → 8,348 | 214.13 → 219.61 | 228.99 → 267.50 |
+| State, 15Min | 3 → 3 | 108,349 → 8,349 | 1,014.70 → 230.04 | 1,078.56 → 273.12 |
+| Future state, daily, 20 bars | 3 → 3 | 10,001 → 22 | 172.77 → 84.21 | 203.65 → 90.13 |
+| Future state, 15Min, 20 bars, short | 3 → 3 | 200,001 → 22 | 1,516.65 → 79.55 | 1,642.08 → 85.68 |
+
+Rows include the single symbol-context row. Daily-only state retains the same
+query workload; its timing variation is not evidence of an optimization.
+Anchors are `2022-11-07T00:00:00Z` (daily) and `2022-11-07T16:00:00Z`
+(intraday). Date-only API input still means end-of-day UTC and therefore selects
+15-minute price anchors under the existing rules.
+
+`EXPLAIN (ANALYZE, BUFFERS)` of the actual bounded repository queries showed:
+
+- Latest: `Limit → Index Scan Backward using stock_bars_pkey`, one actual row,
+  seven shared buffer hits, execution time 0.202 ms.
+- Forward: `Limit → Index Scan using stock_bars_pkey`, 20 actual rows,
+  five shared buffer hits, execution time 0.090 ms.
+
+Both index conditions constrain `symbol_id`, `timeframe`, and `bar_time`, with
+no sort or sequential scan. PostgreSQL chose the existing composite primary-key
+index over the equivalent `idx_stock_bars_symbol_tf_time` index. The benchmark
+prints complete plans, including planning times, on each run.
+
 ## Run (Local)
 ```bash
 export DATABASE_URL='postgresql://stock_user:stock_pass@localhost:5432/stock_tracker'
