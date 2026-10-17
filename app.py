@@ -4065,7 +4065,7 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
         asof_dt = parse_asof(request.args.get("asof"))
         if asof_dt is None:
             return jsonify({"ok": False, "error": "'asof' is required."}), 400
-        desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
+        desired_price_timeframe = normalized_timeframe
         if desired_price_timeframe != "1Day":
             try:
                 _sync_market_data_window(
@@ -4215,7 +4215,7 @@ def get_portfolio_analytics_future_state() -> Response:
         asof_dt = parse_asof(request.args.get("asof"))
         if asof_dt is None:
             return jsonify({"ok": False, "error": "'asof' is required."}), 400
-        desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
+        desired_price_timeframe = normalized_timeframe
         if desired_price_timeframe != "1Day":
             for symbol in symbols:
                 try:
@@ -4473,6 +4473,7 @@ curl -s "http://127.0.0.1:5000/api/events/NVDA/1Day?asof=2023-09-20&volume_multi
 }</code></pre>
 
         <h2>GET /api/futurestate/&lt;symbol&gt;</h2>
+        <p>The anchor and future window both use the requested timeframe. A date-only <code>asof</code> means end-of-day UTC; a timestamp is an exact cutoff. Daily requests use the latest stored daily bar at or before that cutoff and the next <code>N</code> daily bars, even for timed cutoffs. They do not switch to fifteen-minute labels. Request <code>timeframe=15Min</code> explicitly for fifteen-minute anchors and horizons. <code>anchor_price.source_timeframe</code>, <code>window.source_timeframe</code>, and <code>future_state.source_timeframe</code> report that series. A partial window returns available bars with <code>complete_window=false</code> and a null <code>target_end_timestamp</code>; no future bars produces a per-symbol error.</p>
         <p>Returns realized forward max price, min price, and end-of-window price from an <code>asof</code> anchor using the next <code>N</code> future bars. For <code>1Day</code>, <code>days</code> means trading days rather than calendar days. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameter: <code>timeframe</code>.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/futurestate/NVDA?timeframe=1D&asof=2023-09-20&days=20"
 curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:00Z&days=5"</code></pre>

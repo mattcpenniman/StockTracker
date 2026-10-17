@@ -590,6 +590,9 @@ The event feed returns timestamped, deterministic events such as:
 
 - `asof` is required and anchors the calculation on the latest stored bar at or before that timestamp
 - `days` is required and defines the number of future bars to evaluate; for `1Day` this means trading days, not calendar days
+- The anchor and future window both use the requested timeframe. A date-only `asof` means end-of-day UTC; a timed `asof` is an exact cutoff. Daily requests select the latest stored daily bar at or before that cutoff and the next N daily bars, never fifteen-minute bars. A midnight cutoff can select an earlier session than a date-only cutoff.
+- Request `timeframe=15Min` explicitly for fifteen-minute anchors and horizons. `anchor_price.source_timeframe`, `window.source_timeframe`, and `future_state.source_timeframe` report the requested bar series. Unlike technical-state price snapshots, daily future labels do not use intraday price anchors.
+- Partial windows return the available bars with `complete_window=false` and `target_end_timestamp=null`; no future bars produces a per-symbol error (collected in `errors` for portfolio requests).
 - `max_price` uses the maximum future `high` inside the window
 - `min_price` uses the minimum future `low` inside the window
 - `price_at_horizon` uses the close of the Nth future bar in the realized window

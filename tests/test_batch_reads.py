@@ -167,7 +167,11 @@ class BatchPostgreSQLTests(unittest.TestCase):
         with dashboard.app.test_client() as client:
             for suffix in ("", "&include_hidden=1", "&include_hidden=true&hidets=1"):
                 for path in ("state", "futurestate"):
-                    url = f"/api/portfolio/{path}?asof={self.end.date()}&days=20{suffix}"
+                    # Legacy parity applies to midnight daily labels. Date-only
+                    # future requests intentionally no longer use 15Min windows;
+                    # independent horizon assertions cover those responses.
+                    asof = f"{self.end.date()}T00:00:00Z" if path == "futurestate" else self.end.date()
+                    url = f"/api/portfolio/{path}?asof={asof}&days=20{suffix}"
                     payloads = []
                     for label in ("before", "after"):
                         with route_variant(self.dsn, label, type(self).before, self.namespace):
