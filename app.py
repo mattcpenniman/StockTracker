@@ -3858,12 +3858,16 @@ def get_chart_data(symbol: str) -> Response:
         return jsonify({"ok": False, "error": f"Unsupported timeframe '{timeframe}'."}), 400
 
     limit_raw = (request.args.get("limit") or "180").strip()
-    before_dt = parse_asof(request.args.get("before"))
     auto_sync = (request.args.get("auto_sync") or "").strip().lower() in {"1", "true", "yes"}
     try:
         limit = int(limit_raw)
     except ValueError:
         return jsonify({"ok": False, "error": "'limit' must be an integer."}), 400
+
+    try:
+        before_dt = parse_asof(request.args.get("before"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid 'before'; expected YYYY-MM-DD or ISO 8601 timestamp."}), 400
 
     try:
         payload = _get_market_snapshot(symbol, timeframe, limit, before=before_dt)

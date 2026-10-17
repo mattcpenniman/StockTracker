@@ -1091,6 +1091,46 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["errors"][0]["symbol"], "MSFT")
 
 
+class ChartEndpointTests(unittest.TestCase):
+    @patch("app._sync_market_data")
+    @patch("app._get_market_snapshot")
+    def test_invalid_before_returns_json_400_before_market_access(self, mock_snapshot, mock_sync) -> None:
+        for before in ("bad", "2026-02-30", "2026-13-01", "2026-10-17T25:00:00Z", "2026-10-17T12:bad:00Z"):
+            with self.subTest(before=before), flask_app.test_client() as client:
+                response = client.get("/api/chart/NVDA", query_string={"before": before, "auto_sync": "true"})
+
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.mimetype, "application/json")
+                self.assertEqual(response.get_json(), {
+                    "ok": False,
+                    "error": "Invalid 'before'; expected YYYY-MM-DD or ISO 8601 timestamp.",
+                })
+
+        mock_snapshot.assert_not_called()
+        mock_sync.assert_not_called()
+
+    @patch("app._get_market_snapshot")
+    def test_valid_and_omitted_before_reach_snapshot(self, mock_snapshot) -> None:
+        cases = (
+            ("2026-10-17", datetime(2026, 10, 17, 23, 59, 59, 999999, tzinfo=timezone.utc)),
+            ("2026-10-17T12:30:00Z", datetime(2026, 10, 17, 12, 30, tzinfo=timezone.utc)),
+            ("2026-10-17T14:30:00+02:00", datetime(2026, 10, 17, 12, 30, tzinfo=timezone.utc)),
+            (None, None),
+        )
+        for before, expected in cases:
+            with self.subTest(before=before), flask_app.test_client() as client:
+                mock_snapshot.reset_mock()
+                mock_snapshot.return_value = {"symbol": "NVDA", "bars": []}
+                query = {"timeframe": "1Day", "limit": "42"}
+                if before is not None:
+                    query["before"] = before
+                response = client.get("/api/chart/NVDA", query_string=query)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.get_json()["ok"])
+                mock_snapshot.assert_called_once_with("NVDA", "1Day", 42, before=expected)
+
+
 class StateEndpointHelperTests(unittest.TestCase):
 
     def test_market_snapshot_needs_sync_when_latest_bar_is_stale_despite_fresh_sync(self) -> None:
