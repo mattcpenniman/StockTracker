@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 
 from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
 from analytics.utils import isoformat_utc, parse_asof
+from analytics.runtime import runtime_diagnostics
 from live_prices import PriceCache, YahooQuotes
 from database import get_connection
 from market_sync import SyncFlights
@@ -91,6 +92,7 @@ TIMEFRAME_DELTAS = {
     "1Day": timedelta(days=1),
 }
 analytics_service = AnalyticsService()
+app.logger.warning("Analytics runtime: %s", json.dumps(runtime_diagnostics(), sort_keys=True))
 _market_sync_flights = SyncFlights()
 
 
@@ -4343,7 +4345,7 @@ def analytics_health() -> Response:
         status = 200 if payload["ok"] else 503
         return jsonify(payload), status
     except Exception as exc:
-        return jsonify({"ok": False, "service": "analytics", "error": str(exc)}), 500
+        return jsonify({"ok": False, "service": "analytics", "error": str(exc), "runtime": runtime_diagnostics()}), 500
 
 
 @app.get("/api/stocks")
@@ -4638,7 +4640,13 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
 <pre><code>curl -s "http://127.0.0.1:5000/api/metadata/NVDA"</code></pre>
 
         <h2>GET /api/health/analytics</h2>
-        <p>Returns analytics service health and database connectivity status.</p>
+        <p>Returns database connectivity and runtime diagnostics: artifact revision/release ID,
+        configured/effective backend, extension availability/version, and process-local native/Python
+        execution counts with fallback reasons. Cache hits and synthetic release checks are excluded.
+        Returns 503 if Rust is explicitly configured but unavailable. State (including batch/portfolio)
+        and events use the indicator kernel; futurestate price-window labels do not.
+        Run <code>python -m analytics.release_check --require-rust --expected-revision REV --expected-release ID</code>
+        inside the final runtime to prove native execution with synthetic data and verify artifact identity.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/health/analytics"</code></pre>
 
         <h2>Analytics Query Parameters</h2>
@@ -4770,15 +4778,16 @@ def export_csv() -> Response:
 
 @app.get("/health")
 def health() -> Response:
+    runtime = runtime_diagnostics()
     try:
         _init_db_if_needed()
         with _get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
-        return jsonify({"ok": True, "database": "postgres", "table": DB_TABLE})
+        return jsonify({"ok": runtime["ready"], "database": "postgres", "table": DB_TABLE, "runtime": runtime}), 200 if runtime["ready"] else 503
     except Exception as e:
-        return jsonify({"ok": False, "database": "postgres", "error": str(e)}), 500
+        return jsonify({"ok": False, "database": "postgres", "error": str(e), "runtime": runtime}), 500
 
 
 @app.post("/update-earnings")

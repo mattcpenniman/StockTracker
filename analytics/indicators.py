@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import math
 import os
+from collections import Counter
+from contextvars import ContextVar
+from importlib.metadata import PackageNotFoundError, version
+from threading import Lock
 
 import numpy as np
 import pandas as pd
@@ -11,8 +15,56 @@ from .utils import safe_ratio
 
 try:
     from apollo_indicators import feature_columns as _rust_feature_columns
-except ImportError:
+except (ImportError, OSError):
     _rust_feature_columns = None
+
+
+_dispatch_lock = Lock()
+_dispatch_counts = Counter()
+# Synthetic verification is isolated from real traffic and concurrent requests.
+_dispatch_trace: ContextVar[Counter | None] = ContextVar("analytics_dispatch_trace", default=None)
+
+
+def _record_dispatch(reason: str) -> None:
+    trace = _dispatch_trace.get()
+    if trace is not None:
+        trace[reason] += 1
+        return
+    with _dispatch_lock:
+        _dispatch_counts[reason] += 1
+
+
+def backend_diagnostics() -> dict:
+    configured = os.environ.get("ANALYTICS_BACKEND", "auto").lower()
+    available = _rust_feature_columns is not None
+    valid = configured in {"auto", "python", "rust"}
+    ready = valid and (configured != "rust" or available)
+    try:
+        extension_version = version("apollo-indicators") if available else None
+    except PackageNotFoundError:
+        extension_version = "unknown"
+    with _dispatch_lock:
+        counts = dict(_dispatch_counts)
+    native = counts.get("native", 0)
+    fallbacks = {reason: counts.get(reason, 0) for reason in (
+        "forced_python", "extension_unavailable", "empty_input", "ineligible_data",
+    )}
+    return {
+        "configured_backend": configured if valid else "invalid",
+        "extension_available": available,
+        "extension_version": extension_version,
+        "effective_backend": ("rust" if available and configured != "python" else "python") if ready else "unavailable",
+        "ready": ready,
+        "reason": None if ready else ("extension_unavailable" if valid else "invalid_backend"),
+        "execution": {
+            "scope": "process_since_start; excludes synthetic verification and cache hits",
+            "pid": os.getpid(),
+            "native_calls": native,
+            "python_fallback_calls": sum(fallbacks.values()),
+            "fallback_reasons": fallbacks,
+            "observed_backend": "mixed" if native and sum(fallbacks.values()) else "rust" if native else "python" if sum(fallbacks.values()) else "not_yet_invoked",
+        },
+    }
 
 
 TRADING_PERIODS_PER_YEAR = {
@@ -157,13 +209,17 @@ def compute_feature_frame(
     if backend == "rust" and _rust_feature_columns is None:
         raise RuntimeError("Rust analytics is not installed; run: pip install ./rust")
     if backend == "python" or _rust_feature_columns is None or bars.empty:
-        return _compute_feature_frame_python(bars, timeframe, settings)
+        result = _compute_feature_frame_python(bars, timeframe, settings)
+        _record_dispatch("forced_python" if backend == "python" else "extension_unavailable" if _rust_feature_columns is None else "empty_input")
+        return result
 
     df = bars.sort_values("timestamp").reset_index(drop=True).copy()
     arrays = [np.ascontiguousarray(df[name], dtype=np.float64) for name in ("close", "high", "low", "volume")]
     # Preserve pandas' missing-data/pct_change behavior for unusual input histories.
     if df["timestamp"].isna().any() or any(not np.isfinite(values).all() for values in arrays) or (arrays[0] <= 0).any():
-        return _compute_feature_frame_python(bars, timeframe, settings)
+        result = _compute_feature_frame_python(bars, timeframe, settings)
+        _record_dispatch("ineligible_data")
+        return result
     columns = _rust_feature_columns(
         *arrays,
         np.ascontiguousarray(df["timestamp"].dt.year, dtype=np.int32),
@@ -172,6 +228,7 @@ def compute_feature_frame(
         settings.sma_slope_lookback,
         settings.buffer_pct,
     )
+    _record_dispatch("native")
     columns["volume_anomaly"] = columns["volume_ratio_20"] >= settings.volume_multiple
     # A single construction avoids dozens of pandas rolling calls and insertions.
     return pd.concat([df, pd.DataFrame(columns, index=df.index)], axis=1)

@@ -1,6 +1,10 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-unknown}
+        RELEASE_ID: ${RELEASE_ID:-unknown}
     container_name: stock-tracker-app
     restart: unless-stopped
     env_file:
