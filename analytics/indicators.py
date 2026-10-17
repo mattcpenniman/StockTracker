@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import math
+import os
 
+import numpy as np
 import pandas as pd
 
 from .config import AnalyticsSettings
 from .utils import safe_ratio
+
+try:
+    from apollo_indicators import feature_columns as _rust_feature_columns
+except ImportError:
+    _rust_feature_columns = None
 
 
 TRADING_PERIODS_PER_YEAR = {
@@ -49,7 +56,7 @@ def _zscore(series: pd.Series, window: int) -> pd.Series:
     return (series - rolling_mean) / rolling_std.replace(0.0, pd.NA)
 
 
-def compute_feature_frame(
+def _compute_feature_frame_python(
     bars: pd.DataFrame,
     timeframe: str,
     settings: AnalyticsSettings,
@@ -136,6 +143,38 @@ def compute_feature_frame(
     df["volume_anomaly"] = df["volume_ratio_20"] >= settings.volume_multiple
 
     return df
+
+
+def compute_feature_frame(
+    bars: pd.DataFrame,
+    timeframe: str,
+    settings: AnalyticsSettings,
+) -> pd.DataFrame:
+    """Use the fused native kernel when installed, retaining the pandas reference."""
+    backend = os.environ.get("ANALYTICS_BACKEND", "auto").lower()
+    if backend not in {"auto", "python", "rust"}:
+        raise ValueError("ANALYTICS_BACKEND must be auto, python, or rust.")
+    if backend == "rust" and _rust_feature_columns is None:
+        raise RuntimeError("Rust analytics is not installed; run: pip install ./rust")
+    if backend == "python" or _rust_feature_columns is None or bars.empty:
+        return _compute_feature_frame_python(bars, timeframe, settings)
+
+    df = bars.sort_values("timestamp").reset_index(drop=True).copy()
+    arrays = [np.ascontiguousarray(df[name], dtype=np.float64) for name in ("close", "high", "low", "volume")]
+    # Preserve pandas' missing-data/pct_change behavior for unusual input histories.
+    if df["timestamp"].isna().any() or any(not np.isfinite(values).all() for values in arrays) or (arrays[0] <= 0).any():
+        return _compute_feature_frame_python(bars, timeframe, settings)
+    columns = _rust_feature_columns(
+        *arrays,
+        np.ascontiguousarray(df["timestamp"].dt.year, dtype=np.int32),
+        math.sqrt(TRADING_PERIODS_PER_YEAR.get(timeframe, 252.0)),
+        settings.breakout_lookback,
+        settings.sma_slope_lookback,
+        settings.buffer_pct,
+    )
+    columns["volume_anomaly"] = columns["volume_ratio_20"] >= settings.volume_multiple
+    # A single construction avoids dozens of pandas rolling calls and insertions.
+    return pd.concat([df, pd.DataFrame(columns, index=df.index)], axis=1)
 
 
 def latest_price_payload(row: pd.Series) -> dict:

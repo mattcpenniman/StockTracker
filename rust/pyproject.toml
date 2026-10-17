@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "apollo-indicators"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23"]
+
+[tool.maturin]
+module-name = "apollo_indicators"
