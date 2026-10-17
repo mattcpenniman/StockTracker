@@ -1541,6 +1541,46 @@ def _sync_current_analytics_data_if_needed(symbol: str, requested_timeframe: str
             _sync_market_data(symbol, timeframe, force_full=False, snapshot_limit=1)
 
 
+def _prepare_current_analytics_batch(symbols: List[str], requested_timeframe: str) -> Dict:
+    """Bulk freshness checks, preserving the single-symbol freshness policy.
+
+    Benchmarks share metadata but retain their existing no-auto-sync behavior.
+    Sync results carry the new invalidation timestamps; do not reuse pre-sync
+    cache keys or re-read metadata for symbols that already existed.
+    """
+    repository = analytics_service.repository
+    contexts = repository.fetch_symbol_contexts([*symbols, "SPY", "QQQ"])
+    symbols = list(dict.fromkeys(symbols))
+    ids = [contexts[s]["symbol_id"] for s in symbols if s in contexts]
+    timeframes = ["1Day"] if requested_timeframe == "1Day" else ["1Day", requested_timeframe]
+    latest_by_timeframe = {
+        tf: repository.fetch_bars_many(ids, tf, latest=True) for tf in timeframes
+    }
+    created = []
+    for symbol in symbols:
+        context = contexts.get(symbol)
+        if context is None:
+            # Match _get_market_snapshot's creation behavior even when automatic
+            # freshness sync is disabled. Load the new context after any syncs.
+            context = {"symbol": symbol, "symbol_id": _ensure_symbol_metadata(symbol)}
+            contexts[symbol] = context
+            created.append(symbol)
+        for timeframe in timeframes:
+            frame = latest_by_timeframe[timeframe].get(context["symbol_id"])
+            snapshot = {
+                "bars": [{"t": frame.iloc[-1]["timestamp"].isoformat()}] if frame is not None and not frame.empty else [],
+                "sync_state": context or {},
+            }
+            if _market_snapshot_needs_sync(snapshot, CHART_LATEST_AUTO_SYNC_MAX_AGE_DAYS):
+                result = _sync_market_data(symbol, timeframe, force_full=False, snapshot_limit=1)
+                for key, value in result["sync_state"].items():
+                    context[key] = _parse_market_timestamp(value) if key.endswith("_at") or key.endswith("_time") else value
+    # Only newly created symbols need their new IDs, once sync has inserted them.
+    if created:
+        contexts.update(repository.fetch_symbol_contexts(created))
+    return contexts
+
+
 # ----------------- Routes ----------------------
 
 @app.get("/")
@@ -3992,9 +4032,10 @@ def get_analytics_batch_state() -> Response:
         asof_dt = parse_asof(str(payload.get("asof") or request.args.get("asof") or "").strip() or None)
         normalized_symbols = [str(item).strip().upper() for item in symbols]
         if asof_dt is None:
-            for symbol in normalized_symbols:
-                _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
-        batch = analytics_service.get_batch_state(normalized_symbols, normalized_timeframe, asof_dt, settings)
+            contexts = _prepare_current_analytics_batch(normalized_symbols, normalized_timeframe)
+            batch = analytics_service.get_batch_state(normalized_symbols, normalized_timeframe, asof_dt, settings, contexts=contexts)
+        else:
+            batch = analytics_service.get_batch_state(normalized_symbols, normalized_timeframe, asof_dt, settings)
         batch["ok"] = True
         if hide_ts:
             batch = _strip_symbol_and_timestamps(batch)
@@ -4015,9 +4056,10 @@ def get_portfolio_analytics_state() -> Response:
         settings = _analytics_settings_from_request()
         asof_dt = parse_asof(request.args.get("asof"))
         if asof_dt is None:
-            for symbol in symbols:
-                _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
-        batch = analytics_service.get_batch_state(symbols, normalized_timeframe, asof_dt, settings)
+            contexts = _prepare_current_analytics_batch(symbols, normalized_timeframe)
+            batch = analytics_service.get_batch_state(symbols, normalized_timeframe, asof_dt, settings, contexts=contexts)
+        else:
+            batch = analytics_service.get_batch_state(symbols, normalized_timeframe, asof_dt, settings)
         batch["ok"] = True
         batch["portfolio_symbol_count"] = len(symbols)
         batch["count"] = len(batch.get("states", []))

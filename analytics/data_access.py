@@ -35,6 +35,12 @@ class AnalyticsRepository:
 
     def fetch_symbol_context(self, symbol: str) -> dict[str, Any] | None:
         normalized_symbol = str(symbol).strip().upper()
+        return self.fetch_symbol_contexts([normalized_symbol]).get(normalized_symbol)
+
+    def fetch_symbol_contexts(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        symbols = list(dict.fromkeys(str(s).strip().upper() for s in symbols))
+        if not symbols:
+            return {}
         with self.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -57,15 +63,15 @@ class AnalyticsRepository:
                            ss.sync_error
                     FROM symbol_metadata sm
                     LEFT JOIN symbol_sync_state ss ON ss.symbol_id = sm.id
-                    WHERE sm.symbol = %s
+                    WHERE sm.symbol = ANY(%s)
                     """,
-                    (normalized_symbol,),
+                    (symbols,),
                 )
-                row = cur.fetchone()
+                rows = cur.fetchall()
+        return {row[1]: self._context_row(row) for row in rows}
 
-        if not row:
-            return None
-
+    @staticmethod
+    def _context_row(row) -> dict[str, Any]:
         return {
             "symbol_id": int(row[0]),
             "symbol": row[1],
@@ -145,6 +151,10 @@ class AnalyticsRepository:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
 
+        return self._bar_frame(rows)
+
+    @staticmethod
+    def _bar_frame(rows) -> pd.DataFrame:
         if not rows:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
@@ -163,3 +173,91 @@ class AnalyticsRepository:
                 "volume": pd.to_numeric(df["volume"], errors="coerce"),
             }
         )
+
+    def fetch_bars_many(self, symbol_ids, timeframe, asof=None, *, latest=False, after=None, limit=None):
+        """Compatible reads; LATERAL limits apply per symbol, never to the batch.
+
+        Full daily history is intentionally retained for indicator initialization.
+        Callers chunk those reads; anchors and future windows remain SQL-bounded.
+        """
+        ids = list(dict.fromkeys(symbol_ids))
+        if not ids:
+            return {}
+        sql = """
+            SELECT requested.symbol_id, bars.*
+            FROM unnest(%s::bigint[]) WITH ORDINALITY AS requested(symbol_id, position)
+        """
+        params: list[Any] = [ids]
+        if after is not None:
+            if limit is None or limit <= 0:
+                raise ValueError("'limit' must be greater than zero.")
+            sql += " JOIN unnest(%s::timestamptz[]) WITH ORDINALITY AS anchors(bar_time, position) USING (position)"
+            params.append([after[sid].astimezone(timezone.utc) for sid in ids])
+        sql += " CROSS JOIN LATERAL (SELECT bar_time, open, high, low, close, volume FROM stock_bars WHERE symbol_id = requested.symbol_id AND timeframe = %s"
+        params.append(timeframe)
+        if asof is not None:
+            sql += " AND bar_time <= %s"
+            params.append(asof.astimezone(timezone.utc))
+        if after is not None:
+            sql += " AND bar_time > anchors.bar_time"
+        sql += " ORDER BY bar_time DESC" if latest else " ORDER BY bar_time ASC"
+        if latest or limit is not None:
+            sql += " LIMIT %s"
+            params.append(1 if latest else limit)
+        sql += ") bars ORDER BY requested.position, bars.bar_time"
+        with self.get_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        grouped = {sid: [] for sid in ids}
+        for row in rows:
+            grouped[row[0]].append(row[1:])
+        return {sid: self._bar_frame(values) for sid, values in grouped.items()}
+
+
+class BatchReads:
+    """Request-local repository view. Never installed on the shared service.
+
+    Read lazily so a fully warm request only loads contexts. History is fetched
+    in groups of ten, while small, bounded anchor/window reads use groups of 100.
+    Missing metadata and empty frames are memoized too.
+    """
+
+    def __init__(self, repository, contexts):
+        self.repository = repository
+        self.contexts = contexts
+        self.ids = list(dict.fromkeys(c["symbol_id"] for c in contexts.values()))
+        self.frames = {}
+        self.anchor_asofs = {}
+
+    def fetch_symbol_context(self, symbol):
+        return self.contexts.get(str(symbol).strip().upper())
+
+    def _read(self, symbol_id, timeframe, asof, *, latest=False, after=None, limit=None):
+        key = (timeframe, asof, latest, limit)
+        frames = self.frames.setdefault(key, {})
+        if symbol_id not in frames:
+            size = 100 if latest or after is not None else 10
+            pending = [sid for sid in self.ids if sid not in frames and sid != symbol_id]
+            # Start with the requested symbol even when some earlier symbols hit cache.
+            # It may also have been evicted from the shared LRU since planning.
+            ids = [symbol_id] + pending[:size - 1]
+            anchors = None
+            if after is not None:
+                latest_frames = self.frames[(timeframe, asof, True, None)]
+                anchors = {sid: frame.iloc[-1]["timestamp"] for sid, frame in latest_frames.items() if not frame.empty}
+                ids = [sid for sid in ids if sid in anchors]
+            frames.update(self.repository.fetch_bars_many(ids, timeframe, asof if after is None else None,
+                                                        latest=latest, after=anchors, limit=limit))
+        return frames[symbol_id]
+
+    def fetch_bars(self, symbol_id, timeframe, asof=None):
+        return self._read(symbol_id, timeframe, asof)
+
+    def fetch_latest_bar(self, symbol_id, timeframe, asof=None):
+        self.anchor_asofs[symbol_id, timeframe] = asof
+        return self._read(symbol_id, timeframe, asof, latest=True)
+
+    def fetch_future_bars(self, symbol_id, timeframe, after, limit):
+        # The latest-bar read uses the request's original as-of, not the anchor.
+        asof = self.anchor_asofs[symbol_id, timeframe]
+        return self._read(symbol_id, timeframe, asof, after=after, limit=limit)

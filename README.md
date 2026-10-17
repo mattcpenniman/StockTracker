@@ -116,6 +116,51 @@ no sort or sequential scan. PostgreSQL chose the existing composite primary-key
 index over the equivalent `idx_stock_bars_symbol_tf_time` index. The benchmark
 prints complete plans, including planning times, on each run.
 
+### Bulk batch and portfolio analytics (VEC-784)
+
+Batch requests load symbol metadata and sync timestamps once, including SPY/QQQ
+for state enrichment. A request-local repository view shares those contexts and
+lazy bar reads without changing the shared service's repository. Cache hits skip
+bar reads; cache misses group full daily histories by ten symbols and bounded
+price anchors/future windows by up to 100 symbols. Daily indicator history is
+not truncated. SQL limits and strict/inclusive time boundaries apply separately
+to each symbol, including symbols with different anchor timestamps.
+
+Current batch/portfolio state routes check freshness with bulk latest-bar reads
+and the same freshness policy as single-symbol routes. Successful sync results
+supply updated cache-invalidation timestamps before analytics are read. Newly
+created symbols load their new metadata after sync. Benchmark auto-sync behavior,
+requested ordering, duplicate entries, per-symbol errors, hidden-row filtering,
+portfolio ranks, and benchmark-relative returns retain their existing semantics.
+All database work remains sequential through `AnalyticsRepository.get_conn`;
+connection pooling is tracked separately in VEC-785.
+
+Reproduce PostgreSQL payload parity and 10/50/100-symbol cold/warm measurements:
+
+```bash
+export ANALYTICS_TEST_DATABASE_URL='postgresql://user:password@localhost:5432/test_database'
+python -m unittest tests.test_batch_reads
+python -m analytics.batch_benchmark --repeats 10 --bars 5000
+```
+
+The benchmark loads pre-change service/routes from git ref `7e9e230`, creates a
+private schema using production DDL/indexes, and asserts exact full JSON parity
+for every measured pair. It uses real Flask requests and PostgreSQL connections,
+warm database/OS caches, and alternating before/after order with one excluded
+warmup pair. Cold/warm refer to service caches; schema-init work and provider
+network calls are excluded. Median/p95 timings, SQL counts, and transferred rows
+are printed for historical batch state, current portfolio state, and daily and
+intraday portfolio future labels. Missing intraday anchors remain independent
+per-symbol failures and are retried on warm requests.
+
+Measured 100-symbol medians on PostgreSQL 16.13 with the native indicator backend:
+historical batch state **10,867 → 6,806 ms cold / 2,469 → 70 ms warm**;
+current portfolio state **16,856 → 7,234 ms cold / 8,384 → 356 ms warm**;
+daily portfolio future labels **7,587 → 677 ms cold / 2,435 → 61 ms warm**.
+Full 10/50/100-symbol median/p95 timings, query/row counts, parity coverage and
+measurement conditions are in Vector: `vector doc show DOC-215`
+("VEC-784 bulk analytics query and latency evidence").
+
 ## Run (Local)
 ```bash
 export DATABASE_URL='postgresql://stock_user:stock_pass@localhost:5432/stock_tracker'
