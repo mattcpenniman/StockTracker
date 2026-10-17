@@ -480,6 +480,57 @@ The event feed returns timestamped, deterministic events such as:
 - Batch requests currently iterate symbols in-process; this is fine for a manageable watchlist-sized universe
 - Cached analytics responses are in-memory per process and keyed by symbol, timeframe, `asof`, and last bar sync time
 
+## Dashboard daily snapshot benchmark (VEC-781)
+
+`GET /data` shares one chronological daily-close snapshot across trend, RSI,
+MACD, latest-bar timestamp, and MA distances. A per-symbol indexed `LATERAL`
+query reads at most 250 bars. RSI/MACD retain the dashboard's existing 250-bar
+seed window; MA/trend formulas and missing-history defaults are preserved.
+
+Reproduce against a PostgreSQL database where the user can create schemas:
+
+```bash
+export ANALYTICS_TEST_DATABASE_URL='postgresql://user:password@host/database'
+python -m unittest discover -s tests
+python -m analytics.dashboard_benchmark --repeats 30 --bars 5000
+```
+
+The benchmark creates and removes a unique private schema with production DDL
+and indexes. It loads the actual pre-change route/helpers from git commit
+`1b62127` (`--baseline-ref` overrides this); retain that commit in the checkout's
+history for the benchmark and PostgreSQL dashboard parity test. Each measured
+request checks exact full-response parity. Price fetching is stubbed with a mix
+of supplied and missing prices, so no live-price network calls enter these timings.
+All other route work, including repeated schema-initialization SQL, is measured.
+One warmup pair precedes 30 measured pairs, with before/after order alternating;
+PostgreSQL and OS caches are warm. These are synthetic long-history portfolios,
+not production traffic measurements.
+
+Measured 2026-10-17, 5,000 daily bars per symbol, milliseconds:
+
+| Symbols | Before median / p95 | After median / p95 | Daily bar scan rows before → after | Total rows transferred before → after |
+| --- | ---: | ---: | ---: | ---: |
+| 10 | 819.30 / 1063.18 | 198.14 / 477.61 | 250,000 → 2,500 | 7,720 → 2,510 |
+| 50 | 2621.34 / 2855.65 | 301.14 / 339.69 | 1,250,000 → 12,500 | 38,600 → 12,550 |
+| 100 | 4956.04 / 5146.97 | 441.44 / 639.38 | 2,500,000 → 25,000 | 77,200 → 25,100 |
+
+At every size: bar SELECTs **5 → 1**, all SELECTs **7 → 3**, total SQL
+statements including initialization **112 → 48**. Transferred rows include
+forecast/earnings rows. Scan counts sum `Actual Rows + Rows Removed by Filter`
+times `Actual Loops` at `stock_bars` relation scan nodes in `EXPLAIN ANALYZE`;
+they count logical rows visited, not physical disk reads or intermediate nodes.
+The baseline plans scan whole daily histories under window/aggregate nodes.
+The new plan uses `Nested Loop → Limit → Index Scan Backward (stock_bars_pkey)`,
+250 rows per symbol, followed by chronological sorting of the bounded result.
+No additional index is required.
+
+Full `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` plans for all five old bar
+queries and the new query at each portfolio size are retained in Vector:
+`vector doc show DOC-213` ("VEC-781 dashboard snapshot benchmark and EXPLAIN evidence").
+PostgreSQL parity tests also cover 0/1/14/15/19/20/21/25/26/33/34/35/49/50/
+199/200/201/220/249/250/251/5000-bar histories, hidden rows, absent metadata,
+empty portfolios, latest-close fallback, and unrelated newer intraday bars.
+
 ## Field Rules
 - `symbol`: required
 - `forecast_price`: required numeric
