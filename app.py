@@ -21,6 +21,7 @@ from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSetting
 from analytics.utils import parse_asof
 from live_prices import PriceCache, YahooQuotes
 from database import get_connection
+from market_sync import SyncFlights
 
 # Load environment variables from a .env file in the same directory (if present)
 try:
@@ -90,6 +91,7 @@ TIMEFRAME_DELTAS = {
     "1Day": timedelta(days=1),
 }
 analytics_service = AnalyticsService()
+_market_sync_flights = SyncFlights()
 
 
 def _opportunity_score(reward_score: float, risk_score: float, confidence_score: float) -> float:
@@ -280,6 +282,18 @@ def _init_db_if_needed() -> None:
                         source TEXT NOT NULL DEFAULT 'alpaca',
                         ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                         PRIMARY KEY (symbol_id, timeframe, bar_time)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS market_data_coverage (
+                        symbol_id BIGINT NOT NULL REFERENCES symbol_metadata(id) ON DELETE CASCADE,
+                        timeframe TEXT NOT NULL,
+                        window_start TIMESTAMPTZ NOT NULL,
+                        window_end TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (symbol_id, timeframe, window_start, window_end),
+                        CHECK (window_start <= window_end)
                     )
                     """
                 )
@@ -1213,6 +1227,13 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int, before: dateti
 
 
 def _sync_market_data(symbol: str, timeframe: str, force_full: bool = False, snapshot_limit: int = 5000) -> Dict:
+    return _market_sync_flights.run(
+        ("sync", symbol.strip().upper(), timeframe, force_full, snapshot_limit),
+        lambda: _sync_market_data_once(symbol, timeframe, force_full, snapshot_limit),
+    )
+
+
+def _sync_market_data_once(symbol: str, timeframe: str, force_full: bool = False, snapshot_limit: int = 5000) -> Dict:
     symbol = str(symbol).strip().upper()
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe '{timeframe}'.")
@@ -1315,6 +1336,19 @@ def _sync_market_data_window(
     end: datetime,
     snapshot_limit: int = 1,
 ) -> Dict:
+    return _market_sync_flights.run(
+        ("window", symbol.strip().upper(), timeframe, start, end, snapshot_limit),
+        lambda: _sync_market_data_window_once(symbol, timeframe, start, end, snapshot_limit),
+    )
+
+
+def _sync_market_data_window_once(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+    snapshot_limit: int = 1,
+) -> Dict:
     symbol = str(symbol).strip().upper()
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe '{timeframe}'.")
@@ -1349,6 +1383,21 @@ def _sync_market_data_window(
                 effective_latest_bar_time = None
                 if historical_bars:
                     effective_latest_bar_time = _parse_market_timestamp(historical_bars[-1].get("t"))
+                # Record only a completed, delay-bounded provider response. Empty
+                # responses are useful coverage too (weekends and market closures).
+                step = TIMEFRAME_DELTAS[timeframe].total_seconds()
+                finalized_end = datetime.fromtimestamp(
+                    (int(delayed_now.timestamp() // step) - 1) * step, timezone.utc,
+                )
+                covered_end = min(bounded_end, finalized_end)
+                if bounded_start <= covered_end:
+                    cur.execute(
+                        """
+                        INSERT INTO market_data_coverage (symbol_id, timeframe, window_start, window_end)
+                        VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING
+                        """,
+                        (symbol_id, timeframe, bounded_start, covered_end),
+                    )
                 cur.execute(
                     """
                     UPDATE symbol_sync_state
@@ -1526,10 +1575,107 @@ def _strip_symbol_and_timestamps(value):
 
 
 def _backfill_analytics_symbol_if_needed(symbol: str) -> None:
-    _sync_market_data(symbol, "1Day", force_full=True, snapshot_limit=1)
+    _market_sync_flights.run(
+        ("backfill", symbol.strip().upper()),
+        lambda: _sync_market_data(symbol, "1Day", force_full=True, snapshot_limit=1),
+    )
+
+
+def _historical_price_coverage(symbol: str, timeframe: str, start: datetime, end: datetime):
+    """Indexed bar bounds plus explicitly verified (possibly empty) windows."""
+    symbol_id = _ensure_symbol_metadata(symbol.strip().upper())
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    (SELECT max(bar_time) FROM stock_bars
+                     WHERE symbol_id = %s AND timeframe = %s AND bar_time <= %s),
+                    (SELECT max(bar_time) FROM stock_bars
+                     WHERE symbol_id = %s AND timeframe = %s)
+                """,
+                (symbol_id, timeframe, end, symbol_id, timeframe),
+            )
+            anchor, latest = cur.fetchone()
+            cur.execute(
+                """
+                SELECT window_start, window_end FROM market_data_coverage
+                WHERE symbol_id = %s AND timeframe = %s
+                  AND window_end >= %s AND window_start <= %s
+                ORDER BY window_start
+                """,
+                (symbol_id, timeframe, start, end),
+            )
+            return anchor, latest, cur.fetchall()
+
+
+def _prepare_historical_price_anchor(symbol: str, timeframe: str, asof_dt: datetime) -> None:
+    def prepare():
+        delayed_now = _utcnow() - timedelta(minutes=max(CHART_DELAY_MINUTES, 0))
+        end = min(asof_dt, delayed_now)
+        start = asof_dt - timedelta(days=7)
+        if start > end:
+            raise ValueError("Target sync window is in the future after delay adjustment.")
+        anchor, latest, windows = _historical_price_coverage(symbol, timeframe, start, end)
+        step = TIMEFRAME_DELTAS[timeframe]
+        suitable = anchor is not None and anchor >= start
+        payload = {"data_quality": {"price_source_timeframe": timeframe, "price_bar_timestamp": anchor}}
+        if (suitable and latest >= end and latest > anchor
+                and end - anchor < step and end + step <= delayed_now
+                and _state_payload_has_desired_price_anchor(payload, timeframe, end)):
+            return
+        # A stored anchor supplies the left edge; never refetch its older history.
+        cursor = max(start, anchor + step) if suitable else start
+        # Refresh the last bar itself if asof falls inside its interval.
+        if suitable and cursor > end:
+            cursor = anchor
+        tail_covered = False
+        for covered_start, covered_end in windows:
+            if covered_end < cursor:
+                continue
+            if covered_start > cursor:
+                _sync_market_data_window(symbol, timeframe, cursor, min(covered_start, end))
+            cursor = max(cursor, covered_end)
+            if cursor >= end:
+                tail_covered = True
+                break
+        if not tail_covered:
+            _sync_market_data_window(symbol, timeframe, cursor, end)
+
+    _market_sync_flights.run(("historical-anchor", symbol.strip().upper(), timeframe, asof_dt), prepare)
+
+
+def _read_analytics_state(symbol, timeframe, asof_dt, settings):
+    desired = _analytics_price_timeframe_for_request(timeframe, asof_dt)
+    if desired != "1Day" and asof_dt is not None:
+        _prepare_historical_price_anchor(symbol, desired, asof_dt)
+    payload = analytics_service.get_symbol_state(symbol, timeframe, asof_dt, settings)
+    if desired != "1Day":
+        if asof_dt is not None:
+            # A completed historical fetch may legitimately end on a closure,
+            # but a daily fallback is not the requested intraday price anchor.
+            quality = payload.get("data_quality") or {}
+            timestamp = quality.get("price_bar_timestamp")
+            if (quality.get("price_source_timeframe") != desired or not timestamp
+                    or not asof_dt - timedelta(days=7) <= parse_asof(timestamp) <= asof_dt):
+                raise AnalyticsNotFoundError(f"No {desired} price anchor available for '{symbol.upper()}' at or before asof.")
+        elif not _state_payload_has_desired_price_anchor(payload, desired, asof_dt):
+            _market_sync_flights.run(
+                ("full", symbol.strip().upper(), desired),
+                lambda: _sync_market_data(symbol, desired, force_full=True, snapshot_limit=1),
+            )
+            payload = analytics_service.get_symbol_state(symbol, timeframe, asof_dt, settings)
+    return payload
 
 
 def _sync_current_analytics_data_if_needed(symbol: str, requested_timeframe: str) -> None:
+    return _market_sync_flights.run(
+        ("current", symbol.strip().upper(), requested_timeframe),
+        lambda: _sync_current_analytics_data_once(symbol, requested_timeframe),
+    )
+
+
+def _sync_current_analytics_data_once(symbol: str, requested_timeframe: str) -> None:
     timeframes = ["1Day"]
     if requested_timeframe != "1Day":
         timeframes.append(requested_timeframe)
@@ -3800,34 +3946,7 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
         asof_dt = parse_asof(request.args.get("asof"))
         if asof_dt is None:
             _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
-        desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
-        if desired_price_timeframe != "1Day" and asof_dt is not None:
-            try:
-                _sync_market_data_window(
-                    symbol,
-                    desired_price_timeframe,
-                    start=asof_dt - timedelta(days=7),
-                    end=asof_dt + timedelta(days=1),
-                    snapshot_limit=1,
-                )
-            except Exception:
-                pass
-        payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
-        if (
-            desired_price_timeframe != "1Day"
-            and not _state_payload_has_desired_price_anchor(payload, desired_price_timeframe, asof_dt)
-        ):
-            if asof_dt is not None:
-                _sync_market_data_window(
-                    symbol,
-                    desired_price_timeframe,
-                    start=asof_dt - timedelta(days=7),
-                    end=asof_dt + timedelta(days=1),
-                    snapshot_limit=1,
-                )
-            else:
-                _sync_market_data(symbol, desired_price_timeframe, force_full=True, snapshot_limit=1)
-            payload = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)
+        payload = _read_analytics_state(symbol, normalized_timeframe, asof_dt, settings)
         payload["ok"] = True
         if hide_ts:
             payload = _strip_symbol_and_timestamps(payload)
@@ -3835,19 +3954,7 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
     except AnalyticsNotFoundError as exc:
         try:
             _backfill_analytics_symbol_if_needed(symbol)
-            desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe or "1Day", asof_dt)
-            if desired_price_timeframe != "1Day":
-                if asof_dt is not None:
-                    _sync_market_data_window(
-                        symbol,
-                        desired_price_timeframe,
-                        start=asof_dt - timedelta(days=7),
-                        end=asof_dt + timedelta(days=1),
-                        snapshot_limit=1,
-                    )
-                else:
-                    _sync_market_data(symbol, desired_price_timeframe, force_full=True, snapshot_limit=1)
-            payload = analytics_service.get_symbol_state(symbol, normalized_timeframe or "1Day", asof_dt, settings or AnalyticsSettings())
+            payload = _read_analytics_state(symbol, normalized_timeframe or "1Day", asof_dt, settings or AnalyticsSettings())
             payload["ok"] = True
             if hide_ts:
                 payload = _strip_symbol_and_timestamps(payload)
@@ -4251,6 +4358,7 @@ def api_docs() -> Response:
 
         <h2>GET /api/state/&lt;symbol&gt;</h2>
         <p>Returns current or backdated analytics state for one symbol. Optional query parameters: <code>timeframe</code>, <code>asof</code>, <code>breakout_lookback</code>, <code>buffer_pct</code>, <code>volume_confirmation</code>, <code>volume_multiple</code>. If you request an intraday timeframe like <code>15Min</code>, the anchor price comes from the intraday bar at or before <code>asof</code> while moving averages and regimes still use daily bars.</p>
+        <p>Historical reads reuse stored price anchors and successfully verified provider coverage, fetching only missing windows. Date-only <code>asof</code> values mean end-of-day and use a 15-minute price anchor for daily analytics. A completed fetch over a market closure may use an earlier intraday bar; inspect <code>data_quality.price_bar_timestamp</code>. Required sync failures return an error, and unavailable intraday anchors return 404 after backfill. Current reads retain freshness checks, and unfinished delayed bars are rechecked rather than permanently marked covered.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/state/NVDA"
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=1D&asof=2023-09-20"
 curl -s "http://127.0.0.1:5000/api/state/NVDA?timeframe=15Min&asof=2023-09-20T15:45:00Z"

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import unittest
-from datetime import datetime, timezone
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Barrier, Event, Lock
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -953,6 +955,226 @@ class StateEndpointHelperTests(unittest.TestCase):
                 pd.Timestamp("2024-08-23T21:03:00Z"),
             )
         )
+
+
+class HistoricalStateSyncTests(unittest.TestCase):
+    asof = datetime(2023, 9, 20, 15, 45, tzinfo=timezone.utc)
+
+    def payload(self, timestamp=None, timeframe="15Min"):
+        return {
+            "symbol": "NVDA", "timeframe": "1Day", "as_of": "2023-09-20T15:45:00Z",
+            "price": {"timestamp": (timestamp or self.asof).isoformat()},
+            "data_quality": {"price_source_timeframe": timeframe,
+                             "price_bar_timestamp": (timestamp or self.asof).isoformat()},
+        }
+
+    def test_five_documented_url_forms_reuse_covered_data(self):
+        urls = [
+            "/api/state/NVDA",
+            "/api/state/NVDA?timeframe=1D&asof=2023-09-20",
+            "/api/state/NVDA?timeframe=15Min&asof=2023-09-20T15:45:00Z",
+            "/api/state/NVDA?timeframe=1D&asof=2023-09-20&hidets=true",
+            "/api/state/NVDA/1Day?breakout_lookback=55&buffer_pct=0.005",
+        ]
+        def coverage(symbol, timeframe, start, end):
+            return end, end + timedelta(days=1), []
+
+        with patch.object(dashboard, "_historical_price_coverage", side_effect=coverage) as covered, \
+                patch.object(dashboard, "_get_market_snapshot", return_value={}), \
+                patch.object(dashboard, "_market_snapshot_needs_sync", return_value=False), \
+                patch.object(dashboard, "_sync_market_data") as current_sync, \
+                patch.object(dashboard, "_sync_market_data_window") as window_sync, \
+                patch.object(dashboard.analytics_service, "get_symbol_state") as state:
+            for url in urls:
+                with self.subTest(url=url):
+                    asof = parse_asof("2023-09-20") if "asof=2023-09-20&" in url or url.endswith("2023-09-20") else self.asof
+                    state.return_value = self.payload(asof)
+                    with flask_app.test_client() as client:
+                        for _ in range(2):
+                            response = client.get(url)
+                            self.assertEqual(response.status_code, 200, response.get_json())
+                            if "hidets=true" in url:
+                                self.assertNotIn("symbol", response.get_json())
+                                self.assertNotIn("timestamp", response.get_json()["price"])
+                    requested_timeframe = "15Min" if "timeframe=15Min" in url else "1Day"
+                    self.assertEqual(state.call_args.args[1], requested_timeframe)
+                    if "asof=" in url:
+                        self.assertEqual(state.call_args.args[2], asof)
+                        self.assertEqual(covered.call_args.args[1], "15Min")
+                        self.assertEqual(covered.call_args.args[3], asof)
+                    else:
+                        self.assertIsNone(state.call_args.args[2])
+            window_sync.assert_not_called()
+            current_sync.assert_not_called()
+            settings = state.call_args.args[3]
+            self.assertEqual(settings.breakout_lookback, 55)
+            self.assertEqual(settings.buffer_pct, 0.005)
+
+    def test_stale_anchor_fetches_only_missing_tail(self):
+        anchor = self.asof - timedelta(days=1)
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(anchor, anchor, [])), \
+                patch.object(dashboard, "_sync_market_data_window") as sync:
+            dashboard._prepare_historical_price_anchor("NVDA", "15Min", self.asof)
+        sync.assert_called_once_with("NVDA", "15Min", anchor + timedelta(minutes=15), self.asof)
+
+    def test_stale_same_day_anchor_is_not_covered_just_because_newer_days_exist(self):
+        anchor = self.asof - timedelta(hours=3)
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(anchor, self.asof + timedelta(days=1), [])), \
+                patch.object(dashboard, "_sync_market_data_window") as sync:
+            dashboard._prepare_historical_price_anchor("NVDA", "15Min", self.asof)
+        sync.assert_called_once_with("NVDA", "15Min", anchor + timedelta(minutes=15), self.asof)
+
+    def test_unfinished_delayed_bar_is_refetched(self):
+        anchor = self.asof - timedelta(minutes=5)
+        with patch.object(dashboard, "_utcnow", return_value=self.asof + timedelta(minutes=20)), \
+                patch.object(dashboard, "CHART_DELAY_MINUTES", 20), \
+                patch.object(dashboard, "_historical_price_coverage", return_value=(anchor, anchor, [])), \
+                patch.object(dashboard, "_sync_market_data_window") as sync:
+            for _ in range(2):
+                dashboard._prepare_historical_price_anchor("NVDA", "15Min", self.asof)
+        self.assertEqual(sync.call_count, 2)
+        sync.assert_called_with("NVDA", "15Min", anchor, self.asof)
+
+    def test_partial_coverage_does_not_hide_unfinished_bar_at_exact_asof(self):
+        windows = [(self.asof - timedelta(days=7), self.asof - timedelta(minutes=15))]
+        with patch.object(dashboard, "_utcnow", return_value=self.asof + timedelta(minutes=20)), \
+                patch.object(dashboard, "CHART_DELAY_MINUTES", 20), \
+                patch.object(dashboard, "_historical_price_coverage", return_value=(self.asof, self.asof, windows)), \
+                patch.object(dashboard, "_sync_market_data_window") as sync:
+            dashboard._prepare_historical_price_anchor("NVDA", "15Min", self.asof)
+        sync.assert_called_once_with("NVDA", "15Min", self.asof, self.asof)
+
+    def test_current_state_checks_freshness_again_after_an_unsuccessful_refresh(self):
+        stale = {"bars": [{"t": "2023-09-19T20:00:00Z"}], "sync_state": {}}
+        with patch.object(dashboard, "_get_market_snapshot", return_value=stale) as snapshot, \
+                patch.object(dashboard, "_sync_market_data") as sync:
+            dashboard._sync_current_analytics_data_if_needed("NVDA", "15Min")
+            dashboard._sync_current_analytics_data_if_needed("NVDA", "15Min")
+        self.assertEqual(snapshot.call_count, 4)
+        self.assertEqual(sync.call_count, 4)
+
+    def test_missing_anchor_fetches_window_and_partial_coverage_fetches_only_gaps(self):
+        start = self.asof - timedelta(days=7)
+        windows = [(start, start + timedelta(days=2)),
+                   (start + timedelta(days=3), self.asof)]
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, windows)), \
+                patch.object(dashboard, "_sync_market_data_window") as sync:
+            dashboard._prepare_historical_price_anchor("NVDA", "15Min", self.asof)
+        sync.assert_called_once_with("NVDA", "15Min", start + timedelta(days=2), start + timedelta(days=3))
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])), \
+                patch.object(dashboard, "_sync_market_data_window") as sync:
+            dashboard._prepare_historical_price_anchor("NVDA", "15Min", self.asof)
+        sync.assert_called_once_with("NVDA", "15Min", start, self.asof)
+
+    def test_closures_reuse_successfully_verified_empty_tail(self):
+        for end in [parse_asof("2023-09-23"), parse_asof("2023-12-25")]:
+            anchor = end - timedelta(days=3)
+            windows = [(anchor + timedelta(minutes=15), end)]
+            with self.subTest(end=end), \
+                    patch.object(dashboard, "_historical_price_coverage", return_value=(anchor, anchor, windows)), \
+                    patch.object(dashboard, "_sync_market_data_window") as sync, \
+                    patch.object(dashboard.analytics_service, "get_symbol_state", return_value=self.payload(anchor)):
+                dashboard._read_analytics_state("NVDA", "1Day", end, AnalyticsSettings())
+                dashboard._read_analytics_state("NVDA", "1Day", end, AnalyticsSettings())
+                sync.assert_not_called()
+
+    def test_failed_historical_fetch_returns_error_then_retries(self):
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])), \
+                patch.object(dashboard, "_sync_market_data_window", side_effect=[RuntimeError("provider down"), None]) as sync, \
+                patch.object(dashboard.analytics_service, "get_symbol_state", return_value=self.payload()):
+            with flask_app.test_client() as client:
+                failed = client.get("/api/state/NVDA?asof=2023-09-20T15:45:00Z")
+                retried = client.get("/api/state/NVDA?asof=2023-09-20T15:45:00Z")
+            self.assertEqual(failed.status_code, 500)
+            self.assertIn("provider down", failed.get_json()["error"])
+            self.assertEqual(retried.status_code, 200)
+            self.assertEqual(sync.call_count, 2)
+
+    def test_missing_intraday_anchor_does_not_silently_return_daily_fallback(self):
+        with patch.object(dashboard, "_prepare_historical_price_anchor"), \
+                patch.object(dashboard, "_backfill_analytics_symbol_if_needed") as backfill, \
+                patch.object(dashboard.analytics_service, "get_symbol_state", return_value=self.payload(timeframe="1Day")):
+            with flask_app.test_client() as client:
+                response = client.get("/api/state/NVDA?asof=2023-09-20T15:45:00Z")
+        self.assertEqual(response.status_code, 404)
+        backfill.assert_called_once_with("NVDA")
+
+    def test_daily_not_found_still_backfills_and_retries(self):
+        with patch.object(dashboard, "_prepare_historical_price_anchor"), \
+                patch.object(dashboard, "_backfill_analytics_symbol_if_needed") as backfill, \
+                patch.object(dashboard.analytics_service, "get_symbol_state", side_effect=[AnalyticsNotFoundError("no daily bars"), self.payload()]):
+            with flask_app.test_client() as client:
+                response = client.get("/api/state/NVDA?asof=2023-09-20T15:45:00Z")
+        self.assertEqual(response.status_code, 200)
+        backfill.assert_called_once_with("NVDA")
+
+    def test_concurrent_cold_requests_share_sync(self):
+        self._concurrent_cold_requests()
+
+    def test_concurrent_cold_requests_share_failure_then_retry(self):
+        self._concurrent_cold_requests(fail=True)
+
+    def _concurrent_cold_requests(self, fail=False):
+        entered, release, joined = Event(), Event(), Event()
+        barrier = Barrier(6)
+        count_lock = Lock()
+        waiters = 0
+        class ObservedFuture(Future):
+            def result(self, timeout=None):
+                nonlocal waiters
+                with count_lock:
+                    waiters += 1
+                    if waiters == 5:
+                        joined.set()
+                return super().result(timeout)
+        def provider(*args):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            if fail:
+                raise RuntimeError("provider down")
+        def request_state():
+            barrier.wait(timeout=5)
+            with flask_app.test_client() as client:
+                return client.get("/api/state/NVDA?asof=2023-09-20T15:45:00Z").status_code
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])), \
+                patch.object(dashboard, "_sync_market_data_window", side_effect=provider) as sync, \
+                patch.object(dashboard.analytics_service, "get_symbol_state", return_value=self.payload()), \
+                patch("market_sync.Future", ObservedFuture), \
+                ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [pool.submit(request_state) for _ in range(6)]
+            self.assertTrue(entered.wait(5))
+            self.assertTrue(joined.wait(5))
+            release.set()
+            self.assertEqual([f.result(timeout=5) for f in futures], [500 if fail else 200] * 6)
+            sync.assert_called_once()
+            if fail:
+                sync.side_effect = None
+                with flask_app.test_client() as client:
+                    response = client.get("/api/state/NVDA?asof=2023-09-20T15:45:00Z")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(sync.call_count, 2)
+
+    def test_window_records_only_successful_delay_bounded_coverage(self):
+        conn = MagicMock()
+        cur = conn.__enter__.return_value.cursor.return_value.__enter__.return_value
+        now = self.asof + timedelta(minutes=20)
+        with patch.object(dashboard, "_ensure_symbol_metadata", return_value=1), \
+                patch.object(dashboard, "_get_conn", return_value=conn), \
+                patch.object(dashboard, "_utcnow", return_value=now), \
+                patch.object(dashboard, "CHART_DELAY_MINUTES", 20), \
+                patch.object(dashboard, "_fetch_alpaca_bars", return_value=[]) as fetch, \
+                patch.object(dashboard, "_upsert_stock_bars", return_value=0), \
+                patch.object(dashboard, "_get_market_snapshot", return_value={}):
+            dashboard._sync_market_data_window("NVDA", "15Min", self.asof - timedelta(days=7), now)
+            self.assertEqual(fetch.call_args.args[-1], self.asof)
+            inserts = [c for c in cur.execute.call_args_list if "INSERT INTO market_data_coverage" in c.args[0]]
+            self.assertEqual(len(inserts), 1)
+            self.assertEqual(inserts[0].args[1][-1], self.asof - timedelta(minutes=15))
+            cur.reset_mock()
+            fetch.side_effect = RuntimeError("provider down")
+            with self.assertRaisesRegex(RuntimeError, "provider down"):
+                dashboard._sync_market_data_window("NVDA", "15Min", self.asof - timedelta(days=7), now)
+            self.assertFalse(any("INSERT INTO market_data_coverage" in c.args[0] for c in cur.execute.call_args_list))
 
 
 if __name__ == "__main__":
