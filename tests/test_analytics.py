@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import os
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pandas as pd
 
 from app import app as flask_app, _market_snapshot_needs_sync, _state_payload_has_desired_price_anchor
 from analytics.config import AnalyticsSettings
 from analytics.indicators import compute_feature_frame
+from analytics import indicators
 from analytics.regimes import (
     classify_momentum_regime,
     classify_position_in_range,
@@ -75,6 +78,76 @@ class IndicatorTests(unittest.TestCase):
         self.assertTrue(pd.isna(latest["sma_20"]))
         self.assertTrue(pd.isna(latest["return_20"]))
         self.assertTrue(pd.isna(latest["atr_14"]))
+
+
+class RustIndicatorTests(unittest.TestCase):
+    def test_auto_falls_back_when_extension_is_unavailable(self) -> None:
+        bars = _fixture_bars(30)
+        with patch.object(indicators, "_rust_feature_columns", None), patch.dict(os.environ, ANALYTICS_BACKEND="auto"):
+            actual = compute_feature_frame(bars, "1Day", AnalyticsSettings())
+        pd.testing.assert_frame_equal(actual, indicators._compute_feature_frame_python(bars, "1Day", AnalyticsSettings()))
+        with patch.object(indicators, "_rust_feature_columns", None), patch.dict(os.environ, ANALYTICS_BACKEND="rust"):
+            with self.assertRaisesRegex(RuntimeError, "pip install ./rust"):
+                compute_feature_frame(bars, "1Day", AnalyticsSettings())
+
+    @unittest.skipIf(indicators._rust_feature_columns is None, "Install ./rust for native parity tests")
+    def test_native_features_and_signals_match_pandas(self) -> None:
+        rng = np.random.default_rng(777)
+        for count in (1, 14, 20, 26, 55, 200, 252, 1200):
+            bars = _fixture_bars(count)
+            bars["close"] = 100 * np.exp(np.cumsum(rng.normal(0, 0.015, count)))
+            bars["high"] = bars["close"] + rng.uniform(0.1, 3, count)
+            bars["low"] = bars["close"] - rng.uniform(0.1, 3, count)
+            bars["volume"] = rng.integers(0, 10_000_000, count).astype(float)
+            # Exercise sorting and year boundaries, not just rising daily prices.
+            bars = bars.sample(frac=1, random_state=777)
+            for timeframe in ("1Day", "15Min"):
+                for lookback in (1, 55, 1500):
+                    with self.subTest(count=count, timeframe=timeframe, lookback=lookback):
+                        settings = AnalyticsSettings(breakout_lookback=lookback, buffer_pct=0.005, sma_slope_lookback=7)
+                        expected = indicators._compute_feature_frame_python(bars, timeframe, settings)
+                        with patch.dict(os.environ, ANALYTICS_BACKEND="rust"):
+                            actual = compute_feature_frame(bars, timeframe, settings)
+                        pd.testing.assert_frame_equal(actual, expected, check_like=True, rtol=1e-8, atol=1e-10)
+                        pd.testing.assert_frame_equal(
+                            compute_signal_columns(actual, settings), compute_signal_columns(expected, settings),
+                            check_like=True, rtol=1e-8, atol=1e-10,
+                        )
+
+    @unittest.skipIf(indicators._rust_feature_columns is None, "Install ./rust for native parity tests")
+    def test_flat_zero_volume_and_missing_data(self) -> None:
+        for scenario in ("flat", "fractional_flat", "down", "zero_volume", "missing", "missing_timestamp", "zero_price", "empty"):
+            with self.subTest(scenario=scenario):
+                bars = _fixture_bars(300)
+                if scenario in {"flat", "fractional_flat"}:
+                    bars[["open", "high", "low", "close"]] = 100.1 if scenario == "fractional_flat" else 100.0
+                elif scenario == "down":
+                    bars["close"] = bars["close"][::-1].to_numpy()
+                elif scenario == "zero_volume":
+                    bars["volume"] = 0.0
+                elif scenario == "missing":
+                    bars.loc[100, "volume"] = np.nan
+                elif scenario == "missing_timestamp":
+                    bars.loc[100, "timestamp"] = pd.NaT
+                elif scenario == "zero_price":
+                    bars.loc[100, "close"] = 0.0
+                else:
+                    bars = bars.iloc[:0]
+                expected = indicators._compute_feature_frame_python(bars, "1Day", AnalyticsSettings())
+                with patch.dict(os.environ, ANALYTICS_BACKEND="rust"):
+                    actual = compute_feature_frame(bars, "1Day", AnalyticsSettings())
+                # Native NaN and pandas object/pd.NA both serialize to JSON null.
+                pd.testing.assert_frame_equal(actual.isna(), expected.isna(), check_like=True)
+                for frame in (actual, expected):
+                    for column in frame.select_dtypes(include="object"):
+                        frame[column] = frame[column].astype("Float64").astype(float)
+                pd.testing.assert_frame_equal(actual, expected, check_like=True, rtol=1e-8, atol=1e-10)
+                if not bars.empty:
+                    pd.testing.assert_frame_equal(
+                        compute_signal_columns(actual, AnalyticsSettings()),
+                        compute_signal_columns(expected, AnalyticsSettings()),
+                        check_like=True, rtol=1e-8, atol=1e-10,
+                    )
 
 
 class SignalTests(unittest.TestCase):

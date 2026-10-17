@@ -27,6 +27,45 @@ Single-file Flask app for tracking stock forecast prices with a PostgreSQL backe
 pip install -r requirements.txt
 ```
 
+### Rust analytics acceleration
+
+The state and event APIs can calculate their indicator feature frame in a fused
+Rust extension (PyO3 + NumPy). Install with Rust/Cargo 1.83+ and a C linker available:
+
+```bash
+pip install ./rust
+```
+
+Docker builds and installs the release extension automatically in a separate
+build stage. The runtime image does not need the Rust toolchain.
+
+`ANALYTICS_BACKEND=auto` (default) uses Rust when installed, otherwise pandas.
+Use `ANALYTICS_BACKEND=python` to force the reference implementation or
+`ANALYTICS_BACKEND=rust` to require the extension at calculation time. Histories
+with missing/nonfinite OHLCV values or nonpositive closes use pandas to preserve
+its existing missing-data behavior. Restart the app after changing backends to
+clear its in-process state cache.
+
+All `/api/state` URL forms and parameters retain their existing meaning, including
+`asof`, `timeframe`, `hidets`, `breakout_lookback`, and `buffer_pct`. Native code
+calculates returns, moving averages, RSI, MACD, ATR, volatility, ranges, volume
+statistics, and breakout levels; signal classification still runs in Python.
+The native calculation releases the GIL. Database queries, market-data syncing,
+HTTP serialization, and cache hits are outside this acceleration.
+
+Validate parity and measure uncached feature + signal calculation locally:
+
+```bash
+python -m unittest tests/test_analytics.py
+python -m analytics.benchmark --bars 260 1000 10000 --repeats 20
+python -m analytics.benchmark --bars 1000 --repeats 20 --http
+```
+
+The `--http` comparison exercises all five documented single-symbol state URL
+examples through Flask with a fixture repository and a fresh cache per request.
+It validates JSON parity and includes route/service/serialization overhead, while
+mocking database and market-data network calls; it is not a live-server benchmark.
+
 ## Run (Local)
 ```bash
 export DATABASE_URL='postgresql://stock_user:stock_pass@localhost:5432/stock_tracker'

@@ -1,6 +1,7 @@
 flask
 yfinance
 pandas
+numpy>=1.23
 python-dotenv
 psycopg2-binary
 yfinance
