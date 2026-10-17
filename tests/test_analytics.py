@@ -352,7 +352,8 @@ class ServiceTests(unittest.TestCase):
                 "volume": [1000.0, 1200.0],
             }
         )
-        repo.fetch_bars.side_effect = [daily_bars, intraday_bars]
+        repo.fetch_bars.return_value = daily_bars
+        repo.fetch_latest_bar.return_value = intraday_bars.tail(1)
         service = AnalyticsService(repository=repo)
 
         payload = service.get_symbol_state("NVDA", "15Min", pd.Timestamp("2023-09-17T16:00:00Z"), AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))
@@ -404,7 +405,8 @@ class ServiceTests(unittest.TestCase):
                 "volume": [1000.0, 1200.0],
             }
         )
-        repo.fetch_bars.side_effect = [daily_bars, intraday_bars]
+        repo.fetch_bars.return_value = daily_bars
+        repo.fetch_latest_bar.return_value = intraday_bars.tail(1)
         service = AnalyticsService(repository=repo)
 
         payload = service.get_symbol_state("NVDA", "1Day", pd.Timestamp("2023-09-17T12:15:00Z"), AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))
@@ -456,7 +458,8 @@ class ServiceTests(unittest.TestCase):
                 "volume": [1000.0] * 6,
             }
         )
-        repo.fetch_bars.side_effect = [anchor_and_history, future]
+        repo.fetch_latest_bar.return_value = anchor_and_history.tail(1)
+        repo.fetch_future_bars.return_value = future.head(5)
         service = AnalyticsService(repository=repo)
 
         payload = service.get_future_state("NVDA", "1Day", pd.Timestamp("2023-01-30", tz="UTC"), 5)
@@ -521,7 +524,8 @@ class ServiceTests(unittest.TestCase):
                 "volume": [900.0, 800.0, 1000.0],
             }
         )
-        repo.fetch_bars.side_effect = [intraday_anchor_bars, intraday_future_bars]
+        repo.fetch_latest_bar.return_value = intraday_anchor_bars.tail(1)
+        repo.fetch_future_bars.return_value = intraday_future_bars.head(2)
         service = AnalyticsService(repository=repo)
 
         payload = service.get_future_state(
@@ -589,7 +593,8 @@ class ServiceTests(unittest.TestCase):
                 "volume": [900.0, 800.0, 1000.0],
             }
         )
-        repo.fetch_bars.side_effect = [intraday_anchor_bars, intraday_future_bars]
+        repo.fetch_latest_bar.return_value = intraday_anchor_bars.tail(1)
+        repo.fetch_future_bars.return_value = intraday_future_bars
         service = AnalyticsService(repository=repo)
 
         payload = service.get_future_state(
@@ -655,7 +660,8 @@ class ServiceTests(unittest.TestCase):
                 "volume": [900.0, 800.0, 1000.0],
             }
         )
-        repo.fetch_bars.side_effect = [intraday_anchor_bars, intraday_future_bars]
+        repo.fetch_latest_bar.return_value = intraday_anchor_bars.tail(1)
+        repo.fetch_future_bars.return_value = intraday_future_bars
         service = AnalyticsService(repository=repo)
 
         payload = service.get_future_state(

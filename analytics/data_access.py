@@ -92,6 +92,33 @@ class AnalyticsRepository:
         asof: datetime | None = None,
         start: datetime | None = None,
     ) -> pd.DataFrame:
+        return self._fetch_bars(symbol_id, timeframe, asof=asof, start=start)
+
+    def fetch_latest_bar(
+        self, symbol_id: int, timeframe: str, asof: datetime | None = None,
+    ) -> pd.DataFrame:
+        """Return at most one bar, including a bar exactly at the as-of."""
+        return self._fetch_bars(symbol_id, timeframe, asof=asof, descending=True, limit=1)
+
+    def fetch_future_bars(
+        self, symbol_id: int, timeframe: str, after: datetime, limit: int,
+    ) -> pd.DataFrame:
+        """Return the next trading bars, strictly after the anchor, oldest first."""
+        if limit <= 0:
+            raise ValueError("'limit' must be greater than zero.")
+        return self._fetch_bars(symbol_id, timeframe, after=after, limit=limit)
+
+    def _fetch_bars(
+        self,
+        symbol_id: int,
+        timeframe: str,
+        *,
+        asof: datetime | None = None,
+        start: datetime | None = None,
+        after: datetime | None = None,
+        descending: bool = False,
+        limit: int | None = None,
+    ) -> pd.DataFrame:
         sql = """
             SELECT bar_time, open, high, low, close, volume
             FROM stock_bars
@@ -105,7 +132,13 @@ class AnalyticsRepository:
         if asof is not None:
             sql += " AND bar_time <= %s"
             params.append(asof.astimezone(timezone.utc))
-        sql += " ORDER BY bar_time ASC"
+        if after is not None:
+            sql += " AND bar_time > %s"
+            params.append(after.astimezone(timezone.utc))
+        sql += " ORDER BY bar_time DESC" if descending else " ORDER BY bar_time ASC"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
 
         with self.get_conn() as conn:
             with conn.cursor() as cur:
