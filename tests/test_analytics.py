@@ -108,6 +108,7 @@ class FutureLabelHorizonTests(unittest.TestCase):
 
     def test_explicit_intraday_response_keeps_intraday_anchor_window_and_sync(self):
         with patch.object(dashboard, "analytics_service", self.service), \
+             patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])), \
              patch.object(dashboard, "_sync_market_data_window") as sync, \
              flask_app.test_client() as client:
             response = client.get("/api/futurestate/NVDA/15Min?asof=2023-09-20T15:00:00Z&days=20")
@@ -118,7 +119,140 @@ class FutureLabelHorizonTests(unittest.TestCase):
         self.assertEqual(payload["anchor_price"]["timestamp"], "2023-09-20T15:00:00Z")
         self.assertEqual(payload["window"]["future_bar_count"], 20)
         self.assertEqual(payload["window"]["realized_end_timestamp"], "2023-09-20T20:00:00Z")
-        self.assertEqual(sync.call_args.args, ("NVDA", "15Min"))
+        self.assertEqual(sync.call_args.args[:2], ("NVDA", "15Min"))
+
+    def test_intraday_covered_requests_skip_provider_with_cold_and_warm_cache(self):
+        asof = parse_asof("2023-09-20T15:00:00Z")
+        start, end = dashboard._future_preparation_window(asof, 20)
+        with patch.object(dashboard, "analytics_service", self.service), \
+             patch.object(dashboard, "_portfolio_symbols", return_value=["NVDA"]), \
+             patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [(start, end)])), \
+             patch.object(dashboard, "_sync_market_data_window") as sync, flask_app.test_client() as client:
+            for path in ("/api/futurestate/NVDA", "/api/portfolio/futurestate"):
+                for _ in range(2):
+                    response = client.get(path, query_string={"timeframe": "15Min", "asof": asof.isoformat(), "days": 20})
+                    self.assertEqual(response.status_code, 200, response.get_json())
+            sync.assert_not_called()
+
+    def test_portfolio_missing_coverage_is_per_symbol_and_never_fetches(self):
+        asof = parse_asof("2023-09-20T15:00:00Z")
+        def coverage(symbol, timeframe, start, end):
+            return None, None, [(start, end)] if symbol == "NVDA" else []
+        with patch.object(dashboard, "analytics_service", self.service), \
+             patch.object(dashboard, "_portfolio_symbols", return_value=["NVDA", "MISSING"]), \
+             patch.object(dashboard, "_historical_price_coverage", side_effect=coverage), \
+             patch.object(dashboard, "_sync_market_data_window") as sync, flask_app.test_client() as client:
+            response = client.get("/api/portfolio/futurestate", query_string={"timeframe": "15Min", "asof": asof.isoformat(), "days": 20})
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200, payload)
+        self.assertEqual(payload["portfolio_symbol_count"], 2)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["errors"][0]["symbol"], "MISSING")
+        self.assertIn("POST /api/coverage/prepare", payload["errors"][0]["error"])
+        sync.assert_not_called()
+
+    def test_future_fetch_failure_is_reported_and_next_request_retries(self):
+        with patch.object(dashboard, "analytics_service", self.service), \
+             patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])), \
+             patch.object(dashboard, "_sync_market_data_window", side_effect=[RuntimeError("provider down"), None]) as sync, \
+             flask_app.test_client() as client:
+            url = "/api/futurestate/NVDA/15Min?asof=2023-09-20T15:00:00Z&days=20"
+            failed = client.get(url)
+            self.assertEqual(failed.status_code, 500)
+            self.assertIn("provider down", failed.get_json()["error"])
+            self.assertEqual(client.get(url).status_code, 200)
+        self.assertEqual(sync.call_count, 2)
+
+    def test_future_missing_daily_data_retries_only_daily_backfill(self):
+        with patch.object(dashboard.analytics_service, "get_future_state", side_effect=[AnalyticsNotFoundError("missing"), {}]), \
+             patch.object(dashboard, "_backfill_analytics_symbol_if_needed") as backfill, \
+             patch.object(dashboard, "_sync_market_data_window") as sync, flask_app.test_client() as client:
+            response = client.get("/api/futurestate/NVDA?asof=2023-09-20&days=20")
+        self.assertEqual(response.status_code, 200)
+        backfill.assert_called_once_with("NVDA")
+        sync.assert_not_called()
+
+    def test_intraday_preparation_limits_and_validation_precede_provider_work(self):
+        with patch.object(dashboard, "_sync_market_data_window") as sync, flask_app.test_client() as client:
+            for suffix in ("days=0", "days=20&stoploss=-1"):
+                response = client.get("/api/futurestate/NVDA/15Min?asof=2023-09-20&" + suffix)
+                self.assertEqual(response.status_code, 400, response.get_json())
+            body = {"symbols": ["NVDA"], "timeframe": "15Min", "start": "2023-09-13T15:00:00Z", "end": "2023-10-10T15:00:00Z"}
+            for change in ({"symbols": list("ABCDEF")}, {"end": "2023-11-01"}):
+                self.assertEqual(client.post("/api/coverage/prepare", json={**body, **change}).status_code, 400)
+            sync.assert_not_called()
+            with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])):
+                response = client.get("/api/futurestate/NVDA/15Min?asof=2023-09-20&days=25")
+            self.assertEqual(response.status_code, 404, response.get_json())
+            self.assertIn("POST /api/coverage/prepare", response.get_json()["error"])
+            sync.assert_not_called()
+            with patch.object(dashboard, "analytics_service", self.service), \
+                 patch.object(dashboard, "_historical_price_coverage", side_effect=lambda s, tf, start, end: (None, None, [(start, end)])):
+                response = client.get("/api/futurestate/NVDA/15Min?asof=2023-09-20T15:00:00Z&days=25")
+            self.assertEqual(response.status_code, 200, response.get_json())
+            sync.assert_not_called()
+            with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])):
+                response = client.post("/api/coverage/prepare", json=body)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json()["timeframe"], "15Min")
+            self.assertEqual(response.get_json()["count"], 1)
+            sync.assert_called_once()
+
+    def test_intraday_partial_coverage_fetches_only_gap(self):
+        start, end = parse_asof("2023-09-01"), parse_asof("2023-09-20")
+        left, right = start + timedelta(days=3), end - timedelta(days=3)
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [(start, left), (right, end)])), \
+             patch.object(dashboard, "_sync_market_data_window") as sync:
+            dashboard._prepare_window_coverage("nvda", "15Min", start, end)
+        sync.assert_called_once_with("NVDA", "15Min", left, right)
+
+    def test_future_identical_concurrency_coalesces_success_and_failure(self):
+        for fail in (False, True):
+            entered, release, joined = Event(), Event(), Event()
+            lock = Lock()
+            waiters = 0
+            class ObservedFuture(Future):
+                def result(self, timeout=None):
+                    nonlocal waiters
+                    with lock:
+                        waiters += 1
+                        if waiters == 5:
+                            joined.set()
+                    return super().result(timeout)
+            def provider(*args):
+                entered.set()
+                self.assertTrue(release.wait(5))
+                if fail:
+                    raise RuntimeError("provider down")
+            def read():
+                with flask_app.test_client() as client:
+                    return client.get("/api/futurestate/NVDA/15Min?asof=2023-09-20T15:00:00Z&days=20").status_code
+            with self.subTest(fail=fail), \
+                 patch.object(dashboard, "analytics_service", self.service), \
+                 patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [])), \
+                 patch.object(dashboard, "_sync_market_data_window", side_effect=provider) as sync, \
+                 patch("market_sync.Future", ObservedFuture), ThreadPoolExecutor(max_workers=6) as pool:
+                futures = [pool.submit(read) for _ in range(6)]
+                self.assertTrue(entered.wait(5))
+                self.assertTrue(joined.wait(5))
+                release.set()
+                self.assertEqual([f.result(timeout=5) for f in futures], [500 if fail else 200] * 6)
+                sync.assert_called_once()
+
+    def test_unfinalized_future_tail_is_not_treated_as_covered(self):
+        asof = parse_asof("2023-09-20T15:00:00Z")
+        now = asof + timedelta(hours=1)
+        with patch.object(dashboard, "_utcnow", return_value=now), \
+             patch.object(dashboard, "CHART_DELAY_MINUTES", 0):
+            start, end = dashboard._future_preparation_window(asof, 20)
+        self.assertEqual(end, now)
+        finalized = now - timedelta(minutes=15)
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [(start, finalized)])), \
+             patch.object(dashboard, "_sync_market_data_window") as sync:
+            for _ in range(2):
+                dashboard._prepare_window_coverage("NVDA", "15Min", start, end)
+        self.assertEqual(sync.call_count, 2)
+        sync.assert_called_with("NVDA", "15Min", finalized, end)
 
     def test_daily_thresholds_keep_side_and_first_hit_order(self):
         for side, first, stop_date, profit_date in (

@@ -4069,18 +4069,11 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
         asof_dt = parse_asof(request.args.get("asof"))
         if asof_dt is None:
             return jsonify({"ok": False, "error": "'asof' is required."}), 400
-        desired_price_timeframe = normalized_timeframe
-        if desired_price_timeframe != "1Day":
-            try:
-                _sync_market_data_window(
-                    symbol,
-                    desired_price_timeframe,
-                    start=asof_dt - timedelta(days=7),
-                    end=asof_dt + timedelta(days=max(1, days)),
-                    snapshot_limit=1,
-                )
-            except Exception:
-                pass
+        _validate_future_preparation(days, stop_loss_pct, take_profit_pct)
+        if normalized_timeframe != "1Day":
+            start, end = _future_preparation_window(asof_dt, days)
+            _prepare_window_coverage(symbol, normalized_timeframe, start, end,
+                                     allow_sync=end - start <= timedelta(days=31))
         payload = analytics_service.get_future_state(
             symbol,
             normalized_timeframe,
@@ -4096,16 +4089,9 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
         return jsonify(payload)
     except AnalyticsNotFoundError as exc:
         try:
+            if normalized_timeframe != "1Day":
+                return jsonify({"ok": False, "error": str(exc)}), 404
             _backfill_analytics_symbol_if_needed(symbol)
-            desired_price_timeframe = _analytics_price_timeframe_for_request(normalized_timeframe, asof_dt)
-            if desired_price_timeframe != "1Day":
-                _sync_market_data_window(
-                    symbol,
-                    desired_price_timeframe,
-                    start=asof_dt - timedelta(days=7),
-                    end=asof_dt + timedelta(days=max(1, days)),
-                    snapshot_limit=1,
-                )
             payload = analytics_service.get_future_state(
                 symbol,
                 normalized_timeframe,
@@ -4128,32 +4114,61 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
-def _prepare_daily_coverage(symbol: str, start: datetime, end: datetime) -> Dict:
+def _validate_future_preparation(days, stop_loss_pct, take_profit_pct):
+    if days <= 0:
+        raise ValueError("'days' must be greater than zero.")
+    if any(value is not None and value < 0 for value in (stop_loss_pct, take_profit_pct)):
+        raise ValueError("Stop-loss and take-profit percentages must be nonnegative.")
+
+
+def _future_preparation_window(asof_dt, days):
+    # Preserve the existing calendar search envelope, not a promise of N trading
+    # sessions. The service reports partial horizons independently of coverage.
+    start = asof_dt - timedelta(days=7)
+    end = min(asof_dt + timedelta(days=days),
+              _utcnow() - timedelta(minutes=max(CHART_DELAY_MINUTES, 0)))
+    if start >= end:
+        raise ValueError("Target sync window is in the future after delay adjustment.")
+    return start, end
+
+
+def _prepare_window_coverage(symbol: str, timeframe: str, start: datetime, end: datetime,
+                             allow_sync: bool = True) -> Dict:
     """Fetch only unverified gaps; completed empty windows count as coverage."""
+    symbol = symbol.strip().upper()
     def prepare():
-        _, _, windows = _historical_price_coverage(symbol, "1Day", start, end)
+        _, _, windows = _historical_price_coverage(symbol, timeframe, start, end)
         cursor = start
-        fetched = 0
+        gaps = []
         for covered_start, covered_end in windows:
             if covered_end < cursor:
                 continue
             if covered_start > cursor:
-                _sync_market_data_window(symbol, "1Day", cursor, min(covered_start, end))
-                fetched += 1
+                gaps.append((cursor, min(covered_start, end)))
             cursor = max(cursor, covered_end)
             if cursor >= end:
                 break
         if cursor < end:
-            _sync_market_data_window(symbol, "1Day", cursor, end)
-            fetched += 1
-        return {"symbol": symbol, "fetched_window_count": fetched, "status": "prepared"}
+            gaps.append((cursor, end))
+        if gaps and not allow_sync:
+            raise AnalyticsNotFoundError(
+                f"Verified {timeframe} coverage required for '{symbol}'; use POST /api/coverage/prepare "
+                f"with timeframe={timeframe}, start={isoformat_utc(start)}, end={isoformat_utc(end)}."
+            )
+        for gap_start, gap_end in gaps:
+            _sync_market_data_window(symbol, timeframe, gap_start, gap_end)
+        return {"symbol": symbol, "fetched_window_count": len(gaps), "status": "prepared"}
 
-    return _market_sync_flights.run(("daily-coverage", symbol, start, end), prepare)
+    return _market_sync_flights.run(("coverage", symbol, timeframe, start, end, allow_sync), prepare)
+
+
+def _prepare_daily_coverage(symbol: str, start: datetime, end: datetime) -> Dict:
+    return _prepare_window_coverage(symbol, "1Day", start, end)
 
 
 @app.post("/api/coverage/prepare")
 def prepare_analytics_coverage() -> Response:
-    """Explicit, bounded preparation for daily features, labels and benchmarks."""
+    """Explicit, bounded preparation for features, labels and benchmarks."""
     try:
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
@@ -4162,28 +4177,34 @@ def prepare_analytics_coverage() -> Response:
         if not isinstance(symbols, list) or not symbols or any(not isinstance(s, str) or not s.strip() for s in symbols):
             raise ValueError("'symbols' must be a non-empty array of symbol strings.")
         symbols = list(dict.fromkeys(s.strip().upper() for s in symbols))
-        include_benchmarks = payload.get("include_benchmarks", True)
+        timeframe = _normalize_analytics_timeframe(payload.get("timeframe"))
+        include_benchmarks = payload.get("include_benchmarks", timeframe == "1Day")
         if not isinstance(include_benchmarks, bool):
             raise ValueError("'include_benchmarks' must be a boolean.")
         if include_benchmarks:
             symbols = list(dict.fromkeys([*symbols, "SPY", "QQQ"]))
         if len(symbols) > 50:
             raise ValueError("At most 50 symbols, including benchmarks, may be prepared per request.")
+        if timeframe != "1Day" and len(symbols) > 5:
+            raise ValueError("At most 5 intraday symbols may be prepared per request.")
         start = parse_asof(payload.get("start"))
         end = parse_asof(payload.get("end"))
         if start is None or end is None or not start < end:
             raise ValueError("'start' and 'end' are required and start must precede end.")
         if end - start > timedelta(days=400):
             raise ValueError("Coverage preparation is limited to 400 calendar days per request.")
+        if timeframe != "1Day" and end - start > timedelta(days=31):
+            raise ValueError("Intraday preparation is limited to 31 calendar days per request.")
         if end > _utcnow() - timedelta(minutes=max(CHART_DELAY_MINUTES, 0)):
             raise ValueError("'end' must not exceed the delayed present time.")
         prepared, errors = [], []
         for symbol in symbols:
             try:
-                prepared.append(_prepare_daily_coverage(symbol, start, end))
+                prepared.append(_prepare_daily_coverage(symbol, start, end) if timeframe == "1Day"
+                                else _prepare_window_coverage(symbol, timeframe, start, end))
             except Exception as exc:
                 errors.append({"symbol": symbol, "error": str(exc)})
-        return jsonify({"ok": True, "timeframe": "1Day", "start": isoformat_utc(start),
+        return jsonify({"ok": True, "timeframe": timeframe, "start": isoformat_utc(start),
                         "end": isoformat_utc(end), "prepared": prepared, "errors": errors,
                         "count": len(prepared), "requested_symbol_count": len(symbols)})
     except (ValueError, TypeError) as exc:
@@ -4281,21 +4302,20 @@ def get_portfolio_analytics_future_state() -> Response:
         asof_dt = parse_asof(request.args.get("asof"))
         if asof_dt is None:
             return jsonify({"ok": False, "error": "'asof' is required."}), 400
-        desired_price_timeframe = normalized_timeframe
-        if desired_price_timeframe != "1Day":
+        _validate_future_preparation(days, stop_loss_pct, take_profit_pct)
+        preparation_errors = []
+        ready_symbols = symbols
+        if normalized_timeframe != "1Day":
+            start, end = _future_preparation_window(asof_dt, days)
+            ready_symbols = []
             for symbol in symbols:
                 try:
-                    _sync_market_data_window(
-                        symbol,
-                        desired_price_timeframe,
-                        start=asof_dt - timedelta(days=7),
-                        end=asof_dt + timedelta(days=max(1, days)),
-                        snapshot_limit=1,
-                    )
-                except Exception:
-                    pass
+                    _prepare_window_coverage(symbol, normalized_timeframe, start, end, allow_sync=False)
+                    ready_symbols.append(symbol)
+                except Exception as exc:
+                    preparation_errors.append({"symbol": symbol, "error": str(exc)})
         batch = analytics_service.get_batch_future_state(
-            symbols,
+            ready_symbols,
             normalized_timeframe,
             asof_dt,
             days,
@@ -4303,6 +4323,7 @@ def get_portfolio_analytics_future_state() -> Response:
             take_profit_pct=take_profit_pct,
             side=side,
         )
+        batch["errors"].extend(preparation_errors)
         batch["ok"] = True
         batch["portfolio_symbol_count"] = len(symbols)
         batch["count"] = len(batch.get("future_states", []))
@@ -4565,12 +4586,14 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
 }</code></pre>
 
         <h2>GET /api/portfolio/futurestate</h2>
+        <p>Portfolio reads perform no provider I/O. Explicit intraday requests require verified provider coverage over the seven-day anchor lookback through <code>asof + days</code>, capped at the delayed present. Uncovered symbols return per-symbol errors with preparation bounds; prepare them using <code>POST /api/coverage/prepare</code> and retry. Single-symbol intraday reads fetch only missing coverage ranges for envelopes up to 31 calendar days and report required provider failures; larger uncovered envelopes require explicit preparation in smaller windows. Successful empty windows cover market closures; unfinished delayed tails are rechecked, not permanently covered. This calendar search does not guarantee N trading bars; inspect <code>complete_window</code>.</p>
         <p>Returns realized forward performance for every visible stock in the saved portfolio from the same <code>asof</code> anchor. This is intended for labeling historical training examples after fetching technicals from <code>/api/portfolio/state</code>. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameters include <code>timeframe</code>, <code>hidets</code>, <code>include_hidden=1</code>, <code>side</code>, <code>stoploss</code>, and <code>takeprofit</code>. For <code>1Day</code>, <code>days</code> means future trading bars rather than calendar days.</p>
         <h3>Historical coverage and daily preparation</h3>
         <p>HTTP success and <code>ok=true</code> report request execution, not complete history. State responses expose <code>requested_asof</code> and <code>data_quality.historical_coverage</code> separately for indicators and price. Future labels expose the same diagnostics for their anchor, plus <code>complete_future_window</code>. Each coverage object reports the actual bar timestamp, lag in seconds, and status: <code>within_tolerance</code> (at most seven calendar days), <code>stale_trailing</code> (older), <code>anchor_after_cutoff</code>, or <code>not_evaluated</code> (no historical cutoff). This is a conservative age warning, not a trading-calendar or interior-gap audit: <code>completeness_verified</code> is false. Weekends and holidays do not require exact-date bars. Batch summaries list stale symbols and incomplete label windows; per-symbol errors remain separate.</p>
         <p>Benchmark quality appears under each state's <code>data_quality.benchmark_coverage</code>. Missing or stale benchmarks report <code>benchmark_errors</code>; relative returns are omitted for stale benchmarks or unequal indicator timestamps. For daily training, join by symbol AND indicator/label anchor timestamp, require a complete future window, and inspect coverage. A timed daily state may use an intraday price while its indicators and daily labels use daily bars; joining by symbol alone is insufficient. Preserve timestamps rather than using <code>hidets</code> when pairing.</p>
         <p><code>POST /api/coverage/prepare</code> explicitly prepares daily bars using JSON <code>symbols</code>, <code>start</code>, <code>end</code>, and optional boolean <code>include_benchmarks</code> (default true, adds SPY and QQQ). Use ISO timestamps for precise bounds. Limits: 50 unique symbols including benchmarks and 400 calendar days per request; end must be at or before the delayed present. Select a window containing indicator warmup, the cutoff and future-label horizon; split longer histories into bounded requests. Only gaps in previously verified provider windows are fetched. Completed empty windows cover closures too; recent unfinalized tails may be fetched again. Provider failures are collected per symbol in <code>errors</code>; <code>ok=true</code> does not mean every symbol prepared. Preparation verifies provider responses, not that a provider supplied every trading session. Subsequent analytics reads expose actual anchors and realized horizon counts.</p>
         <pre>curl -s http://127.0.0.1:5000/api/coverage/prepare -H 'Content-Type: application/json' -d '{"symbols":["NVDA"],"start":"2025-11-01T00:00:00Z","end":"2026-10-01T00:00:00Z"}'</pre>
+        <p>For intraday labels, supply <code>timeframe</code> (for example <code>15Min</code>). Intraday preparation is limited to 5 unique symbols including benchmarks and 31 calendar days per request; split larger work into bounded requests. Benchmarks default to excluded for intraday preparation. Daily limits and defaults above are unchanged. Identical preparation coalesces within each worker; separate processes may fetch concurrently.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/portfolio/futurestate?timeframe=1D&asof=2023-09-20&days=20"</code></pre>
 
 <pre><code>{
