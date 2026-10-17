@@ -512,6 +512,97 @@ class HistoricalEventsPostgreSQLTests(unittest.TestCase):
                                 json.dumps(payload, allow_nan=False)
 
 
+class HistoricalCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.bars = _fixture_bars(260)
+        # A Friday before the Labor Day closure; no exact-date bar is required.
+        self.bars["timestamp"] = pd.bdate_range(end="2026-09-04T04:00:00Z", periods=260, normalize=False)
+        self.contexts = {s: {"symbol": s, "symbol_id": i} for i, s in enumerate(("NVDA", "SPY"), 1)}
+        self.repo = Mock()
+        self.repo.fetch_symbol_context.side_effect = self.contexts.get
+        self.repo.fetch_symbol_contexts.return_value = self.contexts
+        self.repo.fetch_bars.return_value = self.bars
+        self.repo.fetch_bars_many.side_effect = lambda ids, *args, **kwargs: {i: self.bars for i in ids}
+        self.repo.fetch_latest_bar.return_value = self.bars.tail(1)
+        self.repo.fetch_future_bars.return_value = self.bars.tail(1).assign(timestamp=pd.Timestamp("2026-09-08T04:00:00Z"))
+        self.service = AnalyticsService(self.repo)
+
+    def test_covered_closure_and_months_old_history_have_distinct_quality(self):
+        for cutoff, stale in (("2026-09-04T23:00:00Z", False), ("2026-09-06T00:00:00Z", False),
+                              ("2026-09-07T23:00:00Z", False), ("2026-11-01T00:00:00Z", True)):
+            with self.subTest(cutoff=cutoff):
+                state = self.service.get_symbol_state("NVDA", "1Day", parse_asof(cutoff), AnalyticsSettings())
+                coverage = state["data_quality"]["historical_coverage"]["indicators"]
+                self.assertEqual(coverage["stale"], stale)
+                self.assertEqual(coverage["requested_asof"], cutoff)
+                self.assertEqual(coverage["actual_bar_timestamp"], "2026-09-04T04:00:00Z")
+                self.assertFalse(coverage["completeness_verified"])
+                self.assertEqual(state, self.service.get_symbol_state("NVDA", "1Day", parse_asof(cutoff), AnalyticsSettings()))
+
+    def test_batch_reports_stale_symbols_and_missing_or_stale_benchmarks(self):
+        batch = self.service.get_batch_state(["NVDA", "MISSING"], "1Day", parse_asof("2026-11-01T00:00:00Z"), AnalyticsSettings())
+        self.assertEqual(batch["data_quality"]["stale_symbols"], ["NVDA"])
+        self.assertEqual([e["symbol"] for e in batch["errors"]], ["MISSING"])
+        self.assertEqual({e["symbol"] for e in batch["benchmark_errors"]}, {"SPY", "QQQ"})
+        self.assertEqual(batch["states"][0]["relative"], {})
+        self.assertEqual(batch["states"][0]["data_quality"]["benchmark_coverage"]["QQQ"]["status"], "missing")
+
+    def test_unaligned_benchmark_does_not_generate_relative_returns(self):
+        older = self.bars.iloc[:-1]
+        self.repo.fetch_bars_many.side_effect = lambda ids, *args, **kwargs: {i: self.bars if i == 1 else older for i in ids}
+        batch = self.service.get_batch_state(["NVDA"], "1Day", parse_asof("2026-09-07T00:00:00Z"), AnalyticsSettings())
+        state = batch["states"][0]
+        self.assertFalse(state["data_quality"]["benchmark_coverage"]["SPY"]["aligned"])
+        self.assertEqual(state["relative"], {})
+
+    def test_historical_feature_label_pairing_exposes_anchor_and_partial_window(self):
+        cutoff = parse_asof("2026-09-07T00:00:00Z")
+        state = self.service.get_symbol_state("NVDA", "1Day", cutoff, AnalyticsSettings())
+        label = self.service.get_future_state("NVDA", "1Day", cutoff, 2)
+        self.assertEqual(state["data_quality"]["indicator_bar_timestamp"], label["anchor_price"]["timestamp"])
+        self.assertEqual(state["requested_asof"], label["requested_asof"])
+        self.assertEqual(state["data_quality"]["historical_coverage"]["indicators"], label["data_quality"]["historical_coverage"])
+        self.assertFalse(label["data_quality"]["complete_future_window"])
+        stale = self.service.get_future_state("NVDA", "1Day", parse_asof("2026-11-01"), 1)
+        self.assertTrue(stale["data_quality"]["historical_coverage"]["stale"])
+
+    def test_recent_intraday_price_does_not_mask_stale_daily_indicators(self):
+        cutoff = parse_asof("2026-10-01T18:00:00Z")
+        self.repo.fetch_latest_bar.return_value = self.bars.tail(1).assign(timestamp=pd.Timestamp(cutoff))
+        state = self.service.get_symbol_state("NVDA", "1Day", cutoff, AnalyticsSettings())
+        coverage = state["data_quality"]["historical_coverage"]
+        self.assertTrue(coverage["indicators"]["stale"])
+        self.assertFalse(coverage["price"]["stale"])
+
+    def test_prepare_bounds_and_per_symbol_errors(self):
+        client = flask_app.test_client()
+        payload = {"symbols": ["nvda", "NVDA"], "start": "2026-01-01T00:00:00Z", "end": "2026-09-08T00:00:00Z"}
+        with patch.object(dashboard, "_prepare_daily_coverage", side_effect=[{"symbol": "NVDA"}, RuntimeError("provider unavailable"), {"symbol": "QQQ"}]) as prepare:
+            response = client.post("/api/coverage/prepare", json=payload)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual([c.args[0] for c in prepare.call_args_list], ["NVDA", "SPY", "QQQ"])
+            self.assertEqual(response.get_json()["errors"], [{"symbol": "SPY", "error": "provider unavailable"}])
+            prepare.reset_mock()
+            for change in ({"symbols": list(map(str, range(51)))}, {"start": "2020-01-01"},
+                           {"end": "2099-01-01"}, {"end": payload["start"]}, {"include_benchmarks": "false"}):
+                with self.subTest(change=change):
+                    self.assertEqual(client.post("/api/coverage/prepare", json={**payload, **change}).status_code, 400)
+            prepare.assert_not_called()
+
+    def test_prepare_fetches_only_gaps_and_reuses_verified_empty_closure(self):
+        start, middle, end = map(parse_asof, ("2026-09-04T00:00:00Z", "2026-09-05T00:00:00Z", "2026-09-08T00:00:00Z"))
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [(middle, end)])), \
+             patch.object(dashboard, "_sync_market_data_window") as sync:
+            result = dashboard._prepare_daily_coverage("NVDA", start, end)
+            sync.assert_called_once_with("NVDA", "1Day", start, middle)
+            self.assertEqual(result["fetched_window_count"], 1)
+        with patch.object(dashboard, "_historical_price_coverage", return_value=(None, None, [(start, middle), (middle, end)])), \
+             patch.object(dashboard, "_sync_market_data_window") as sync:
+            result = dashboard._prepare_daily_coverage("NVDA", start, end)
+            sync.assert_not_called()
+            self.assertEqual(result["fetched_window_count"], 0)
+
+
 class ServiceTests(unittest.TestCase):
     def test_service_builds_state_payload(self) -> None:
         repo = Mock()
@@ -979,7 +1070,8 @@ class ServiceTests(unittest.TestCase):
         service.repository.fetch_symbol_contexts.return_value = {}
         service.get_future_state = Mock(
             side_effect=[
-                {"symbol": "NVDA", "future_state": {"return_at_horizon_pct": 0.05}},
+                {"symbol": "NVDA", "future_state": {"return_at_horizon_pct": 0.05},
+                 "data_quality": {"historical_coverage": {"stale": False}}, "window": {"complete_window": True}},
                 AnalyticsNotFoundError("Symbol 'MSFT' was not found in symbol_metadata."),
             ]
         )

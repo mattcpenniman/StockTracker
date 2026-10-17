@@ -18,7 +18,7 @@ from flask import Flask, Response, jsonify, request
 import matplotlib.pyplot as plt
 
 from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
-from analytics.utils import parse_asof
+from analytics.utils import isoformat_utc, parse_asof
 from live_prices import PriceCache, YahooQuotes
 from database import get_connection
 from market_sync import SyncFlights
@@ -4124,6 +4124,68 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+def _prepare_daily_coverage(symbol: str, start: datetime, end: datetime) -> Dict:
+    """Fetch only unverified gaps; completed empty windows count as coverage."""
+    def prepare():
+        _, _, windows = _historical_price_coverage(symbol, "1Day", start, end)
+        cursor = start
+        fetched = 0
+        for covered_start, covered_end in windows:
+            if covered_end < cursor:
+                continue
+            if covered_start > cursor:
+                _sync_market_data_window(symbol, "1Day", cursor, min(covered_start, end))
+                fetched += 1
+            cursor = max(cursor, covered_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            _sync_market_data_window(symbol, "1Day", cursor, end)
+            fetched += 1
+        return {"symbol": symbol, "fetched_window_count": fetched, "status": "prepared"}
+
+    return _market_sync_flights.run(("daily-coverage", symbol, start, end), prepare)
+
+
+@app.post("/api/coverage/prepare")
+def prepare_analytics_coverage() -> Response:
+    """Explicit, bounded preparation for daily features, labels and benchmarks."""
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ValueError("A JSON object is required.")
+        symbols = payload.get("symbols")
+        if not isinstance(symbols, list) or not symbols or any(not isinstance(s, str) or not s.strip() for s in symbols):
+            raise ValueError("'symbols' must be a non-empty array of symbol strings.")
+        symbols = list(dict.fromkeys(s.strip().upper() for s in symbols))
+        include_benchmarks = payload.get("include_benchmarks", True)
+        if not isinstance(include_benchmarks, bool):
+            raise ValueError("'include_benchmarks' must be a boolean.")
+        if include_benchmarks:
+            symbols = list(dict.fromkeys([*symbols, "SPY", "QQQ"]))
+        if len(symbols) > 50:
+            raise ValueError("At most 50 symbols, including benchmarks, may be prepared per request.")
+        start = parse_asof(payload.get("start"))
+        end = parse_asof(payload.get("end"))
+        if start is None or end is None or not start < end:
+            raise ValueError("'start' and 'end' are required and start must precede end.")
+        if end - start > timedelta(days=400):
+            raise ValueError("Coverage preparation is limited to 400 calendar days per request.")
+        if end > _utcnow() - timedelta(minutes=max(CHART_DELAY_MINUTES, 0)):
+            raise ValueError("'end' must not exceed the delayed present time.")
+        prepared, errors = [], []
+        for symbol in symbols:
+            try:
+                prepared.append(_prepare_daily_coverage(symbol, start, end))
+            except Exception as exc:
+                errors.append({"symbol": symbol, "error": str(exc)})
+        return jsonify({"ok": True, "timeframe": "1Day", "start": isoformat_utc(start),
+                        "end": isoformat_utc(end), "prepared": prepared, "errors": errors,
+                        "count": len(prepared), "requested_symbol_count": len(symbols)})
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
 @app.post("/api/state/batch")
 def get_analytics_batch_state() -> Response:
     payload = request.get_json(silent=True) or {}
@@ -4500,6 +4562,11 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
 
         <h2>GET /api/portfolio/futurestate</h2>
         <p>Returns realized forward performance for every visible stock in the saved portfolio from the same <code>asof</code> anchor. This is intended for labeling historical training examples after fetching technicals from <code>/api/portfolio/state</code>. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameters include <code>timeframe</code>, <code>hidets</code>, <code>include_hidden=1</code>, <code>side</code>, <code>stoploss</code>, and <code>takeprofit</code>. For <code>1Day</code>, <code>days</code> means future trading bars rather than calendar days.</p>
+        <h3>Historical coverage and daily preparation</h3>
+        <p>HTTP success and <code>ok=true</code> report request execution, not complete history. State responses expose <code>requested_asof</code> and <code>data_quality.historical_coverage</code> separately for indicators and price. Future labels expose the same diagnostics for their anchor, plus <code>complete_future_window</code>. Each coverage object reports the actual bar timestamp, lag in seconds, and status: <code>within_tolerance</code> (at most seven calendar days), <code>stale_trailing</code> (older), <code>anchor_after_cutoff</code>, or <code>not_evaluated</code> (no historical cutoff). This is a conservative age warning, not a trading-calendar or interior-gap audit: <code>completeness_verified</code> is false. Weekends and holidays do not require exact-date bars. Batch summaries list stale symbols and incomplete label windows; per-symbol errors remain separate.</p>
+        <p>Benchmark quality appears under each state's <code>data_quality.benchmark_coverage</code>. Missing or stale benchmarks report <code>benchmark_errors</code>; relative returns are omitted for stale benchmarks or unequal indicator timestamps. For daily training, join by symbol AND indicator/label anchor timestamp, require a complete future window, and inspect coverage. A timed daily state may use an intraday price while its indicators and daily labels use daily bars; joining by symbol alone is insufficient. Preserve timestamps rather than using <code>hidets</code> when pairing.</p>
+        <p><code>POST /api/coverage/prepare</code> explicitly prepares daily bars using JSON <code>symbols</code>, <code>start</code>, <code>end</code>, and optional boolean <code>include_benchmarks</code> (default true, adds SPY and QQQ). Use ISO timestamps for precise bounds. Limits: 50 unique symbols including benchmarks and 400 calendar days per request; end must be at or before the delayed present. Select a window containing indicator warmup, the cutoff and future-label horizon; split longer histories into bounded requests. Only gaps in previously verified provider windows are fetched. Completed empty windows cover closures too; recent unfinalized tails may be fetched again. Provider failures are collected per symbol in <code>errors</code>; <code>ok=true</code> does not mean every symbol prepared. Preparation verifies provider responses, not that a provider supplied every trading session. Subsequent analytics reads expose actual anchors and realized horizon counts.</p>
+        <pre>curl -s http://127.0.0.1:5000/api/coverage/prepare -H 'Content-Type: application/json' -d '{"symbols":["NVDA"],"start":"2025-11-01T00:00:00Z","end":"2026-10-01T00:00:00Z"}'</pre>
 <pre><code>curl -s "http://127.0.0.1:5000/api/portfolio/futurestate?timeframe=1D&asof=2023-09-20&days=20"</code></pre>
 
 <pre><code>{

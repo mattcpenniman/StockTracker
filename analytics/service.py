@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from .config import AnalyticsSettings
+from .coverage import historical_coverage
 from .data_access import AnalyticsRepository, BatchReads
 from .indicators import compute_feature_frame, latest_price_payload, sufficiency_flags
 from .regimes import (
@@ -167,6 +168,10 @@ class AnalyticsService:
                 "last_sync_timestamp": context.get("last_synced_at"),
                 "sync_status": context.get("sync_status"),
                 "sync_error": context.get("sync_error"),
+                "historical_coverage": {
+                    "indicators": historical_coverage(asof_dt, latest["timestamp"]),
+                    "price": historical_coverage(asof_dt, anchor_timestamp),
+                },
             }
         )
 
@@ -289,6 +294,7 @@ class AnalyticsService:
         latest_for_serialization = latest.copy()
         latest_for_serialization["timestamp"] = anchor_timestamp
         payload = serialize_state_payload(context["symbol"], timeframe, latest_for_serialization, quality, sections)
+        payload["requested_asof"] = isoformat_utc(asof_dt)
         self._state_cache.set(cache_key, payload)
         return payload
 
@@ -431,6 +437,11 @@ class AnalyticsService:
                 "symbol": context["symbol"],
                 "timeframe": timeframe,
                 "as_of": anchor_timestamp,
+                "requested_asof": isoformat_utc(asof_dt),
+                "data_quality": {
+                    "historical_coverage": historical_coverage(asof_dt, anchor_timestamp),
+                    "complete_future_window": complete_window,
+                },
                 "horizon_days": days,
                 "side": side,
                 "anchor_price": {
@@ -526,10 +537,27 @@ class AnalyticsService:
             except AnalyticsNotFoundError as exc:
                 benchmark_errors.append({"symbol": benchmark, "error": str(exc)})
 
+        for benchmark, state in benchmark_states.items():
+            coverage = state.get("data_quality", {}).get("historical_coverage", {}).get("indicators", {})
+            if coverage.get("stale"):
+                benchmark_errors.append({"symbol": benchmark, "error": "Stale trailing benchmark history at requested asof."})
+
         return_fields = ("r_1", "r_5", "r_20", "r_60")
         for state in states:
             relative = state.setdefault("relative", {})
+            relative_quality = state.setdefault("data_quality", {}).setdefault("benchmark_coverage", {})
             for benchmark, benchmark_state in benchmark_states.items():
+                indicator_timestamp = state.get("data_quality", {}).get("indicator_bar_timestamp")
+                benchmark_timestamp = benchmark_state.get("data_quality", {}).get("indicator_bar_timestamp")
+                aligned = indicator_timestamp == benchmark_timestamp
+                coverage = benchmark_state.get("data_quality", {}).get("historical_coverage", {}).get("indicators", {})
+                relative_quality[benchmark] = {
+                    "indicator_bar_timestamp": benchmark_timestamp,
+                    "aligned": aligned,
+                    "historical_coverage": coverage,
+                }
+                if not aligned or coverage.get("stale"):
+                    continue
                 benchmark_returns = benchmark_state.get("returns", {}) if isinstance(benchmark_state.get("returns"), dict) else {}
                 state_returns = state.get("returns", {}) if isinstance(state.get("returns"), dict) else {}
                 for field in return_fields:
@@ -537,6 +565,9 @@ class AnalyticsService:
                     benchmark_return = benchmark_returns.get(field)
                     if state_return is not None and benchmark_return is not None and pd.notna(state_return) and pd.notna(benchmark_return):
                         relative[f"rel_return_{benchmark.lower()}_{field.removeprefix('r_')}"] = float(state_return) - float(benchmark_return)
+
+            for error in benchmark_errors:
+                relative_quality.setdefault(error["symbol"], {"status": "missing", "error": error["error"]})
 
         return list(benchmark_states.keys()), benchmark_errors
 
@@ -574,6 +605,12 @@ class AnalyticsService:
                 "states": states,
                 "errors": errors,
                 "benchmark_errors": benchmark_errors,
+                "data_quality": {
+                    "stale_symbols": [state["symbol"] for state in states if any(
+                        item.get("stale") for item in state.get("data_quality", {}).get("historical_coverage", {}).values()
+                    )],
+                    "completeness_verified": False,
+                },
             }
         )
 
@@ -619,6 +656,11 @@ class AnalyticsService:
                 "side": side,
                 "future_states": future_states,
                 "errors": errors,
+                "data_quality": {
+                    "stale_symbols": [state["symbol"] for state in future_states if state["data_quality"]["historical_coverage"]["stale"]],
+                    "incomplete_window_symbols": [state["symbol"] for state in future_states if not state["window"]["complete_window"]],
+                    "completeness_verified": False,
+                },
             }
         )
 
