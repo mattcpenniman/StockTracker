@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import Any
 
 import pandas as pd
 
 from .config import AnalyticsSettings
-from .data_access import AnalyticsRepository
+from .data_access import AnalyticsRepository, BatchReads
 from .indicators import compute_feature_frame, latest_price_payload, sufficiency_flags
 from .regimes import (
     classify_momentum_regime,
@@ -36,6 +36,9 @@ class _StateCache:
         self._data.move_to_end(key)
         return self._data[key]
 
+    def __contains__(self, key: tuple) -> bool:
+        return key in self._data
+
     def set(self, key: tuple, value: dict[str, Any]) -> None:
         self._data[key] = value
         self._data.move_to_end(key)
@@ -58,6 +61,12 @@ class AnalyticsService:
 
     def get_symbol_metadata(self, symbol: str) -> dict[str, Any]:
         return serialize_symbol_metadata(self._context_for_symbol(symbol))
+
+    def _batch_service(self, symbols, contexts=None):
+        scoped = copy(self)
+        contexts = self.repository.fetch_symbol_contexts(symbols) if contexts is None else contexts
+        scoped.repository = BatchReads(self.repository, contexts)
+        return scoped
 
     def _state_cache_key(
         self,
@@ -85,6 +94,13 @@ class AnalyticsService:
         if timestamp.hour == 0 and timestamp.minute == 0 and timestamp.second == 0 and timestamp.microsecond == 0:
             return requested_timeframe
         return "15Min"
+
+    def _future_cache_key(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side):
+        return (
+            context["symbol"], timeframe, self._preferred_price_timeframe(timeframe, asof_dt),
+            isoformat_utc(asof_dt), days, stop_loss_pct, take_profit_pct, side,
+            isoformat_utc(context.get("last_bar_synced_at")),
+        )
 
     def _load_feature_frame(
         self,
@@ -329,17 +345,7 @@ class AnalyticsService:
 
         context = self._context_for_symbol(symbol)
         price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
-        cache_key = (
-            context["symbol"],
-            timeframe,
-            price_timeframe,
-            isoformat_utc(asof_dt),
-            days,
-            stop_loss_pct,
-            take_profit_pct,
-            side,
-            isoformat_utc(context.get("last_bar_synced_at")),
-        )
+        cache_key = self._future_cache_key(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side)
         cached = self._future_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -537,18 +543,25 @@ class AnalyticsService:
         timeframe: str,
         asof_dt,
         settings: AnalyticsSettings,
+        *,
+        contexts=None,
     ) -> dict[str, Any]:
+        scoped = self._batch_service([*symbols, "SPY", "QQQ"], contexts)
+        scoped.repository.ids = list(dict.fromkeys(
+            context["symbol_id"] for context in scoped.repository.contexts.values()
+            if self._state_cache_key(context, timeframe, isoformat_utc(asof_dt), settings) not in self._state_cache
+        ))
         states: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
 
         for symbol in symbols:
             try:
-                states.append(deepcopy(self.get_symbol_state(symbol, timeframe, asof_dt, settings)))
+                states.append(deepcopy(scoped.get_symbol_state(symbol, timeframe, asof_dt, settings)))
             except AnalyticsNotFoundError as exc:
                 errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
 
         self._add_portfolio_ranks(states)
-        benchmarks, benchmark_errors = self._add_benchmark_relative_returns(states, timeframe, asof_dt, settings)
+        benchmarks, benchmark_errors = scoped._add_benchmark_relative_returns(states, timeframe, asof_dt, settings)
 
         return clean_json_value(
             {
@@ -571,13 +584,18 @@ class AnalyticsService:
         take_profit_pct: float | None = None,
         side: str = "long",
     ) -> dict[str, Any]:
+        scoped = self._batch_service(symbols)
+        scoped.repository.ids = list(dict.fromkeys(
+            context["symbol_id"] for context in scoped.repository.contexts.values()
+            if self._future_cache_key(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side) not in self._future_cache
+        ))
         future_states: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
 
         for symbol in symbols:
             try:
                 future_states.append(
-                    self.get_future_state(
+                    scoped.get_future_state(
                         symbol,
                         timeframe,
                         asof_dt,

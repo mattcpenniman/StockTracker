@@ -369,6 +369,8 @@ class ServiceTests(unittest.TestCase):
             4: bars_with_step(1.5),
         }
         repo.fetch_symbol_context.side_effect = lambda symbol: contexts.get(str(symbol).upper())
+        repo.fetch_symbol_contexts.return_value = contexts
+        repo.fetch_bars_many.side_effect = lambda ids, *args, **kwargs: {sid: bars_by_id[sid] for sid in ids}
         repo.fetch_bars.side_effect = lambda symbol_id, timeframe, asof=None, start=None: bars_by_id[symbol_id]
         service = AnalyticsService(repository=repo)
 
@@ -750,6 +752,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_service_builds_batch_future_state_payload(self) -> None:
         service = AnalyticsService(repository=Mock())
+        service.repository.fetch_symbol_contexts.return_value = {}
         service.get_future_state = Mock(
             side_effect=[
                 {"symbol": "NVDA", "future_state": {"return_at_horizon_pct": 0.05}},
