@@ -613,6 +613,48 @@ The event feed returns timestamped, deterministic events such as:
 - Batch requests currently iterate symbols in-process; this is fine for a manageable watchlist-sized universe
 - Cached analytics responses are in-memory per process and keyed by symbol, timeframe, `asof`, and last bar sync time
 
+## Historical analytics coverage (VEC-798)
+
+Historical state and future-label responses report `requested_asof` separately
+from their actual anchors. Inspect `data_quality.historical_coverage`: state
+reports daily indicators and price separately, while labels report their anchor.
+Each includes `actual_bar_timestamp`, `lag_seconds`, `stale`, and `status`.
+`stale_trailing` means more than seven **calendar** days behind the cutoff;
+`within_tolerance` is an age check, not proof of complete history. No exact-date
+bar is required for weekends or holidays. `completeness_verified` remains false:
+this check does not audit interior gaps or use an exchange calendar. Requests
+without an `asof` have `not_evaluated` historical coverage.
+
+Batch quality summaries list `stale_symbols`; label batches also list
+`incomplete_window_symbols`. Check these along with per-symbol `errors` and
+`benchmark_errors` even when HTTP status is 200 and `ok=true`. Per-state
+`benchmark_coverage` reports alignment and benchmark age. Stale or unaligned
+benchmarks do not produce relative-return features.
+
+Prepare a targeted daily window before generating a training dataset:
+
+```bash
+curl -s http://127.0.0.1:5000/api/coverage/prepare \
+  -H 'Content-Type: application/json' \
+  -d '{"symbols":["NVDA","AAPL"],"start":"2025-11-01T00:00:00Z","end":"2026-10-01T00:00:00Z"}'
+```
+
+This adds SPY and QQQ by default (`include_benchmarks: false` disables this),
+deduplicates symbols, and fetches daily gaps in recorded provider coverage.
+Limits are 50 unique symbols including benchmarks and 400 calendar days per
+request, ending no later than the delayed present. Choose bounds that include
+indicator warmup and the future-label horizon; split longer histories into
+bounded requests. Verified empty closure windows are reused. Unfinalized recent
+tails may be fetched again. The response includes `prepared`, `errors`, and
+per-symbol `fetched_window_count`; provider failures do not abort other symbols.
+Provider coverage records verify a completed response, not session completeness.
+
+For daily feature/label pairing, preserve timestamps and join on **symbol and
+daily indicator/label anchor timestamp**, checking age and complete future
+windows. Timed daily states can have an intraday price anchor, so joining on
+symbol or top-level `as_of` alone is insufficient. Full endpoint details are on
+`/api-docs`.
+
 ## Dashboard daily snapshot benchmark (VEC-781)
 
 `GET /data` shares one chronological daily-close snapshot across trend, RSI,
