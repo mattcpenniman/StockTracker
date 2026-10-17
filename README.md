@@ -592,11 +592,45 @@ The event feed returns timestamped, deterministic events such as:
 - `days` is required and defines the number of future bars to evaluate; for `1Day` this means trading days, not calendar days
 - The anchor and future window both use the requested timeframe. A date-only `asof` means end-of-day UTC; a timed `asof` is an exact cutoff. Daily requests select the latest stored daily bar at or before that cutoff and the next N daily bars, never fifteen-minute bars. A midnight cutoff can select an earlier session than a date-only cutoff.
 - Request `timeframe=15Min` explicitly for fifteen-minute anchors and horizons. `anchor_price.source_timeframe`, `window.source_timeframe`, and `future_state.source_timeframe` report the requested bar series. Unlike technical-state price snapshots, daily future labels do not use intraday price anchors.
+
 - Partial windows return the available bars with `complete_window=false` and `target_end_timestamp=null`; no future bars produces a per-symbol error (collected in `errors` for portfolio requests).
 - `max_price` uses the maximum future `high` inside the window
 - `min_price` uses the minimum future `low` inside the window
 - `price_at_horizon` uses the close of the Nth future bar in the realized window
 - all `*_pct` values are relative to the anchor close at `asof`
+
+### Future-window preparation
+
+Single-symbol intraday future-state reads check persisted successful provider
+coverage before fetching, reuse completed windows (including empty market
+closures), and fetch only missing ranges. Required provider failures are returned
+as errors. Identical concurrent preparation shares one operation within a worker.
+The search envelope remains seven calendar days before `asof` through `days`
+calendar days after it, capped at the delayed present. Automatic single-symbol
+preparation is limited to a 31-day envelope; larger uncovered envelopes require
+explicit preparation in smaller windows. This search is not a guarantee of N trading bars;
+inspect `window.complete_window` and `future_bar_count`.
+
+Portfolio future-state reads perform **no provider I/O**. For explicit intraday
+requests, symbols without verified coverage return per-symbol errors identifying
+the required timeframe and bounds. Prepare these ranges explicitly, then retry:
+
+```bash
+curl -s http://127.0.0.1:5000/api/coverage/prepare \
+  -H 'Content-Type: application/json' \
+  -d '{"symbols":["NVDA"],"timeframe":"15Min","start":"2023-09-13T15:00:00Z","end":"2023-10-10T15:00:00Z"}'
+```
+
+Intraday preparation accepts at most **5 unique symbols and 31 calendar days**
+per request. Split larger work into bounded requests; do not fan out automatic
+preparation from a portfolio read. `include_benchmarks` defaults to false for
+intraday preparation and true for daily preparation. Daily preparation retains
+its 50-symbol/400-day limits. Daily future-state reads use stored daily bars;
+missing daily data on the single-symbol route retains its daily backfill retry.
+Coverage is recorded only after successful fetch/upsert and excludes unfinished
+delayed bars, which must be rechecked. A portfolio requiring such a tail reports
+preparation required until the requested tail is finalized; no stale result is
+silently substituted. Existing bars alone do not certify gap-free coverage.
 
 ### Assumptions
 
