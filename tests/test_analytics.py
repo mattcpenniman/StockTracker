@@ -31,6 +31,109 @@ from analytics.dashboard_benchmark import baseline_namespace, dashboard_fixture,
 from analytics.events_benchmark import baseline_generate_events, event_fixture
 
 
+class FutureLabelHorizonTests(unittest.TestCase):
+    def setUp(self):
+        # Competing daily and intraday data: choosing the wrong series changes
+        # both the label values and the realized end date.
+        self.frames = {}
+        for timeframe, timestamps in (
+            ("1Day", pd.bdate_range("2023-09-19T04:00:00Z", periods=25, normalize=False)),
+            ("15Min", pd.date_range("2023-09-20T12:00:00Z", periods=100, freq="15min")),
+        ):
+            closes = np.arange(len(timestamps), dtype=float) + (100 if timeframe == "1Day" else 400)
+            self.frames[timeframe] = pd.DataFrame({
+                "timestamp": timestamps, "open": closes, "high": closes + 2,
+                "low": closes - 2, "close": closes, "volume": 1000.0,
+            })
+        self.repo = Mock()
+        context = {"symbol": "NVDA", "symbol_id": 1}
+        self.repo.fetch_symbol_context.return_value = context
+        self.repo.fetch_symbol_contexts.return_value = {"NVDA": context}
+
+        def read(timeframe, asof=None, after=None, limit=None, latest=False):
+            bars = self.frames[timeframe]
+            if asof is not None:
+                bars = bars[bars.timestamp <= asof]
+            if after is not None:
+                bars = bars[bars.timestamp > after]
+            return bars.tail(1) if latest else bars.head(limit)
+
+        self.repo.fetch_latest_bar.side_effect = lambda sid, tf, asof: read(tf, asof, latest=True)
+        self.repo.fetch_future_bars.side_effect = lambda sid, tf, after, limit: read(tf, after=after, limit=limit)
+        self.repo.fetch_bars_many.side_effect = lambda ids, tf, asof=None, latest=False, after=None, limit=None: {
+            sid: read(tf, asof, after[sid] if after else None, limit, latest) for sid in ids
+        }
+        self.service = AnalyticsService(self.repo)
+
+    def test_daily_responses_count_twenty_daily_bars_for_date_and_timed_cutoffs(self):
+        for asof, anchor, end, close in (
+            ("2023-09-20", "2023-09-20T04:00:00Z", "2023-10-18T04:00:00Z", 121),
+            ("2023-09-20T15:00:00Z", "2023-09-20T04:00:00Z", "2023-10-18T04:00:00Z", 121),
+            ("2023-09-20T11:00:00-04:00", "2023-09-20T04:00:00Z", "2023-10-18T04:00:00Z", 121),
+            ("2023-09-20T00:00:00Z", "2023-09-19T04:00:00Z", "2023-10-17T04:00:00Z", 120),
+        ):
+            for portfolio in (False, True):
+                with self.subTest(asof=asof, portfolio=portfolio), \
+                     patch.object(dashboard, "analytics_service", self.service), \
+                     patch.object(dashboard, "_portfolio_symbols", return_value=["NVDA", "MISSING"]), \
+                     patch.object(dashboard, "_sync_market_data_window") as sync, \
+                     flask_app.test_client() as client:
+                    path = "/api/portfolio/futurestate" if portfolio else "/api/futurestate/NVDA"
+                    response = client.get(path, query_string={"timeframe": "1D", "asof": asof, "days": 20})
+                    self.assertEqual(response.status_code, 200, response.get_json())
+                    payload = response.get_json()
+                    if portfolio:
+                        self.assertEqual(payload["count"], 1)
+                        self.assertEqual(payload["errors"][0]["symbol"], "MISSING")
+                        payload = payload["future_states"][0]
+                    self.assertEqual(payload["as_of"], anchor)
+                    for section in ("anchor_price", "window", "future_state"):
+                        self.assertEqual(payload[section]["source_timeframe"], "1Day")
+                    self.assertEqual(payload["window"]["future_bar_count"], 20)
+                    self.assertTrue(payload["window"]["complete_window"])
+                    self.assertEqual(payload["window"]["realized_end_timestamp"], end)
+                    self.assertEqual(payload["window"]["target_end_timestamp"], end)
+                    self.assertEqual(payload["future_state"]["price_at_horizon"], close)
+                    self.assertEqual(payload["future_state"]["max_price"], close + 2)
+                    sync.assert_not_called()
+
+    def test_daily_partial_window_and_no_future_bars(self):
+        partial = self.service.get_future_state("NVDA", "1Day", parse_asof("2023-10-19"), 20)
+        self.assertEqual(partial["window"]["future_bar_count"], 2)
+        self.assertFalse(partial["window"]["complete_window"])
+        self.assertIsNone(partial["window"]["target_end_timestamp"])
+        self.assertEqual(partial["window"]["realized_end_timestamp"], "2023-10-23T04:00:00Z")
+        with self.assertRaisesRegex(AnalyticsNotFoundError, "No future bars.*1Day"):
+            self.service.get_future_state("NVDA", "1Day", parse_asof("2023-10-23"), 20)
+
+    def test_explicit_intraday_response_keeps_intraday_anchor_window_and_sync(self):
+        with patch.object(dashboard, "analytics_service", self.service), \
+             patch.object(dashboard, "_sync_market_data_window") as sync, \
+             flask_app.test_client() as client:
+            response = client.get("/api/futurestate/NVDA/15Min?asof=2023-09-20T15:00:00Z&days=20")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        for section in ("anchor_price", "window", "future_state"):
+            self.assertEqual(payload[section]["source_timeframe"], "15Min")
+        self.assertEqual(payload["anchor_price"]["timestamp"], "2023-09-20T15:00:00Z")
+        self.assertEqual(payload["window"]["future_bar_count"], 20)
+        self.assertEqual(payload["window"]["realized_end_timestamp"], "2023-09-20T20:00:00Z")
+        self.assertEqual(sync.call_args.args, ("NVDA", "15Min"))
+
+    def test_daily_thresholds_keep_side_and_first_hit_order(self):
+        for side, first, stop_date, profit_date in (
+            ("long", "take_profit", None, "2023-09-26T04:00:00Z"),
+            ("short", "stop_loss", "2023-09-26T04:00:00Z", None),
+        ):
+            with self.subTest(side=side):
+                payload = self.service.get_future_state("NVDA", "1Day", parse_asof("2023-09-20"), 20,
+                                                        stop_loss_pct=0.05, take_profit_pct=0.05, side=side)
+                state = payload["future_state"]
+                self.assertEqual(state["first_threshold_hit"], first)
+                self.assertEqual(state["stop_loss_hit_timestamp"], stop_date)
+                self.assertEqual(state["take_profit_hit_timestamp"], profit_date)
+
+
 class DashboardSnapshotTests(unittest.TestCase):
     def test_snapshot_is_bounded_chronological_and_preserves_missing_symbols(self):
         conn = MagicMock()
@@ -662,7 +765,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["future_state"]["price_at_horizon_timestamp"], "2023-02-06T00:00:00Z")
         self.assertEqual(payload["window"]["target_end_timestamp"], "2023-02-06T00:00:00Z")
 
-    def test_future_state_daily_request_with_intraday_asof_uses_15min_bars(self) -> None:
+    def test_future_state_explicit_intraday_request_uses_15min_bars(self) -> None:
         repo = Mock()
         repo.fetch_symbol_context.return_value = {
             "symbol_id": 1,
@@ -718,12 +821,12 @@ class ServiceTests(unittest.TestCase):
 
         payload = service.get_future_state(
             "NVDA",
-            "1Day",
+            "15Min",
             pd.Timestamp("2023-09-17T12:15:00Z"),
             2,
         )
 
-        self.assertEqual(payload["timeframe"], "1Day")
+        self.assertEqual(payload["timeframe"], "15Min")
         self.assertEqual(payload["anchor_price"]["close"], 400.0)
         self.assertEqual(payload["anchor_price"]["timestamp"], "2023-09-17T12:15:00Z")
         self.assertEqual(payload["anchor_price"]["source_timeframe"], "15Min")
@@ -787,7 +890,7 @@ class ServiceTests(unittest.TestCase):
 
         payload = service.get_future_state(
             "NVDA",
-            "1Day",
+            "15Min",
             pd.Timestamp("2023-09-17T12:15:00Z"),
             3,
             stop_loss_pct=0.05,
@@ -854,7 +957,7 @@ class ServiceTests(unittest.TestCase):
 
         payload = service.get_future_state(
             "NVDA",
-            "1Day",
+            "15Min",
             pd.Timestamp("2023-09-17T12:15:00Z"),
             3,
             stop_loss_pct=0.05,

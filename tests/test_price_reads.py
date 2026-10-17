@@ -94,6 +94,38 @@ class PostgreSQLPriceParityTests(unittest.TestCase):
                             self.assert_parity("get_future_state", "BENCH", timeframe, parse_asof(asof), days,
                                                stop_loss_pct=0.02, take_profit_pct=0.02, side=side)
 
+    def test_daily_endpoint_horizon_with_real_repository_and_intraday_competition(self):
+        import app as dashboard
+
+        # The fixture has both daily history and intraday bars on January 1.
+        # Assert independent expected dates, rather than only before/after parity.
+        for asof in ("2020-01-01", "2020-01-01T04:15:00Z", "2020-01-01T00:00:00Z"):
+            for portfolio in (False, True):
+                for side in ("long", "short"):
+                    with self.subTest(asof=asof, portfolio=portfolio, side=side), \
+                         patch.object(dashboard, "analytics_service", self.after), \
+                         patch.object(dashboard, "_portfolio_symbols", return_value=["BENCH", "MISSING"]), \
+                         patch.object(dashboard, "_sync_market_data_window") as sync, \
+                         dashboard.app.test_client() as client:
+                        path = "/api/portfolio/futurestate" if portfolio else "/api/futurestate/BENCH"
+                        response = client.get(path, query_string={"timeframe": "1D", "asof": asof,
+                                                                 "days": 20, "side": side,
+                                                                 "stoploss": 0.02, "takeprofit": 0.02})
+                        self.assertEqual(response.status_code, 200, response.get_json())
+                        payload = response.get_json()
+                        if portfolio:
+                            self.assertEqual(payload["count"], 1)
+                            self.assertEqual(payload["errors"][0]["symbol"], "MISSING")
+                            payload = payload["future_states"][0]
+                        self.assertEqual(payload["as_of"], "2020-01-01T00:00:00Z")
+                        self.assertEqual(payload["anchor_price"]["source_timeframe"], "1Day")
+                        self.assertEqual(payload["window"]["source_timeframe"], "1Day")
+                        self.assertEqual(payload["future_state"]["source_timeframe"], "1Day")
+                        self.assertEqual(payload["window"]["future_bar_count"], 20)
+                        self.assertTrue(payload["window"]["complete_window"])
+                        self.assertEqual(payload["window"]["realized_end_timestamp"], "2020-01-29T00:00:00Z")
+                        sync.assert_not_called()
+
     def test_chronological_window_excludes_anchor_and_later_extremes(self):
         anchor = parse_asof("2020-01-03")  # Friday; next daily bar is Monday.
         window = self.repo.fetch_future_bars(self.symbol_id, "1Day", anchor, 2)

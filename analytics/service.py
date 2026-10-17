@@ -97,7 +97,7 @@ class AnalyticsService:
 
     def _future_cache_key(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side):
         return (
-            context["symbol"], timeframe, self._preferred_price_timeframe(timeframe, asof_dt),
+            context["symbol"], timeframe,
             isoformat_utc(asof_dt), days, stop_loss_pct, take_profit_pct, side,
             isoformat_utc(context.get("last_bar_synced_at")),
         )
@@ -344,7 +344,10 @@ class AnalyticsService:
             raise ValueError("'side' must be either 'long' or 'short'.")
 
         context = self._context_for_symbol(symbol)
-        price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
+        # Labels use one consistent bar series for the anchor and horizon.
+        # State price snapshots may prefer intraday resolution, but that must
+        # never turn a requested daily label into N fifteen-minute bars.
+        price_timeframe = timeframe
         cache_key = self._future_cache_key(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side)
         cached = self._future_cache.get(cache_key)
         if cached is not None:
