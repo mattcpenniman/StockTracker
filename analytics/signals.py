@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .config import AnalyticsSettings
@@ -57,7 +58,6 @@ def generate_events(df: pd.DataFrame, settings: AnalyticsSettings, event_limit: 
     working = compute_signal_columns(df, settings)
     close = working["close"]
 
-    event_rows: list[dict[str, Any]] = []
     timestamp_col = working["timestamp"]
 
     price_crosses = {
@@ -86,109 +86,50 @@ def generate_events(df: pd.DataFrame, settings: AnalyticsSettings, event_limit: 
         "new_low_55": working["low"] < working["prior_low_55"],
     }
 
-    for idx in working.index:
-        timestamp = timestamp_col.iloc[idx]
-        if pd.isna(timestamp):
-            continue
-
-        row = working.iloc[idx]
-        if bool(row.get("is_breakout")):
-            event_rows.append(
-                {
-                    "event_type": "breakout",
-                    "timestamp": timestamp,
-                    "value": row["close"],
-                    "reference_level": row["breakout_level"],
-                    "strength": row["breakout_strength"],
-                    "confirmed_by_volume": bool(row["volume_ratio_20"] >= settings.volume_multiple),
-                }
-            )
-        if bool(row.get("is_breakdown")):
-            event_rows.append(
-                {
-                    "event_type": "breakdown",
-                    "timestamp": timestamp,
-                    "value": row["close"],
-                    "reference_level": row["breakdown_level"],
-                    "strength": row["breakdown_strength"],
-                    "confirmed_by_volume": bool(row["volume_ratio_20"] >= settings.volume_multiple),
-                }
-            )
-
-        for event_type, mask in price_crosses.items():
-            if bool(mask.iloc[idx]):
-                event_rows.append(
-                    {
-                        "event_type": event_type,
-                        "timestamp": timestamp,
-                        "value": row["close"],
-                        "reference_level": row[event_type.split("_")[-1].replace("sma", "sma_")],
-                    }
-                )
-
-        for event_type, mask in macd_crosses.items():
-            if bool(mask.iloc[idx]):
-                event_rows.append(
-                    {
-                        "event_type": event_type,
-                        "timestamp": timestamp,
-                        "value": row["macd"],
-                        "reference_level": row["macd_signal"],
-                    }
-                )
-
-        for event_type, mask in rsi_events.items():
-            if bool(mask.iloc[idx]):
-                event_rows.append(
-                    {
-                        "event_type": event_type,
-                        "timestamp": timestamp,
-                        "value": row["rsi_14"],
-                    }
-                )
-
-        for event_type, mask in new_extrema.items():
-            if bool(mask.iloc[idx]):
-                ref_key = "prior_high_20"
-                if event_type == "new_low_20":
-                    ref_key = "prior_low_20"
-                elif event_type == "new_high_55":
-                    ref_key = "prior_high_55"
-                elif event_type == "new_low_55":
-                    ref_key = "prior_low_55"
-                event_rows.append(
-                    {
-                        "event_type": event_type,
-                        "timestamp": timestamp,
-                        "value": row["high"] if "high" in event_type else row["low"],
-                        "reference_level": row[ref_key],
-                    }
-                )
-
-        if bool(row.get("volume_spike")):
-            event_rows.append(
-                {
-                    "event_type": "volume_spike",
-                    "timestamp": timestamp,
-                    "value": row["volume"],
-                    "reference_level": row["avg_volume_20"],
-                    "strength": row["volume_zscore"],
-                }
-            )
-        if bool(row.get("volatility_spike")):
-            event_rows.append(
-                {
-                    "event_type": "volatility_spike",
-                    "timestamp": timestamp,
-                    "value": row["realized_vol_20"],
-                    "reference_level": row["volatility_baseline"],
-                    "strength": row["volatility_ratio"],
-                }
-            )
-
-    event_rows.sort(key=lambda item: item["timestamp"], reverse=True)
-    if event_limit is not None:
-        event_rows = event_rows[: max(1, event_limit)]
+    # Spec order is the historical append order, including ties within a bar.
+    specs = [
+        ("breakout", "close", "breakout_level", "breakout_strength"),
+        ("breakdown", "close", "breakdown_level", "breakdown_strength"),
+        *((name, "close", name.split("_")[-1].replace("sma", "sma_"), None) for name in price_crosses),
+        *((name, "macd", "macd_signal", None) for name in macd_crosses),
+        *((name, "rsi_14", None, None) for name in rsi_events),
+        *((name, "high" if "high" in name else "low", name.replace("new_", "prior_"), None) for name in new_extrema),
+        ("volume_spike", "volume", "avg_volume_20", "volume_zscore"),
+        ("volatility_spike", "realized_vol_20", "volatility_baseline", "volatility_ratio"),
+    ]
+    masks = np.column_stack([
+        working["is_breakout"], working["is_breakdown"],
+        *price_crosses.values(), *macd_crosses.values(), *rsi_events.values(),
+        *new_extrema.values(), working["volume_spike"], working["volatility_spike"],
+    ])
+    candidates = np.flatnonzero(masks.any(axis=1) & timestamp_col.notna().to_numpy())
+    if not len(candidates):
+        return []
+    # Stable descending timestamp order also preserves original row order across
+    # duplicate timestamps. Do not reverse rows: that would reverse these ties.
+    order = timestamp_col.iloc[candidates].reset_index(drop=True).sort_values(
+        ascending=False, kind="stable",
+    ).index.to_numpy()
+    columns = {key: working[key].to_numpy(copy=False) for spec in specs for key in spec[1:] if key is not None}
+    timestamps = timestamp_col.array
+    volume_confirmed = (working["volume_ratio_20"] >= settings.volume_multiple).to_numpy()
+    limit = None if event_limit is None else max(1, event_limit)
+    event_rows: list[dict[str, Any]] = []
+    for idx in candidates[order]:
+        timestamp = timestamps[idx]
+        for event_idx in np.flatnonzero(masks[idx]):
+            event_type, value, reference, strength = specs[event_idx]
+            event = {"event_type": event_type, "timestamp": timestamp, "value": columns[value][idx]}
+            if reference is not None:
+                event["reference_level"] = columns[reference][idx]
+            if strength is not None:
+                event["strength"] = columns[strength][idx]
+            if event_type in {"breakout", "breakdown"}:
+                event["confirmed_by_volume"] = bool(volume_confirmed[idx])
+            event_rows.append(event)
+            # Limit before materialization: a partial final bar keeps spec order.
+            if limit is not None and len(event_rows) >= limit:
+                return event_rows
     return event_rows
 
 

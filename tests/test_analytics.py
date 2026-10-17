@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from analytics.signals import compute_signal_columns, generate_events
 from analytics.utils import parse_asof
 import app as dashboard
 from analytics.dashboard_benchmark import baseline_namespace, dashboard_fixture, variants
+from analytics.events_benchmark import baseline_generate_events, event_fixture
 
 
 class DashboardSnapshotTests(unittest.TestCase):
@@ -250,6 +252,51 @@ class SignalTests(unittest.TestCase):
         event_types = [event["event_type"] for event in events]
         self.assertIn("breakdown", event_types)
         self.assertIn("volume_spike", event_types)
+
+    def test_exact_serialized_event_parity(self) -> None:
+        baseline = baseline_generate_events()
+        rng = np.random.default_rng(786)
+        frames = [event_fixture(1000, density) for density in ("sparse", "dense")]
+        for count in (0, 1, 14, 20, 26, 55, 200, 252, 500):
+            bars = _fixture_bars(count)
+            bars["close"] = 100 * np.exp(np.cumsum(rng.normal(0, 0.03, count)))
+            bars["high"] = bars["close"] + 1
+            bars["low"] = bars["close"] - 1
+            bars["volume"] = rng.integers(0, 10000, count).astype(float)
+            frames.append(compute_feature_frame(bars, "1Day", self.settings))
+        irregular = frames[1].iloc[:30].copy()
+        irregular.loc[0:2, "timestamp"] = pd.NaT
+        irregular.loc[4:6, "timestamp"] = irregular.loc[3, "timestamp"]
+        irregular.loc[10, "timestamp"] = irregular.loc[20, "timestamp"]
+        irregular.loc[12, ["breakout_strength", "volume_zscore"]] = np.nan
+        frames.append(irregular)
+        missing_timestamps = frames[1].iloc[:10].copy()
+        missing_timestamps["timestamp"] = pd.NaT
+        frames.append(missing_timestamps)
+        for frame_idx, features in enumerate(frames):
+            for confirmation in (False, True):
+                settings = AnalyticsSettings(volume_confirmation=confirmation, buffer_pct=0.0)
+                expected = serialize_events("BENCH", "1Day", baseline(features, settings))
+                for limit in (None, -5, 0, 1, 2, 7, 18, 100, 10000):
+                    with self.subTest(frame=frame_idx, confirmation=confirmation, limit=limit):
+                        limited = dict(expected)
+                        if limit is not None:
+                            limited["events"] = expected["events"][:max(1, limit)]
+                        actual = serialize_events("BENCH", "1Day", generate_events(features, settings, limit))
+                        self.assertEqual(json.dumps(actual, sort_keys=True), json.dumps(limited, sort_keys=True))
+
+    def test_simultaneous_event_ties_keep_original_bar_and_event_order(self) -> None:
+        features = event_fixture(3, "dense")
+        features["timestamp"] = features.loc[0, "timestamp"]
+        events = generate_events(features, self.settings)
+        self.assertEqual([event["event_type"] for event in events[:5]], [
+            "breakdown", "new_low_20", "new_low_55", "volume_spike", "volatility_spike",
+        ])
+        self.assertEqual([event["event_type"] for event in events[5:15]], [
+            "breakout", "price_crosses_above_sma20", "price_crosses_above_sma50",
+            "price_crosses_above_sma200", "macd_bullish_cross", "rsi_enters_overbought",
+            "new_high_20", "new_high_55", "volume_spike", "volatility_spike",
+        ])
 
 
 class RegimeTests(unittest.TestCase):
