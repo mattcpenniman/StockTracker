@@ -365,34 +365,45 @@ def _read_df() -> pd.DataFrame:
     return df
 
 
-def _latest_bar_times(symbols: List[str], timeframe: str = "1Day") -> Dict[str, str | None]:
-    out: Dict[str, str | None] = {str(symbol).upper(): None for symbol in symbols}
-    if not symbols:
-        return out
+def _daily_bar_snapshot(symbols: List[str]) -> Tuple[Dict[str, List[float]], Dict[str, str | None]]:
+    """Read at most 250 daily bars per symbol, newest first via the bar index.
 
+    Keep dashboard RSI/MACD's 250-bar seed window (not analytics' seed).
+    Arrays are returned chronologically for all dashboard calculations to share.
+    """
+    closes: Dict[str, List[float]] = {str(symbol).upper(): [] for symbol in symbols}
+    latest: Dict[str, str | None] = {symbol: None for symbol in closes}
+    if not closes:
+        return closes, latest
     _init_db_if_needed()
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT sm.symbol, max(sb.bar_time)
+                SELECT sm.symbol, bars.bar_time, bars.close
                 FROM symbol_metadata sm
-                LEFT JOIN stock_bars sb ON sb.symbol_id = sm.id AND sb.timeframe = %s
+                CROSS JOIN LATERAL (
+                    SELECT sb.bar_time, sb.close
+                    FROM stock_bars sb
+                    WHERE sb.symbol_id = sm.id AND sb.timeframe = '1Day'
+                    ORDER BY sb.bar_time DESC
+                    LIMIT 250
+                ) bars
                 WHERE sm.symbol = ANY(%s)
-                GROUP BY sm.symbol
+                ORDER BY sm.symbol ASC, bars.bar_time ASC
                 """,
-                (timeframe, symbols),
+                (list(closes),),
             )
-            rows = cur.fetchall()
-
-    for symbol, latest_bar_time in rows:
-        symbol_key = str(symbol).upper()
-        out[symbol_key] = latest_bar_time.astimezone(timezone.utc).isoformat() if latest_bar_time else None
-    return out
+            for symbol, bar_time, close in cur.fetchall():
+                key = str(symbol).upper()
+                closes[key].append(float(close))
+                latest[key] = bar_time.astimezone(timezone.utc).isoformat()
+    return closes, latest
 
 
 def _ma_distance_pcts(
-    symbols: List[str], reference_prices: Dict[str, float | None]
+    symbols: List[str], reference_prices: Dict[str, float | None],
+    closes_by_symbol: Dict[str, List[float]] | None = None,
 ) -> Dict[str, Dict[str, float | None]]:
     out: Dict[str, Dict[str, float | None]] = {
         str(symbol).upper(): {"dist_ma20_pct": None, "dist_ma50_pct": None} for symbol in symbols
@@ -400,29 +411,8 @@ def _ma_distance_pcts(
     if not out:
         return out
 
-    _init_db_if_needed()
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT symbol, close
-                FROM (
-                    SELECT sm.symbol, sb.bar_time, sb.close,
-                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
-                    FROM symbol_metadata sm
-                    JOIN stock_bars sb ON sb.symbol_id = sm.id
-                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
-                ) bars
-                WHERE rn <= 50
-                ORDER BY symbol ASC, bar_time ASC
-                """,
-                (list(out.keys()),),
-            )
-            rows = cur.fetchall()
-
-    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
-    for symbol, close in rows:
-        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+    if closes_by_symbol is None:
+        closes_by_symbol, _ = _daily_bar_snapshot(symbols)
 
     for symbol, closes in closes_by_symbol.items():
         reference_price = reference_prices.get(symbol)
@@ -662,34 +652,13 @@ def _load_next_earnings_map() -> Dict[str, str]:
     return {str(symbol).upper(): str(earnings_date) for symbol, earnings_date in rows}
 
 
-def _trend_states(symbols: List[str]) -> Dict[str, str]:
+def _trend_states(symbols: List[str], closes_by_symbol: Dict[str, List[float]] | None = None) -> Dict[str, str]:
     out = {str(symbol).upper(): "Neutral" for symbol in symbols}
     if not out:
         return out
 
-    _init_db_if_needed()
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT symbol, close
-                FROM (
-                    SELECT sm.symbol, sb.bar_time, sb.close,
-                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
-                    FROM symbol_metadata sm
-                    JOIN stock_bars sb ON sb.symbol_id = sm.id
-                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
-                ) bars
-                WHERE rn <= 220
-                ORDER BY symbol ASC, bar_time ASC
-                """,
-                (list(out.keys()),),
-            )
-            rows = cur.fetchall()
-
-    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
-    for symbol, close in rows:
-        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+    if closes_by_symbol is None:
+        closes_by_symbol, _ = _daily_bar_snapshot(symbols)
 
     for symbol, closes in closes_by_symbol.items():
         if len(closes) < 200:
@@ -706,34 +675,13 @@ def _trend_states(symbols: List[str]) -> Dict[str, str]:
     return out
 
 
-def _rsi_14_values(symbols: List[str]) -> Dict[str, float | None]:
+def _rsi_14_values(symbols: List[str], closes_by_symbol: Dict[str, List[float]] | None = None) -> Dict[str, float | None]:
     out: Dict[str, float | None] = {str(symbol).upper(): None for symbol in symbols}
     if not out:
         return out
 
-    _init_db_if_needed()
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT symbol, close
-                FROM (
-                    SELECT sm.symbol, sb.bar_time, sb.close,
-                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
-                    FROM symbol_metadata sm
-                    JOIN stock_bars sb ON sb.symbol_id = sm.id
-                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
-                ) bars
-                WHERE rn <= 250
-                ORDER BY symbol ASC, bar_time ASC
-                """,
-                (list(out.keys()),),
-            )
-            rows = cur.fetchall()
-
-    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
-    for symbol, close in rows:
-        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+    if closes_by_symbol is None:
+        closes_by_symbol, _ = _daily_bar_snapshot(symbols)
 
     period = 14
     for symbol, closes in closes_by_symbol.items():
@@ -781,34 +729,13 @@ def _ema_number_values(values: Sequence[float | None], period: int) -> List[floa
     return out
 
 
-def _macd_signals(symbols: List[str]) -> Dict[str, str]:
+def _macd_signals(symbols: List[str], closes_by_symbol: Dict[str, List[float]] | None = None) -> Dict[str, str]:
     out = {str(symbol).upper(): "Neutral" for symbol in symbols}
     if not out:
         return out
 
-    _init_db_if_needed()
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT symbol, close
-                FROM (
-                    SELECT sm.symbol, sb.bar_time, sb.close,
-                           row_number() OVER (PARTITION BY sm.symbol ORDER BY sb.bar_time DESC) AS rn
-                    FROM symbol_metadata sm
-                    JOIN stock_bars sb ON sb.symbol_id = sm.id
-                    WHERE sm.symbol = ANY(%s) AND sb.timeframe = '1Day'
-                ) bars
-                WHERE rn <= 250
-                ORDER BY symbol ASC, bar_time ASC
-                """,
-                (list(out.keys()),),
-            )
-            rows = cur.fetchall()
-
-    closes_by_symbol: Dict[str, List[float]] = {symbol: [] for symbol in out}
-    for symbol, close in rows:
-        closes_by_symbol.setdefault(str(symbol).upper(), []).append(float(close))
+    if closes_by_symbol is None:
+        closes_by_symbol, _ = _daily_bar_snapshot(symbols)
 
     for symbol, closes in closes_by_symbol.items():
         if len(closes) < 35:
@@ -2141,11 +2068,11 @@ def data() -> Response:
 
     prices: Dict[str, float | None] = _fetch_current_prices(symbols)
     next_map: Dict[str, str] = _load_next_earnings_map()
-    trend_map: Dict[str, str] = _trend_states(symbols)
-    rsi_14_map: Dict[str, float | None] = _rsi_14_values(symbols)
-    macd_signal_map: Dict[str, str] = _macd_signals(symbols)
-    latest_bar_map: Dict[str, str | None] = _latest_bar_times(symbols, "1Day")
-    ma_distance_map = _ma_distance_pcts(symbols, prices)
+    daily_closes, latest_bar_map = _daily_bar_snapshot(symbols)
+    trend_map: Dict[str, str] = _trend_states(symbols, daily_closes)
+    rsi_14_map: Dict[str, float | None] = _rsi_14_values(symbols, daily_closes)
+    macd_signal_map: Dict[str, str] = _macd_signals(symbols, daily_closes)
+    ma_distance_map = _ma_distance_pcts(symbols, prices, daily_closes)
 
     rows = []
     if not df.empty:

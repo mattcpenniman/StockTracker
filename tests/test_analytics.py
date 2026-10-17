@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,71 @@ from analytics.serializers import serialize_events
 from analytics.service import AnalyticsNotFoundError, AnalyticsService
 from analytics.signals import compute_signal_columns, generate_events
 from analytics.utils import parse_asof
+import app as dashboard
+from analytics.dashboard_benchmark import baseline_namespace, dashboard_fixture, variants
+
+
+class DashboardSnapshotTests(unittest.TestCase):
+    def test_snapshot_is_bounded_chronological_and_preserves_missing_symbols(self):
+        conn = MagicMock()
+        cur = conn.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [
+            ("AAPL", datetime(2026, 10, 15, tzinfo=timezone.utc), 101),
+            ("AAPL", datetime(2026, 10, 16, tzinfo=timezone.utc), 102),
+        ]
+        with patch.object(dashboard, "_init_db_if_needed"), patch.object(dashboard, "_get_conn", return_value=conn):
+            closes, latest = dashboard._daily_bar_snapshot(["aapl", "MISSING"])
+        self.assertEqual(closes, {"AAPL": [101.0, 102.0], "MISSING": []})
+        self.assertEqual(latest, {"AAPL": "2026-10-16T00:00:00+00:00", "MISSING": None})
+        sql, params = cur.execute.call_args.args
+        self.assertIn("CROSS JOIN LATERAL", sql)
+        self.assertIn("LIMIT 250", sql)
+        self.assertEqual(params, (["AAPL", "MISSING"],))
+        cur.execute.assert_called_once()
+
+    def test_empty_snapshot_does_not_connect(self):
+        with patch.object(dashboard, "_get_conn") as connect:
+            self.assertEqual(dashboard._daily_bar_snapshot([]), ({}, {}))
+        connect.assert_not_called()
+
+    def test_shared_snapshot_helpers_do_not_read_again(self):
+        closes = {"AAPL": [100.0] * 250}
+        with patch.object(dashboard, "_get_conn") as connect:
+            self.assertEqual(dashboard._trend_states(["AAPL"], closes), {"AAPL": "Neutral"})
+            self.assertEqual(dashboard._rsi_14_values(["AAPL"], closes), {"AAPL": 100.0})
+            self.assertEqual(dashboard._macd_signals(["AAPL"], closes), {"AAPL": "Neutral"})
+            self.assertEqual(dashboard._ma_distance_pcts(["AAPL"], {"AAPL": None}, closes),
+                             {"AAPL": {"dist_ma20_pct": 0.0, "dist_ma50_pct": 0.0}})
+        connect.assert_not_called()
+
+
+@unittest.skipUnless(os.environ.get("ANALYTICS_TEST_DATABASE_URL"), "Set ANALYTICS_TEST_DATABASE_URL for dashboard PostgreSQL parity")
+class DashboardPostgreSQLParityTests(unittest.TestCase):
+    def test_full_dashboard_parity_at_warmup_boundaries_and_hidden_rows(self):
+        baseline = baseline_namespace()
+        with dashboard_fixture(os.environ["ANALYTICS_TEST_DATABASE_URL"], count=22, mixed=True) as dsn, \
+             variants(dsn, baseline) as implementations, dashboard.app.test_client() as client:
+            # Intraday data must not affect the daily snapshot or latest daily time.
+            import psycopg2
+            with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO stock_bars (symbol_id, timeframe, bar_time, open, high, low, close, volume)
+                    SELECT id, '15Min', '2030-01-01', 900, 900, 900, 900, 1000 FROM symbol_metadata
+                """)
+            for url in ("/data", "/data?include_hidden=1", "/data?include_hidden=true"):
+                payloads = {}
+                for name, handler in implementations:
+                    with patch.dict(dashboard.app.view_functions, data=handler):
+                        response = client.get(url)
+                    self.assertEqual(response.status_code, 200)
+                    payloads[name] = response.get_json()
+                self.assertEqual(payloads["before"], payloads["after"], url)
+                self.assertEqual(len(payloads["after"]["rows"]), 15 if url == "/data" else 23)
+            with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM stock_forecasts")
+            for _, handler in implementations:
+                with patch.dict(dashboard.app.view_functions, data=handler):
+                    self.assertEqual(client.get("/data").get_json(), {"rows": []})
 
 
 def _fixture_bars(count: int = 260) -> pd.DataFrame:
