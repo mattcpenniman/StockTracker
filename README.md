@@ -66,6 +66,41 @@ examples through Flask with a fixture repository and a fresh cache per request.
 It validates JSON parity and includes route/service/serialization overhead, while
 mocking database and market-data network calls; it is not a live-server benchmark.
 
+### PostgreSQL connection lifecycle (VEC-785)
+
+App and analytics database blocks share a lazy connection pool per database URL
+and worker process. `DB_POOL_SIZE=4` bounds open connections in each pool;
+`DB_POOL_TIMEOUT_SECONDS=30` controls checkout waiting and connection establishment.
+Budget worker count × pool size against PostgreSQL's connection limit, plus other
+clients. Batch analytics reads remain sequential and do not reserve extra slots.
+
+Successful blocks commit; failed blocks roll back before returning a connection.
+Transport failures discard the connection. Reused connections are checked before
+checkout; failed checks create a replacement without replaying application SQL.
+Connections are not held during analytics computation or provider calls.
+
+Pools are created on first use, including in preloaded worker deployments. Forked
+children discard inherited socket descriptors and initialize fresh pools while
+the parent keeps its connections. `database.close_pools()` is an explicit worker
+shutdown hook and is also registered with `atexit`; idle connections close
+immediately and checked-out connections close when returned. Do not attach pool
+shutdown to Flask request teardown, which would defeat reuse.
+
+Validate lifecycle/concurrency against real PostgreSQL and reproduce endpoint
+measurements (private schemas; no market-data provider calls):
+
+```bash
+export ANALYTICS_TEST_DATABASE_URL='postgresql://user:password@localhost:5432/test_database'
+python -m unittest tests.test_database
+python -m analytics.pool_benchmark --repeats 10 --bars 5000 --load-requests 80
+```
+
+The benchmark compares the old direct-connect factory with pooling using identical
+SQL, routes, and full JSON payloads. It reports connection creations, sampled
+active/total sessions, post-workload transaction state, throughput and median/p95
+latency, including warm caches and eight concurrent callers. Measurement evidence
+is maintained in Vector under VEC-785.
+
 ### Bounded analytics price reads (VEC-780)
 
 Price anchors use an inclusive latest-at-or-before query (`ORDER BY bar_time DESC
