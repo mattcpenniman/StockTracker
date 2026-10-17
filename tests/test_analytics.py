@@ -25,7 +25,7 @@ from analytics.regimes import (
 from analytics.serializers import serialize_events
 from analytics.service import AnalyticsNotFoundError, AnalyticsService
 from analytics.signals import compute_signal_columns, generate_events
-from analytics.utils import parse_asof
+from analytics.utils import clean_json_value, parse_asof
 import app as dashboard
 from analytics.dashboard_benchmark import baseline_namespace, dashboard_fixture, variants
 from analytics.events_benchmark import baseline_generate_events, event_fixture
@@ -264,7 +264,7 @@ class SignalTests(unittest.TestCase):
             bars["close"] = 100 * np.exp(np.cumsum(rng.normal(0, 0.03, count)))
             bars["high"] = bars["close"] + 1
             bars["low"] = bars["close"] - 1
-            bars["volume"] = rng.integers(0, 10000, count).astype(float)
+            bars["volume"] = rng.integers(0, 10000, count)
             frames.append(compute_feature_frame(bars, "1Day", self.settings))
         irregular = frames[1].iloc[:30].copy()
         irregular.loc[0:2, "timestamp"] = pd.NaT
@@ -327,6 +327,22 @@ class RegimeTests(unittest.TestCase):
 
 
 class SerializationTests(unittest.TestCase):
+    def test_nested_numpy_scalars_are_native_and_strict_json_safe(self) -> None:
+        for dtype in (np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64):
+            with self.subTest(dtype=dtype):
+                value = dtype(np.iinfo(dtype).max)
+                cleaned = clean_json_value({"events": [{"value": value}]})
+                self.assertIs(type(cleaned["events"][0]["value"]), int)
+                self.assertEqual(json.loads(json.dumps(cleaned, allow_nan=False))["events"][0]["value"], int(value))
+        for dtype in (np.float16, np.float32, np.float64, np.longdouble):
+            with self.subTest(dtype=dtype):
+                cleaned = clean_json_value((dtype(1.25), dtype("nan"), dtype("inf"), dtype("-inf")))
+                self.assertIs(type(cleaned[0]), float)
+                self.assertEqual(json.loads(json.dumps(cleaned, allow_nan=False)), [1.25, None, None, None])
+        cleaned = clean_json_value([np.bool_(True), np.bool_(False)])
+        self.assertTrue(all(type(value) is bool for value in cleaned))
+        self.assertEqual(json.dumps(cleaned, allow_nan=False), "[true, false]")
+
     def test_json_serialization_converts_nan_to_null(self) -> None:
         payload = serialize_events(
             "NVDA",
@@ -335,6 +351,62 @@ class SerializationTests(unittest.TestCase):
         )
         self.assertIsNone(payload["events"][0]["strength"])
         self.assertEqual(payload["events"][0]["timestamp"], "2023-01-10T00:00:00Z")
+
+
+@unittest.skipUnless(os.environ.get("ANALYTICS_TEST_DATABASE_URL"), "Set ANALYTICS_TEST_DATABASE_URL for historical event PostgreSQL integration")
+class HistoricalEventsPostgreSQLTests(unittest.TestCase):
+    def test_integer_volume_historical_limits_cold_and_cached(self) -> None:
+        import psycopg2
+        from analytics.data_access import AnalyticsRepository
+        from analytics.io_benchmark import price_fixture
+
+        settings = AnalyticsSettings()
+        baseline = baseline_generate_events()
+        with price_fixture(os.environ["ANALYTICS_TEST_DATABASE_URL"], 260, 260) as (dsn, symbol_id):
+            repo = AnalyticsRepository(dsn)
+            for timeframe, alias, start, freq in (
+                ("1Day", "1D", "2000-01-01", "D"),
+                ("15Min", "15Min", "2020-01-01", "15min"),
+            ):
+                asof = pd.date_range(start, periods=259, freq=freq, tz="UTC")[-1].to_pydatetime()
+                with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE stock_bars SET close = 120, high = 121, volume = 195850526
+                        WHERE symbol_id = %s AND timeframe = %s AND bar_time = %s
+                    """, (symbol_id, timeframe, asof))
+                bars = repo.fetch_bars(symbol_id, timeframe, asof)
+                self.assertEqual(bars["volume"].dtype, np.dtype("int64"))
+                self.assertEqual(len(bars), 259)  # The later stored bar is excluded.
+                for backend in ("python", "rust") if indicators._rust_feature_columns is not None else ("python",):
+                    with patch.dict(os.environ, ANALYTICS_BACKEND=backend):
+                        features = compute_feature_frame(bars, timeframe, settings)
+                        expected = serialize_events("BENCH", timeframe, baseline(features, settings, 20))["events"]
+                        self.assertEqual([event["value"] for event in expected if event["event_type"] == "volume_spike"], [195850526])
+                        for limit in (1, 20):
+                            with self.subTest(timeframe=timeframe, backend=backend, limit=limit):
+                                service = AnalyticsService(repo)
+                                url = f"/api/events/BENCH?timeframe={alias}&asof={asof.isoformat()}&event_limit={limit}"
+                                # Encode '+' in the ISO offset for the query string.
+                                url = url.replace("+00:00", "Z")
+                                with patch.object(dashboard, "analytics_service", service), \
+                                     patch.object(repo, "fetch_bars", wraps=repo.fetch_bars) as reads, \
+                                     patch.object(dashboard, "_sync_current_analytics_data_if_needed") as sync, \
+                                     patch.object(dashboard, "_backfill_analytics_symbol_if_needed") as backfill, \
+                                     flask_app.test_client() as client:
+                                    cold = client.get(url)
+                                    self.assertEqual(cold.status_code, 200, cold.get_json())
+                                    self.assertGreater(reads.call_count, 0)
+                                    reads.reset_mock()
+                                    cached = client.get(url)
+                                    reads.assert_not_called()
+                                    sync.assert_not_called()
+                                    backfill.assert_not_called()
+                                self.assertEqual(cached.status_code, 200, cached.get_json())
+                                payload = cold.get_json()
+                                self.assertTrue(payload["ok"])
+                                self.assertEqual(payload, cached.get_json())
+                                self.assertEqual(payload["events"], expected[:limit])
+                                json.dumps(payload, allow_nan=False)
 
 
 class ServiceTests(unittest.TestCase):

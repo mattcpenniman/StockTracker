@@ -4,6 +4,7 @@ import math
 from datetime import date, datetime, time, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
@@ -34,11 +35,14 @@ def isoformat_utc(value: datetime | pd.Timestamp | None) -> str | None:
 
 
 def _clean_float(value: Any) -> Any:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
+    # Pandas rows and candidate arrays can both expose NumPy scalar values.
+    # Normalize here so every serializer (and its cached payload) is JSON-safe.
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
         if math.isnan(value) or math.isinf(value):
             return None
         return value
