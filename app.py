@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
 from analytics.utils import parse_asof
 from live_prices import PriceCache, YahooQuotes
+from database import get_connection
 
 # Load environment variables from a .env file in the same directory (if present)
 try:
@@ -181,9 +182,7 @@ def _action_score(row: Dict) -> float:
 
 
 def _get_conn():
-    if psycopg2 is None:
-        raise RuntimeError("Missing dependency: psycopg2-binary is required for PostgreSQL access.")
-    return psycopg2.connect(DATABASE_URL)
+    return get_connection(DATABASE_URL)
 
 
 def _init_db_if_needed() -> None:

@@ -5,11 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
-
-try:
-    import psycopg2
-except Exception:  # pragma: no cover
-    psycopg2 = None
+from database import get_connection
 
 
 DATABASE_URL = os.environ.get(
@@ -23,9 +19,7 @@ class AnalyticsRepository:
         self.database_url = database_url or DATABASE_URL
 
     def get_conn(self):
-        if psycopg2 is None:
-            raise RuntimeError("Missing dependency: psycopg2-binary is required for PostgreSQL access.")
-        return psycopg2.connect(self.database_url)
+        return get_connection(self.database_url)
 
     def ping(self) -> bool:
         with self.get_conn() as conn:
