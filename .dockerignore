@@ -9,3 +9,6 @@ __pycache__/
 venv/
 *.csv
 rust/target/
+build-info.json
+pyapollo/
+earnings_data/target/

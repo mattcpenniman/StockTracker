@@ -665,5 +665,8 @@ class AnalyticsService:
         )
 
     def health(self) -> dict[str, Any]:
+        from .runtime import runtime_diagnostics
+
+        runtime = runtime_diagnostics()
         ok = self.repository.ping()
-        return {"ok": ok, "service": "analytics", "database": "connected" if ok else "disconnected"}
+        return {"ok": ok and runtime["ready"], "service": "analytics", "database": "connected" if ok else "disconnected", "runtime": runtime}

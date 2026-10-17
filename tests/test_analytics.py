@@ -386,6 +386,141 @@ class IndicatorTests(unittest.TestCase):
         self.assertTrue(pd.isna(latest["atr_14"]))
 
 
+class RuntimeDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        from collections import Counter
+        self.counts = patch.object(indicators, "_dispatch_counts", Counter())
+        self.counts.start()
+        self.addCleanup(self.counts.stop)
+
+    def test_installed_is_not_invoked_and_forced_python_is_reported(self):
+        native = Mock()
+        with patch.object(indicators, "_rust_feature_columns", native), patch.dict(os.environ, ANALYTICS_BACKEND="python"):
+            before = indicators.backend_diagnostics()
+            self.assertTrue(before["extension_available"])
+            self.assertEqual(before["execution"]["observed_backend"], "not_yet_invoked")
+            compute_feature_frame(_fixture_bars(30), "1Day", AnalyticsSettings())
+            after = indicators.backend_diagnostics()
+            self.assertEqual(after["effective_backend"], "python")
+            self.assertEqual(after["execution"]["fallback_reasons"]["forced_python"], 1)
+            self.assertEqual(after["execution"]["native_calls"], 0)
+            native.assert_not_called()
+
+    def test_missing_extension_auto_fallback_and_required_readiness(self):
+        from analytics.release_check import verify_release
+        with patch.object(indicators, "_rust_feature_columns", None):
+            with patch.dict(os.environ, ANALYTICS_BACKEND="auto"):
+                compute_feature_frame(_fixture_bars(30), "1Day", AnalyticsSettings())
+                runtime = indicators.backend_diagnostics()
+                self.assertTrue(runtime["ready"])
+                self.assertEqual(runtime["effective_backend"], "python")
+                self.assertEqual(runtime["execution"]["fallback_reasons"]["extension_unavailable"], 1)
+                self.assertTrue(verify_release(allow_unversioned=True)["ok"])
+                result = verify_release(require_rust=True, allow_unversioned=True)
+                self.assertFalse(result["ok"])
+                self.assertIn("native_execution_not_observed", result["errors"])
+            with patch.dict(os.environ, ANALYTICS_BACKEND="rust"):
+                self.assertFalse(indicators.backend_diagnostics()["ready"])
+                result = verify_release(allow_unversioned=True)
+                self.assertFalse(result["ok"])
+                self.assertIn("extension_unavailable", result["errors"])
+                repo = Mock()
+                repo.ping.return_value = True
+                service = AnalyticsService(repo)
+                self.assertEqual(service.health()["database"], "connected")
+                self.assertFalse(service.health()["ok"])
+                with patch.object(dashboard, "analytics_service", service), flask_app.test_client() as client:
+                    self.assertEqual(client.get("/api/health/analytics").status_code, 503)
+                    with patch.object(dashboard, "_init_db_if_needed"), patch.object(dashboard, "_get_conn", MagicMock()):
+                        response = client.get("/health")
+                        self.assertEqual(response.status_code, 503)
+                        self.assertEqual(response.get_json()["runtime"]["effective_backend"], "unavailable")
+
+    def test_smoke_rejects_importable_but_unused_dispatch(self):
+        from analytics.release_check import verify_release
+        # An installed callable does not prove the public dispatcher uses it.
+        with patch.object(indicators, "_rust_feature_columns", Mock()), \
+             patch.object(indicators, "compute_feature_frame", indicators._compute_feature_frame_python), \
+             patch.dict(os.environ, ANALYTICS_BACKEND="auto"):
+            result = verify_release(require_rust=True, allow_unversioned=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["smoke"]["finite_output"])
+        self.assertIn("native_execution_not_observed", result["errors"])
+
+    def test_reference_mode_smoke_and_artifact_identity(self):
+        from analytics.release_check import verify_release
+        from analytics import runtime
+        manifest = Mock()
+        manifest.read_text.return_value = json.dumps({"revision": "image-revision", "release_id": "release-803"})
+        with patch.object(runtime, "BUILD_INFO_PATH", manifest), \
+             patch.dict(os.environ, ANALYTICS_BACKEND="python", BUILD_REVISION="host-revision", RELEASE_ID="host-release"):
+            result = verify_release(expected_revision="image-revision", expected_release="release-803")
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["smoke"]["dispatch_reasons"], {"forced_python": 1})
+            self.assertEqual(indicators.backend_diagnostics()["execution"]["python_fallback_calls"], 0)
+            self.assertFalse(verify_release(require_rust=True)["ok"])
+            self.assertIn("revision_mismatch", verify_release(expected_revision="host-revision")["errors"])
+            self.assertIn("release_id_mismatch", verify_release(expected_release="host-release")["errors"])
+        manifest.read_text.side_effect = FileNotFoundError
+        with patch.object(runtime, "BUILD_INFO_PATH", manifest), patch.dict(os.environ, ANALYTICS_BACKEND="python"):
+            self.assertEqual(runtime.runtime_diagnostics()["build"]["revision"], "unknown")
+            self.assertIn("artifact_build_identity_missing", verify_release()["errors"])
+
+    @unittest.skipIf(indicators._rust_feature_columns is None, "Install ./rust for native execution evidence")
+    def test_real_native_execution_smoke_and_intended_fallback(self):
+        from analytics.release_check import verify_release
+        with patch.dict(os.environ, ANALYTICS_BACKEND="rust"):
+            before = indicators.backend_diagnostics()["execution"]
+            result = verify_release(require_rust=True, allow_unversioned=True)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["smoke"]["native_calls"], 1)
+            self.assertEqual(before, indicators.backend_diagnostics()["execution"])
+            compute_feature_frame(_fixture_bars(300), "1Day", AnalyticsSettings())
+            for scenario in ("nan", "timestamp", "zero", "empty"):
+                bars = _fixture_bars(300)
+                if scenario == "nan":
+                    bars.loc[50, "volume"] = np.nan
+                elif scenario == "timestamp":
+                    bars.loc[50, "timestamp"] = pd.NaT
+                elif scenario == "zero":
+                    bars.loc[50, "close"] = 0
+                else:
+                    bars = bars.iloc[:0]
+                compute_feature_frame(bars, "1Day", AnalyticsSettings())
+            execution = indicators.backend_diagnostics()["execution"]
+            self.assertEqual(execution["native_calls"], 1)
+            self.assertEqual(execution["python_fallback_calls"], 4)
+            self.assertEqual(execution["fallback_reasons"]["ineligible_data"], 3)
+            self.assertEqual(execution["fallback_reasons"]["empty_input"], 1)
+
+    def test_health_keeps_diagnostics_when_database_fails(self):
+        with patch.object(dashboard.analytics_service.repository, "ping", side_effect=RuntimeError("offline")), \
+             flask_app.test_client() as client:
+            result = client.get("/api/health/analytics")
+            self.assertEqual(result.status_code, 500)
+            self.assertIn("runtime", result.get_json())
+
+    def test_cached_state_does_not_count_as_feature_execution(self):
+        repo = Mock()
+        context = {"symbol": "NVDA", "symbol_id": 1}
+        repo.fetch_symbol_context.return_value = context
+        service = AnalyticsService(repo)
+        settings = AnalyticsSettings()
+        cached = {"symbol": "NVDA", "cached": True}
+        service._state_cache.set(service._state_cache_key(context, "1Day", None, settings), cached)
+        before = indicators.backend_diagnostics()["execution"]
+        self.assertEqual(service.get_symbol_state("NVDA", "1Day", None, settings), cached)
+        self.assertEqual(before, indicators.backend_diagnostics()["execution"])
+        repo.fetch_bars.assert_not_called()
+
+    def test_invalid_configuration_fails_readiness_without_echoing_value(self):
+        with patch.dict(os.environ, ANALYTICS_BACKEND="invalid-sensitive-value"):
+            runtime = indicators.backend_diagnostics()
+        self.assertFalse(runtime["ready"])
+        self.assertEqual(runtime["reason"], "invalid_backend")
+        self.assertNotIn("invalid-sensitive-value", json.dumps(runtime))
+
+
 class RustIndicatorTests(unittest.TestCase):
     def test_auto_falls_back_when_extension_is_unavailable(self) -> None:
         bars = _fixture_bars(30)

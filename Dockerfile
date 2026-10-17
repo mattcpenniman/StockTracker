@@ -16,6 +16,15 @@ RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
 COPY . .
 
+ARG BUILD_REVISION=unknown
+ARG RELEASE_ID=unknown
+LABEL org.opencontainers.image.revision=$BUILD_REVISION
+LABEL org.opencontainers.image.version=$RELEASE_ID
+# Written after COPY: a host checkout's manifest cannot replace the image identity.
+RUN BUILD_REVISION="$BUILD_REVISION" RELEASE_ID="$RELEASE_ID" python -c 'import json, os; from pathlib import Path; Path("build-info.json").write_text(json.dumps({"revision": os.environ["BUILD_REVISION"], "release_id": os.environ["RELEASE_ID"]}))'
+# Exercise the installed wheel and public dispatcher in the FINAL image stage.
+RUN python -m analytics.release_check --require-rust --allow-unversioned
+
 ENV HOST=0.0.0.0
 ENV PORT=5000
 

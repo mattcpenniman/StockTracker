@@ -384,6 +384,65 @@ curl -s "http://127.0.0.1:5000/api/metadata/NVDA"
 curl -s http://127.0.0.1:5000/api/health/analytics
 ```
 
+### Runtime identity and release verification
+
+Both `/health` and `/api/health/analytics` add a `runtime` object while retaining
+their existing database fields. Startup logs report the same runtime identity.
+It includes artifact `build.revision`/`build.release_id`, `configured_backend`,
+`extension_available`/`extension_version`, `effective_backend` for eligible finite
+data, and `execution.observed_backend` (`not_yet_invoked`, `python`, `rust`, or
+`mixed`). Installing a wheel alone does not count as invoking it.
+
+`execution.native_calls`, `python_fallback_calls`, and `fallback_reasons` count
+completed dispatches in **one process since startup**, with its PID. They exclude
+cache hits and synthetic verification. Multiple workers have separate counters;
+these are diagnostics rather than a durable metrics store. Fallback reasons are
+`forced_python`, `extension_unavailable`, `empty_input`, and `ineligible_data`
+(nonfinite input, missing timestamps, or nonpositive close). No symbols, prices,
+credentials, or environment dumps are included.
+
+`ANALYTICS_BACKEND=auto` uses Rust when available and otherwise supports Python.
+`python` intentionally selects the reference implementation. `rust` requires an
+available extension: health/readiness returns 503 if the DB is connected but Rust
+is unavailable. Intentional unusual-data fallback remains supported even in Rust
+mode. Invalid backend configuration also fails readiness.
+
+Embed the exact clean source revision and release identifier when building:
+
+```bash
+BUILD_REVISION=$(git rev-parse HEAD) RELEASE_ID=release-2026-10-17 docker compose build app
+```
+
+Docker writes `/app/build-info.json` after copying source and attaches matching
+OCI revision/version labels. Runtime identity reads that artifact only, never
+host git or runtime `BUILD_REVISION`/`RELEASE_ID` overrides. Build inputs must name
+the clean source used to build the image. Local images without supplied arguments
+report `unknown`; default release verification rejects them.
+
+The final Docker stage runs a Rust smoke check after installing the wheel. After
+deployment, verify the **running container**, supplying the intended release values
+from your release record (not from a possibly newer host checkout):
+
+```bash
+docker compose exec -T app python -m analytics.release_check \
+  --require-rust --expected-revision FULL_COMMIT_SHA --expected-release release-2026-10-17
+curl -s http://127.0.0.1:5000/api/health/analytics
+```
+
+The CLI emits JSON and exits nonzero for missing/mismatched artifact identity,
+failed/nonfinite computation, or missing native invocation. It calculates 320
+synthetic finite bars through the public dispatcher in that runtime, bypassing
+state caches; it does not contact a provider or database, write market data, or
+change runtime configuration. Its isolated `smoke.native_calls` proves execution
+for that calculation; HTTP counters independently describe serving-process work.
+Use `--allow-unversioned` only for development, and omit `--require-rust` to verify
+intentional Python reference mode. An older deployment without these additions
+will lack `runtime` and the CLI: treat that as **unverified/stale**, not Rust-ready.
+
+Kernel coverage: single-symbol state, batch state, portfolio state, and events
+calculate indicator features on cache misses. `futurestate` and portfolio
+`futurestate` use price-window labels and do **not** require the indicator kernel.
+
 ### Query parameters
 
 - `timeframe`: supported values are `1D`/`1Day`, `1Hour`, `15Min`, `5Min`, `1Min`

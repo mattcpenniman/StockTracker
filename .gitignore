@@ -3,3 +3,4 @@ pyapollo
 earnings_data
 .env
 __pycache__
+build-info.json
