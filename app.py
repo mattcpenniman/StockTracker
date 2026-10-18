@@ -18,6 +18,7 @@ from flask import Flask, Response, jsonify, request
 import matplotlib.pyplot as plt
 
 from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
+from analytics.cache import CacheCapacityError
 from analytics.utils import isoformat_utc, parse_asof
 from analytics.runtime import runtime_diagnostics
 from live_prices import PriceCache, YahooQuotes
@@ -3976,11 +3977,15 @@ def get_analytics_state(symbol: str, timeframe: str | None = None) -> Response:
             if hide_ts:
                 payload = _strip_symbol_and_timestamps(payload)
             return jsonify(payload)
+        except CacheCapacityError as capacity_exc:
+            return jsonify({"ok": False, "error": str(capacity_exc)}), 503, {"Retry-After": "1"}
         except Exception:
             pass
         return jsonify({"ok": False, "error": str(exc)}), 404
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    except CacheCapacityError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503, {"Retry-After": "1"}
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -4010,11 +4015,15 @@ def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
             if hide_ts:
                 payload = _strip_symbol_and_timestamps(payload)
             return jsonify(payload)
+        except CacheCapacityError as capacity_exc:
+            return jsonify({"ok": False, "error": str(capacity_exc)}), 503, {"Retry-After": "1"}
         except Exception:
             pass
         return jsonify({"ok": False, "error": str(exc)}), 404
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    except CacheCapacityError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503, {"Retry-After": "1"}
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -4116,11 +4125,15 @@ def get_analytics_future_state(symbol: str, timeframe: str | None = None) -> Res
             if hide_ts:
                 payload = _strip_symbol_and_timestamps(payload)
             return jsonify(payload)
+        except CacheCapacityError as capacity_exc:
+            return jsonify({"ok": False, "error": str(capacity_exc)}), 503, {"Retry-After": "1"}
         except Exception:
             pass
         return jsonify({"ok": False, "error": str(exc)}), 404
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    except CacheCapacityError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503, {"Retry-After": "1"}
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -4656,6 +4669,11 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
         and events use the indicator kernel; futurestate price-window labels do not.
         Run <code>python -m analytics.release_check --require-rust --expected-revision REV --expected-release ID</code>
         inside the final runtime to prove native execution with synthetic data and verify artifact identity.</p>
+        <p><code>caches</code> reports per-worker state/event/future hit, miss, eviction,
+        computation, coalesced-wait, failure and admission-rejection counters, current entries/accounted
+        bytes, in-flight producers/waiters and configured limits. Counters have no symbol/date labels.
+        Single-symbol analytics return 503 with <code>Retry-After: 1</code> on cache admission exhaustion;
+        batches retain per-symbol errors. Cache budgets and revision limitations are documented in README.</p>
 <pre><code>curl -s "http://127.0.0.1:5000/api/health/analytics"</code></pre>
 
         <h2>Analytics Query Parameters</h2>

@@ -156,6 +156,106 @@ excluded. Distinct `event_limit` settings force cold state-cache keys without
 changing state math. This probe assumes exclusive benchmark traffic and one
 serving process per instance so health counters refer to the measured worker.
 
+### Bounded analytics caches (VEC-808)
+
+State, event and future results use separate, concurrency-safe per-worker LRUs.
+Configure each with positive integer environment variables (invalid values fail
+service startup):
+
+| Variable (`KIND` = `STATE`, `EVENT`, or `FUTURE`) | Default per cache / worker |
+| --- | ---: |
+| `ANALYTICS_KIND_CACHE_ENTRIES` | 256 |
+| `ANALYTICS_KIND_CACHE_BYTES` | 8388608 (8 MiB) |
+| `ANALYTICS_KIND_CACHE_INFLIGHT` | 64 producers |
+| `ANALYTICS_KIND_CACHE_WAITERS` | 256 coalesced waiters |
+
+The byte budget charges encoded immutable JSON bytes, recursively measured key
+objects (`sys.getsizeof`, conservatively charging shared objects repeatedly),
+and 256 bytes per entry for mapping/tuple overhead. Both entry and byte limits
+apply. Oversized results are delivered to the producer and its current waiters
+but are not retained; later requests compute again. JSON decoding gives every
+caller an independent mutable response, so route flags and portfolio enrichment
+cannot contaminate cached results.
+
+The three caches together have at most 24 MiB of accounted retained entry storage
+per worker by default, plus fixed container/lock overhead and bounded in-flight
+bookkeeping (64 keys per cache, each limited to 16 KiB, and 256 waiting callers).
+This is **not a whole-process RSS limit**: input bars/features, temporary encoding,
+decoded responses, request threads, Python allocator high-water marks and DB
+pools need additional memory. Multiply budgets by the production worker count.
+The benchmark measures retained object graphs and worker RSS separately rather
+than treating entry count or JSON wire length as memory consumption.
+
+Per-key single-flight covers state, events and future computations. Unrelated
+keys proceed independently; PostgreSQL, analytics, encoding and decoding run
+outside the short cache lock. Failures (including producer cancellation via a
+raised `BaseException`) wake all waiters and remove the flight, permitting retry.
+A disconnected HTTP client does not cancel an active producer; it finishes for
+other waiters. Same-key recursion and nested waits on another producer are
+rejected to prevent dependency cycles within a cache. Exhausted producer/waiter
+budgets reject new admissions rather than queueing indefinitely: single-symbol
+routes return 503 / `Retry-After: 1`; batches collect per-symbol errors. Existing
+producers continue, and cached hits still work.
+
+`GET /api/health/analytics` includes `caches` with `scope: per_worker`, and fixed
+state/event/future groups: hits, misses, evictions, computations, coalesced waits,
+failures, oversized results, rejected admissions, entries, accounted current bytes,
+active producers/waiters and configured limits. Counters reset on worker restart.
+Planning membership probes do not count as hits/misses or alter recency. A miss
+counts each caller without a retained result; computations count elected producers
+and coalesced waits count admitted followers. There are no symbol/date labels.
+
+Keys retain symbol, timeframe, asof and `last_bar_synced_at` distinctions; state
+and event keys also include all analytics settings, events include the limit,
+and future keys include horizon, thresholds and side. Each request reads current
+metadata before planning. A changed stored sync revision makes old entries
+unreachable (they expire by LRU eviction). The revision is the existing
+symbol-wide sync timestamp, not a transactional content hash: direct SQL edits,
+metadata/coverage changes or writes that do not advance `last_bar_synced_at`
+are not detected, and a sync racing a request can mix metadata and bar snapshots.
+There is no cross-worker invalidation broadcast or TTL; writers must advance the
+revision, or workers must be restarted after out-of-band data edits.
+
+For DOC-228's 37-symbol twelve-date working set (468 state entries including
+SPY/QQQ, 444 future entries), this measured configuration fits within the
+unchanged 8 MiB byte budgets:
+
+```bash
+ANALYTICS_STATE_CACHE_ENTRIES=512
+ANALYTICS_FUTURE_CACHE_ENTRIES=512
+```
+
+That is capacity tuning for a finite working set, not a solution for arbitrary
+historical sweeps. VEC-811 tracks multi-date computation reuse; VEC-814 tracks
+further warm-response assembly work. Request-local `BatchReads` stay independent
+and retain lazy, bounded group reads; planning is advisory because eviction can
+happen before use. A coalesced follower does not execute its producer callback,
+although independent leaders can still prefetch overlapping batch groups.
+
+Reproduce unprofiled before/default/tuned HTTP tests and synchronized 16-client
+cold bursts using the same read-only Docker isolation described below. Replace
+the serving command with `python -m analytics.cache_benchmark serve`, then run:
+
+```bash
+python -m analytics.cache_benchmark run --base-url http://127.0.0.1:5008 \
+  --label after-default --output /tmp/cache-default.json
+python -m analytics.cache_benchmark parity --base-url http://127.0.0.1:5008 \
+  --compare-url http://127.0.0.1:5009 --output /tmp/cache-parity.json
+```
+
+Repeat in a fresh container with the two 512-entry settings for the tuned case.
+For the pre-change checkout, mount this checkout's `analytics/cache_benchmark.py`
+at `/bench/cache_benchmark.py`, put the baseline checkout at `/work`, set
+`PYTHONPATH=/work`, and serve with `python /bench/cache_benchmark.py serve`.
+The adapter counts legacy get/set hits/misses/evictions without adding coalescing.
+Benchmark-only `/_benchmark/cache` GET/DELETE routes sample counters, deep retained
+object size, RSS and process-lifetime peak RSS, and reset caches between workloads;
+they are installed only by this isolated entrypoint. Hot and sweep stages include
+warmup; bursts deliberately reset to cold. Raw records include p50/p95/p99,
+completed throughput, capacity/scheduler drops, failures and before/after counters.
+Measured default/tuned comparisons, memory measurements and full-JSON parity are
+recorded in Vector DOC-229 (`vector doc show DOC-229`).
+
 ### High-rate, multi-date portfolio load test (VEC-807)
 
 The stdlib HTTP load generator exercises both historical portfolio endpoints with

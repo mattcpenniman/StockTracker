@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-from copy import copy, deepcopy
+from copy import copy
 from typing import Any
 
 import pandas as pd
 
 from .config import AnalyticsSettings
+from .cache import CacheCapacityError, _StateCache
 from .coverage import historical_coverage
 from .data_access import AnalyticsRepository, BatchReads
 from .indicators import compute_feature_frame, latest_price_payload, sufficiency_flags
@@ -26,33 +26,12 @@ class AnalyticsNotFoundError(RuntimeError):
     pass
 
 
-class _StateCache:
-    def __init__(self, maxsize: int = 256):
-        self.maxsize = maxsize
-        self._data: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
-
-    def get(self, key: tuple) -> dict[str, Any] | None:
-        if key not in self._data:
-            return None
-        self._data.move_to_end(key)
-        return self._data[key]
-
-    def __contains__(self, key: tuple) -> bool:
-        return key in self._data
-
-    def set(self, key: tuple, value: dict[str, Any]) -> None:
-        self._data[key] = value
-        self._data.move_to_end(key)
-        while len(self._data) > self.maxsize:
-            self._data.popitem(last=False)
-
-
 class AnalyticsService:
     def __init__(self, repository: AnalyticsRepository | None = None):
         self.repository = repository or AnalyticsRepository()
-        self._state_cache = _StateCache()
-        self._events_cache = _StateCache()
-        self._future_cache = _StateCache()
+        self._state_cache = _StateCache.configured("state")
+        self._events_cache = _StateCache.configured("event")
+        self._future_cache = _StateCache.configured("future")
 
     def _context_for_symbol(self, symbol: str) -> dict[str, Any]:
         context = self.repository.fetch_symbol_context(symbol)
@@ -129,10 +108,11 @@ class AnalyticsService:
     ) -> dict[str, Any]:
         context = self._context_for_symbol(symbol)
         cache_key = self._state_cache_key(context, timeframe, isoformat_utc(asof_dt), settings)
-        cached = self._state_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        return self._state_cache.get_or_compute(
+            cache_key, lambda: self._compute_symbol_state(context, timeframe, asof_dt, settings),
+        )
 
+    def _compute_symbol_state(self, context, timeframe, asof_dt, settings):
         indicator_timeframe = "1Day"
         price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
         # Keep full daily history: EMA/RSI initialization and YTD depend on it.
@@ -301,7 +281,6 @@ class AnalyticsService:
         latest_for_serialization["timestamp"] = anchor_timestamp
         payload = serialize_state_payload(context["symbol"], timeframe, latest_for_serialization, quality, sections)
         payload["requested_asof"] = isoformat_utc(asof_dt)
-        self._state_cache.set(cache_key, payload)
         return payload
 
     def get_events(
@@ -321,10 +300,11 @@ class AnalyticsService:
             settings.cache_key(),
             event_limit,
         )
-        cached = self._events_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        return self._events_cache.get_or_compute(
+            cache_key, lambda: self._compute_events(context, timeframe, asof_dt, settings, event_limit),
+        )
 
+    def _compute_events(self, context, timeframe, asof_dt, settings, event_limit):
         bars = self.repository.fetch_bars(context["symbol_id"], timeframe, asof_dt)
         if bars.empty:
             raise AnalyticsNotFoundError(
@@ -352,7 +332,6 @@ class AnalyticsService:
             if not price_bars.empty:
                 anchor_timestamp = price_bars.iloc[-1]["timestamp"]
         payload["as_of"] = isoformat_utc(anchor_timestamp)
-        self._events_cache.set(cache_key, payload)
         return payload
 
     def get_future_state(
@@ -378,12 +357,13 @@ class AnalyticsService:
         # Labels use one consistent bar series for the anchor and horizon.
         # State price snapshots may prefer intraday resolution, but that must
         # never turn a requested daily label into N fifteen-minute bars.
-        price_timeframe = timeframe
         cache_key = self._future_cache_key(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side)
-        cached = self._future_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        return self._future_cache.get_or_compute(
+            cache_key, lambda: self._compute_future_state(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side),
+        )
 
+    def _compute_future_state(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side):
+        price_timeframe = timeframe
         anchor_bars = self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt)
         if anchor_bars.empty:
             raise AnalyticsNotFoundError(
@@ -505,7 +485,6 @@ class AnalyticsService:
                 },
             }
         )
-        self._future_cache.set(cache_key, payload)
         return payload
 
     def _state_metric(self, state: dict[str, Any], path: tuple[str, str]) -> float | None:
@@ -559,7 +538,7 @@ class AnalyticsService:
                 continue
             try:
                 benchmark_states[benchmark] = self.get_symbol_state(benchmark, timeframe, asof_dt, settings)
-            except AnalyticsNotFoundError as exc:
+            except (AnalyticsNotFoundError, CacheCapacityError) as exc:
                 benchmark_errors.append({"symbol": benchmark, "error": str(exc)})
 
         for benchmark, state in benchmark_states.items():
@@ -615,8 +594,8 @@ class AnalyticsService:
 
         for symbol in symbols:
             try:
-                states.append(deepcopy(scoped.get_symbol_state(symbol, timeframe, asof_dt, settings)))
-            except AnalyticsNotFoundError as exc:
+                states.append(scoped.get_symbol_state(symbol, timeframe, asof_dt, settings))
+            except (AnalyticsNotFoundError, CacheCapacityError) as exc:
                 errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
 
         self._add_portfolio_ranks(states)
@@ -670,7 +649,7 @@ class AnalyticsService:
                         side=side,
                     )
                 )
-            except AnalyticsNotFoundError as exc:
+            except (AnalyticsNotFoundError, CacheCapacityError) as exc:
                 errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
 
         return clean_json_value(
@@ -689,9 +668,14 @@ class AnalyticsService:
             }
         )
 
+    def cache_diagnostics(self) -> dict[str, Any]:
+        return {"scope": "per_worker", **{name: cache.diagnostics() for name, cache in (
+            ("state", self._state_cache), ("event", self._events_cache), ("future", self._future_cache),
+        )}}
+
     def health(self) -> dict[str, Any]:
         from .runtime import runtime_diagnostics
 
         runtime = runtime_diagnostics()
         ok = self.repository.ping()
-        return {"ok": ok and runtime["ready"], "service": "analytics", "database": "connected" if ok else "disconnected", "runtime": runtime}
+        return {"ok": ok and runtime["ready"], "service": "analytics", "database": "connected" if ok else "disconnected", "runtime": runtime, "caches": self.cache_diagnostics()}
