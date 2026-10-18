@@ -101,6 +101,34 @@ active/total sessions, post-workload transaction state, throughput and median/p9
 latency, including warm caches and eight concurrent callers. Measurement evidence
 is maintained in Vector under VEC-785.
 
+### API request overhead (VEC-805)
+
+Database schema initialization runs once per worker/database configuration, after
+a successful commit. Concurrent requests share initialization; failures are retried.
+Restart workers after externally replacing their schema. Forecast and market-data
+reads still query PostgreSQL on each request as before.
+
+Events reuse their feature-series timestamp or bounded latest-bar reads to retain
+the state's price-anchor policy without calculating an entire second state.
+Indicator history, Rust/Python dispatch and numerical formulas are preserved.
+
+Reproduce live HTTP probes and exact-response before/after measurements:
+
+```bash
+python -m analytics.api_probe --base-url http://192.168.1.80:5005 --repeats 5
+export ANALYTICS_TEST_DATABASE_URL='postgresql://user:password@host/database'
+python -m unittest discover -s tests
+ANALYTICS_BACKEND=rust python -m analytics.api_performance_benchmark --repeats 20
+```
+
+The live probe reads stored data and checks invalid mutation inputs; chart latest
+can perform its normal freshness sync. Successful mutation tests use a private
+schema and deterministic provider data. The performance benchmark also uses a
+private schema, prohibits provider calls, and compares the pinned `1c65793` app
+and service with exact full-JSON equality on each alternating pair. Event requests
+are cold; other measured requests are warm. Full timings, query counts, methodology
+and deployed-baseline results are maintained in Vector: `vector doc show DOC-223`.
+
 ### Bounded analytics price reads (VEC-780)
 
 Price anchors use an inclusive latest-at-or-before query (`ORDER BY bar_time DESC

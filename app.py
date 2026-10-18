@@ -58,6 +58,7 @@ DATABASE_URL = os.environ.get(
 CSV_HEADERS = ["symbol", "forecast_price", "updated_date"]
 EXTENDED_HEADERS = CSV_HEADERS + ["reward_score", "risk_score", "confidence_score", "classification", "hidden"]
 _LOCK = threading.Lock()
+_DB_INITIALIZED_FOR = None
 ALLOWED_CLASSIFICATIONS = {"buy", "hold/watch", "sell"}
 DEFAULT_SCORE = 5.0
 DEFAULT_CLASSIFICATION = "hold/watch"
@@ -190,7 +191,15 @@ def _get_conn():
 
 
 def _init_db_if_needed() -> None:
+    global _DB_INITIALIZED_FOR
+    # Schema setup is process/configuration scoped, not request scoped. Include
+    # the factory so isolated repositories/test schemas initialize independently.
+    key = (os.getpid(), DATABASE_URL, DB_TABLE, EARNINGS_TABLE, _get_conn)
+    if _DB_INITIALIZED_FOR == key:
+        return
     with _LOCK:
+        if _DB_INITIALIZED_FOR == key:
+            return
         with _get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -344,6 +353,8 @@ def _init_db_if_needed() -> None:
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_stock_bars_timeframe_time_symbol ON stock_bars (timeframe, bar_time DESC, symbol_id)"
                 )
+        # Publish only after the transaction commits; failures must be retried.
+        _DB_INITIALIZED_FOR = key
 
 
 def _read_df() -> pd.DataFrame:
@@ -3988,7 +3999,6 @@ def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
             _sync_current_analytics_data_if_needed(symbol, normalized_timeframe)
         payload = analytics_service.get_events(symbol, normalized_timeframe, asof_dt, settings, event_limit=event_limit)
         payload["ok"] = True
-        payload["as_of"] = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)["as_of"]
         if hide_ts:
             payload = _strip_symbol_and_timestamps(payload)
         return jsonify(payload)
@@ -3997,7 +4007,6 @@ def get_analytics_events(symbol: str, timeframe: str | None = None) -> Response:
             _backfill_analytics_symbol_if_needed(symbol)
             payload = analytics_service.get_events(symbol, normalized_timeframe, asof_dt, settings, event_limit=event_limit)
             payload["ok"] = True
-            payload["as_of"] = analytics_service.get_symbol_state(symbol, normalized_timeframe, asof_dt, settings)["as_of"]
             if hide_ts:
                 payload = _strip_symbol_and_timestamps(payload)
             return jsonify(payload)
