@@ -35,6 +35,7 @@ def request(base, endpoint, asof, days, timeout):
         with urlopen(base + "/api/portfolio/" + endpoint + "?" + urlencode(query), timeout=timeout) as response:
             body = response.read()
             record.update(status=response.status, bytes=len(body))
+            record["worker_pid"] = response.headers.get("X-Worker-Pid")
         payload = json.loads(body)
         key = "states" if endpoint == "state" else "future_states"
         count = payload.get("count", 0)

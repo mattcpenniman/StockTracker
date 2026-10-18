@@ -14,6 +14,7 @@ class PortfolioLoadTests(unittest.TestCase):
     def response(self, payload):
         class Response(io.BytesIO):
             status = 200
+            headers = {"X-Worker-Pid": "123"}
         return Response(json.dumps(payload).encode())
 
     def test_partial_http_200_is_failure(self):
@@ -34,6 +35,7 @@ class PortfolioLoadTests(unittest.TestCase):
         })):
             record = request("http://localhost", "futurestate", "2026-03-17", 20, 1)
         self.assertTrue(record["valid"])
+        self.assertEqual(record["worker_pid"], "123")
         summary = summarize([record])
         self.assertEqual(summary["benchmark_error_observations"], 1)
         self.assertEqual(summary["stale_symbol_observations"], 1)
