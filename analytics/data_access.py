@@ -10,6 +10,7 @@ from database import get_connection
 from . import future_labels
 from .state_bars import StateBars
 from .quality import OHLCV_SQL_CHECK
+from .availability import start_bound
 
 
 DATABASE_URL = os.environ.get(
@@ -115,7 +116,7 @@ class AnalyticsRepository:
     def fetch_latest_bar(
         self, symbol_id: int, timeframe: str, asof: datetime | None = None,
     ) -> pd.DataFrame:
-        """Return at most one bar, including a bar exactly at the as-of."""
+        """Return at most one completed bar available at the as-of."""
         return self._fetch_bars(symbol_id, timeframe, asof=asof, descending=True, limit=1)
 
     def fetch_future_bars(
@@ -148,9 +149,9 @@ class AnalyticsRepository:
         if start is not None:
             sql += " AND bar_time >= %s"
             params.append(start.astimezone(timezone.utc))
-        if asof is not None:
+        if after is None or asof is not None:
             sql += " AND bar_time <= %s"
-            params.append(asof.astimezone(timezone.utc))
+            params.append(start_bound(asof, timeframe).to_pydatetime())
         if after is not None:
             sql += " AND bar_time > %s"
             params.append(after.astimezone(timezone.utc))
@@ -208,7 +209,7 @@ class AnalyticsRepository:
                     WHERE symbol_id = %s AND timeframe = '15Min' AND bar_time <= requested.cutoff
                     ORDER BY bar_time DESC LIMIT 1
                 ) bars ORDER BY requested.position
-            """, (cutoffs, symbol_id))
+            """, ([start_bound(c, "15Min").to_pydatetime() for c in cutoffs], symbol_id))
             rows = cur.fetchall()
         frame = self._bar_frame([row[1:] for row in rows], timestamp_unit="us")
         return {int(row[0]) - 1: frame.iloc[idx].to_dict() for idx, row in enumerate(rows)}
@@ -252,9 +253,9 @@ class AnalyticsRepository:
         columns = f"high, low, close, COALESCE(({OHLCV_SQL_CHECK}), false) AS ohlcv_valid" if _labels else "open, high, low, close, volume"
         sql += f" CROSS JOIN LATERAL (SELECT (EXTRACT(EPOCH FROM bar_time) * 1000000)::bigint AS bar_time_us, {columns} FROM stock_bars WHERE symbol_id = requested.symbol_id AND timeframe = %s"
         params.append(timeframe)
-        if asof is not None:
+        if after is None or asof is not None:
             sql += " AND bar_time <= %s"
-            params.append(asof.astimezone(timezone.utc))
+            params.append(start_bound(asof, timeframe).to_pydatetime())
         if after is not None:
             sql += " AND bar_time > anchors.bar_time"
         sql += " ORDER BY bar_time DESC" if latest else " ORDER BY bar_time ASC"

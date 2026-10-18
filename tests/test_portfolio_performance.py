@@ -74,12 +74,14 @@ class TimestampTransportTests(unittest.TestCase):
                 """, (symbol_id,))
             before, after = old_repository(dsn), AnalyticsRepository(dsn)
             cutoff = pd.Timestamp("2026-09-17T13:30:00.123456Z")
+            from analytics.availability import start_bound
+            eligible_start = start_bound(cutoff, "1Day")
             pairs = [
                 (before.fetch_bars(symbol_id, "1Day"), after.fetch_bars(symbol_id, "1Day")),
-                (before.fetch_latest_bar(symbol_id, "1Day", cutoff), after.fetch_latest_bar(symbol_id, "1Day", cutoff)),
+                (before.fetch_latest_bar(symbol_id, "1Day", eligible_start), after.fetch_latest_bar(symbol_id, "1Day", cutoff)),
                 (before.fetch_future_bars(symbol_id, "1Day", cutoff, 1), after.fetch_future_bars(symbol_id, "1Day", cutoff, 1)),
                 (before.fetch_bars_many([symbol_id], "1Day")[symbol_id], after.fetch_bars_many([symbol_id], "1Day")[symbol_id]),
-                (before.fetch_bars_many([symbol_id], "1Day", cutoff, latest=True)[symbol_id],
+                (before.fetch_bars_many([symbol_id], "1Day", eligible_start, latest=True)[symbol_id],
                  after.fetch_bars_many([symbol_id], "1Day", cutoff, latest=True)[symbol_id]),
                 (before.fetch_bars_many([symbol_id], "1Day", after={symbol_id: cutoff}, limit=1)[symbol_id],
                  after.fetch_bars_many([symbol_id], "1Day", after={symbol_id: cutoff}, limit=1)[symbol_id]),

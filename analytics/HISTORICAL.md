@@ -19,6 +19,40 @@ Only `1D`/`1Day` are supported. Cutoffs use the existing `parse_asof`: date-only
 means 23:59:59.999999 UTC; explicit timestamps retain their instant. Cutoff order
 and duplicates are retained with a zero-based `date_index`.
 
+## Bar completion and availability (VEC-829)
+
+All state, event and label-anchor reads use completed stored bars. Daily bars
+are start-labelled aggregates without regular-session-only provenance; their
+UTC label date identifies the session for both legacy 00Z and Alpaca 04Z/05Z
+labels. Final daily OHLCV becomes eligible at **the next America/New_York
+midnight**, including on early-close days. DST uses the IANA timezone, not a
+fixed 24-hour delay. Daily bars can contain extended-hours trades, so neither
+the regular close nor an early close releases them. Weekends and holidays do
+not manufacture bars; freshness diagnostics use the NYSE calendar's previous
+eligible session. At a date-only UTC end-of-day cutoff, that NY date's final
+daily aggregate is still unavailable; request the next NY midnight to include it.
+
+Intraday OHLCV is eligible when `bar_start + full timeframe interval <= cutoff`.
+Premarket and postmarket bars are included, and intervals are never shortened
+at a regular or early close. No partial aggregate is built. At 14:00Z the 13:45Z
+15-minute bar is eligible, but the 14:00Z bar is not. Equality at completion is
+inclusive; equality at a bar's start does not release its final values.
+
+This same policy bounds Python/native inputs, single/batch/portfolio reads,
+SPY/QQQ, historical prefixes, prices and price-dependent ratios/signals. Missing
+intraday prices retain the service's completed-daily fallback. Quality includes
+`bar_availability`, `indicator_available_at` and `price_available_at`; label
+quality includes `anchor_available_at`. Label anchors use the latest eligible
+bar of the requested timeframe; the realized window is the next N stored bars
+strictly after that anchor (not N bars after the requested instant). Its first
+bar can therefore overlap the cutoff. Label OHLCV is deliberately future data.
+
+Eligibility models event-time completion conservatively, not the historical
+instant the provider published or revised each observation. The database has
+no receipt-time/version history; these guarantees do not certify historical
+provider latency or adjustment/revision provenance. Current reads evaluate
+completion against now, rounded down to the cache's minute boundary.
+
 Response: `timeframe`, `symbols`, `date_count`, `sample_count` (requested
 date-symbol pairs), `limits`, `execution`, and `dates`. Each date contains
 `date_index`, original `cutoff`, normalized `requested_asof`, `features` and
@@ -56,7 +90,7 @@ this is still bounded per symbol, independent of the number of cutoffs.
 No provider synchronization or metadata creation occurs. Use the existing
 `POST /api/coverage/prepare` explicitly for missing daily/SPY/QQQ coverage and
 15-minute price windows (respect its symbol/window limits), then rerun. Coverage
-diagnostics retain the seven-calendar-day warning heuristic and
+diagnostics use calendar-aware expected eligible sessions/regular intervals and
 `completeness_verified: false`; a recent anchor is not proof of gap-free data.
 No transaction-wide market-data snapshot is promised across symbol reads.
 

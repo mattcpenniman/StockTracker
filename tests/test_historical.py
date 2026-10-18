@@ -14,6 +14,7 @@ from analytics.data_access import AnalyticsRepository, LabelBar
 from analytics.future_labels import scan_windows
 from analytics.service import AnalyticsService
 from analytics.utils import parse_asof
+from analytics.availability import start_bound
 
 
 class HistoryRepository:
@@ -45,8 +46,8 @@ class HistoryRepository:
         result = {}
         for sid in ids:
             frame = self.frames[sid, tf]
-            if asof is not None:
-                frame = frame[frame.timestamp <= asof]
+            if after is None or asof is not None:
+                frame = frame[frame.timestamp <= start_bound(asof, tf)]
             if after is not None:
                 frame = frame[frame.timestamp > after[sid]]
             result[sid] = (frame.tail(1) if latest else frame.head(limit)).reset_index(drop=True)
@@ -121,15 +122,16 @@ class HistoricalTests(unittest.TestCase):
         self.assertNotEqual(result["dates"][0]["features"]["states"][0]["portfolio"],
                             result["dates"][1]["features"]["states"][0]["portfolio"])
 
-    def test_invalid_history_rejects_symbol_for_entire_shared_sweep(self):
+    def test_invalid_later_history_rejects_only_affected_cutoffs(self):
         dates = ["2024-06-03", "2024-07-02"]
         for value in (0.0, float("nan")):
             self.repo.frames[1, "1Day"].loc[self.repo.frames[1, "1Day"].timestamp > parse_asof("2024-06-15"), "close"] = value
             result = self.service.get_historical_portfolio(["B"], dates, AnalyticsSettings(), 2)
-            for row in result["dates"]:
-                self.assertEqual(row["features"]["states"], [])
-                self.assertEqual(row["features"]["errors"][0]["symbol"], "B")
-                self.assertIn("Invalid OHLCV", row["features"]["errors"][0]["error"])
+            self.assertEqual(len(result["dates"][0]["features"]["states"]), 1)
+            row = result["dates"][1]
+            self.assertEqual(row["features"]["states"], [])
+            self.assertEqual(row["features"]["errors"][0]["symbol"], "B")
+            self.assertIn("Invalid OHLCV", row["features"]["errors"][0]["error"])
 
     def test_no_cache_pollution_and_reads_scale_with_symbols_not_dates(self):
         for n in (12, 60):
@@ -230,7 +232,7 @@ class HistoricalTests(unittest.TestCase):
         self.assertIn("WITH ORDINALITY", sql)
         self.assertIn("bar_time <= requested.cutoff", sql)
         self.assertIn("ORDER BY bar_time DESC LIMIT 1", sql)
-        self.assertEqual(args, (dates, 7))
+        self.assertEqual(args, ([d - pd.Timedelta(minutes=15) for d in dates], 7))
         self.assertEqual(list(result), [1])
 
 

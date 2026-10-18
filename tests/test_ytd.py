@@ -76,8 +76,9 @@ class YtdTests(unittest.TestCase):
             for backend in self.backends:
                 with self.subTest(repo=repo_class, backend=backend), patch.dict(os.environ, ANALYTICS_BACKEND=backend):
                     service = AnalyticsService(repo)
-                    history = service.get_historical_portfolio(["A"], dates, AnalyticsSettings(), 1)
-                    for date, row, value in zip(dates, history["dates"], expected):
+                    cutoffs = [(pd.Timestamp(d) + pd.Timedelta(days=1)).strftime("%Y-%m-%dT05:00:00Z") for d in dates]
+                    history = service.get_historical_portfolio(["A"], cutoffs, AnalyticsSettings(), 1)
+                    for date, row, value in zip(cutoffs, history["dates"], expected):
                         state = row["features"]["states"][0]
                         single = service.get_batch_state(["A"], "1Day", parse_asof(date), AnalyticsSettings())["states"][0]
                         self.assertEqual(state, single)
