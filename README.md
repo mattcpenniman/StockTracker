@@ -1484,13 +1484,35 @@ Historical state and future-label responses report `requested_asof` separately
 from their actual anchors. Inspect `data_quality.historical_coverage`: state
 reports daily indicators and price separately, while labels report their anchor.
 Each includes `actual_bar_timestamp`, `lag_seconds`, `stale`, and `status`.
-`stale_trailing` means more than seven **calendar** days behind the cutoff;
-`within_tolerance` is an age check, not proof of complete history. No exact-date
-bar is required for weekends or holidays. `completeness_verified` remains false:
-this check does not audit interior gaps or use an exchange calendar. Requests
-without an `asof` have `not_evaluated` historical coverage.
+`stale_trailing` now means a missing latest completed NYSE regular session or
+intraday interval, accounting for holidays, weekends, DST and early closes.
+Current requests evaluate against now (freshness cached at most one minute).
+`expected_latest_completed`, `freshness_status`, `anchor_completed`, and `action`
+explain the result. Legacy `within_tolerance` is only a freshness result, not
+validation of the chosen anchor or investment performance. VEC-829 tracks
+completed-bar selection; consumers must check `anchor_completed` separately.
 
-Batch quality summaries list `stale_symbols`; label batches also list
+OHLCV must have finite positive prices, consistent high/low ranges, and finite
+nonnegative integral volume (zero is allowed). Missing or malformed bars reject
+the entire ingestion page before writes and the affected analytics symbol/window;
+no filling or dropping is performed. Batch errors preserve the other symbols.
+Shared historical sweeps reject a symbol for all cutoffs if loaded history is
+malformed. `ohlcv_validation` covers consumed bars only; the database constraint
+enforces new writes with a NOT VALID migration, not certification of legacy rows.
+
+State `session_coverage` independently reports interior missing sessions and
+out-of-calendar dates within observed bounds (counts plus up to 20 examples).
+NYSE regular-session presence is not listing-lifetime, halt-aware, extended-hours
+or intraday-interval completeness. `metric_history` reports per-metric valid-bar
+warmup and usable-value availability; legacy 20/50/200 flags count validated
+observations, not completed sessions. `corporate_action_consistency` remains
+`unknown` without authoritative adjustment provenance; one-bar absolute moves
+of at least 50% trigger review warnings with examples, never automatic rejection
+or normalization. VEC-830/VEC-831 own action normalization and adjustment basis.
+`completeness_verified` remains false regardless of recent anchors or enough rows.
+
+Batch quality summaries list `stale_symbols`, `session_warning_symbols`, and
+`corporate_action_warning_symbols`; label batches also list
 `incomplete_window_symbols`. Check these along with per-symbol `errors` and
 `benchmark_errors` even when HTTP status is 200 and `ok=true`. Per-state
 `benchmark_coverage` reports alignment and benchmark age. Stale or unaligned

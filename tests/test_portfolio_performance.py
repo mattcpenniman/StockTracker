@@ -13,6 +13,7 @@ from analytics.data_access import AnalyticsRepository
 from analytics.io_benchmark import price_fixture
 from analytics.service import AnalyticsService
 from tests.test_analytics import _fixture_bars
+from tests.quality_compat import legacy_quality_contract
 
 
 BASELINE = "8cf31c7"
@@ -35,6 +36,7 @@ class StateSnapshotParityTests(unittest.TestCase):
             for count in (1, 19, 20, 21, 49, 50, 51, 199, 200, 201, 260):
                 bars = _fixture_bars(count)
                 bars["close"] = 100 + 10 * np.sin(np.arange(count) / 3)
+                bars["open"] = bars["close"]
                 bars["high"] = bars.close + 1
                 bars["low"] = bars.close - 1
                 bars["volume"] = np.where(np.arange(count) % 7 == 0, 10000, 1000)
@@ -47,11 +49,14 @@ class StateSnapshotParityTests(unittest.TestCase):
                             repo.fetch_bars.return_value = bars
                             anchor = bars.tail(1).copy()
                             anchor["close"] = 95.0
+                            anchor["open"] = 95.0
+                            anchor["high"] = 96.0
+                            anchor["low"] = 94.0
                             repo.fetch_latest_bar.return_value = anchor
                             settings = AnalyticsSettings(volume_confirmation=confirmation)
                             expected = type(self).baseline(repo).get_symbol_state("TEST", timeframe, None, settings)
                             actual = AnalyticsService(repo).get_symbol_state("TEST", timeframe, None, settings)
-                            self.assertEqual(actual, expected)
+                            self.assertEqual(legacy_quality_contract(actual), legacy_quality_contract(expected))
 
 
 @unittest.skipUnless(os.environ.get("ANALYTICS_TEST_DATABASE_URL"), "requires PostgreSQL")

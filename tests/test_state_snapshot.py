@@ -14,6 +14,7 @@ from analytics.data_access import AnalyticsRepository
 from analytics.service import AnalyticsService
 from analytics.snapshot_benchmark import ReferenceService
 from analytics.state_bars import StateBars
+from analytics.quality import DataQualityError
 from analytics.utils import clean_json_value, parse_asof
 from tests.test_historical import HistoryRepository
 
@@ -59,7 +60,7 @@ class SnapshotTests(unittest.TestCase):
                 for count in (1, 14, 20, 26, 55, 60, 200, 252, 1200, 5000):
                     close = 100 * np.exp(np.cumsum(rng.normal(0, .015, count)))
                     frame = pd.DataFrame(dict(timestamp=pd.date_range("2023-12-20T23:59:59.123456Z", periods=count),
-                        open=close - .5, high=close + rng.uniform(.1, 3, count), low=close - rng.uniform(.1, 3, count),
+                        open=close, high=close + rng.uniform(.1, 3, count), low=close - rng.uniform(.1, 3, count),
                         close=close, volume=rng.integers(0, 10_000_000, count)))
                     for settings in settings_list:
                         with self.subTest(backend=backend, count=count, settings=settings):
@@ -91,17 +92,20 @@ class SnapshotTests(unittest.TestCase):
             cases.append(frame)
         for backend in ["python"] + (["rust"] if indicators._rust_feature_columns else []):
             with patch.dict(os.environ, ANALYTICS_BACKEND=backend):
-                for frame in cases:
+                for case_index, frame in enumerate(cases):
+                    if case_index > 1:
+                        with self.assertRaises(DataQualityError):
+                            indicators.compute_feature_frame(frame, "1Day", AnalyticsSettings())
+                        with self.assertRaises(DataQualityError):
+                            indicators.compute_feature_snapshot(typed(frame), "1Day", AnalyticsSettings())
+                        continue
                     expected = indicators.compute_feature_frame(frame, "1Day", AnalyticsSettings()).iloc[-1].to_dict()
                     actual = indicators.compute_feature_snapshot(typed(frame), "1Day", AnalyticsSettings())
                     self.assertEqual(clean_json_value(actual), clean_json_value(expected))
         missing_timestamp = base.copy()
         missing_timestamp.loc[20, "timestamp"] = pd.NaT
-        actual = indicators.compute_feature_snapshot(missing_timestamp, "1Day", AnalyticsSettings())
-        expected = indicators.compute_feature_frame(missing_timestamp, "1Day", AnalyticsSettings()).iloc[-1].to_dict()
-        self.assertTrue(pd.isna(actual.pop("timestamp")))
-        self.assertTrue(pd.isna(expected.pop("timestamp")))
-        self.assertEqual(clean_json_value(actual), clean_json_value(expected))
+        with self.assertRaises(DataQualityError):
+            indicators.compute_feature_snapshot(missing_timestamp, "1Day", AnalyticsSettings())
 
     def test_extension_absence_old_abi_and_invalid_configuration(self):
         bars = typed(HistoryRepository().frames[0, "1Day"])

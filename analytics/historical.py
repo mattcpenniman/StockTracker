@@ -3,17 +3,15 @@ from dataclasses import fields
 from datetime import datetime
 import json
 import math
-import os
 from threading import BoundedSemaphore
 
-import numpy as np
 import pandas as pd
 
-from . import indicators
 from .config import AnalyticsSettings
 from .data_access import LabelBar
 from .future_labels import scan_windows
 from .indicators import compute_feature_frame
+from .quality import DataQualityError
 from .service import AnalyticsNotFoundError
 from .utils import isoformat_utc, parse_asof
 
@@ -136,22 +134,15 @@ def _run(service, symbols, cutoffs, dates, settings, days, stop, take, side):
         metrics["loaded_rows"] += len(bars)
         if len(bars) > LIMITS["max_history_bars"]:
             raise HistoricalLimitError(f"Daily history for '{symbol}' exceeds 20000 bars; cannot truncate initialization.")
-        features = compute_feature_frame(bars, "1Day", settings) if not bars.empty else bars
+        try:
+            features = compute_feature_frame(bars, "1Day", settings) if not bars.empty else bars
+        except DataQualityError as exc:
+            for i in range(len(dates)):
+                retain(states, i, symbol, exc.with_traceback(None))
+                if symbol in requested:
+                    retain(labels, i, symbol, exc.with_traceback(None))
+            continue
         metrics["feature_computations"] += int(not bars.empty)
-        # Dispatch itself depends on whole-input eligibility. An invalid later
-        # bar must not switch an earlier, eligible prefix from native to Python
-        # (the backends have small floating-point differences). Preserve the
-        # single-date backend choice with at most one extra prefix computation.
-        if not bars.empty and indicators._rust_feature_columns is not None and os.environ.get("ANALYTICS_BACKEND", "auto").lower() != "python":
-            valid = np.isfinite(bars[["close", "high", "low", "volume"]].to_numpy(dtype=float)).all(axis=1)
-            valid &= bars.close.to_numpy() > 0
-            invalid = np.flatnonzero(~valid)
-            if len(invalid) and invalid[0] > 0:
-                boundary = int(invalid[0])
-                prefix = compute_feature_frame(bars.iloc[:boundary], "1Day", settings)
-                features = pd.concat([prefix, features.iloc[boundary:]], ignore_index=True)
-                metrics["feature_computations"] += 1
-                del prefix
         price_dates = [d for d in dates if service._preferred_price_timeframe("1Day", d) == "15Min"]
         prices = service.repository.fetch_historical_price_anchors(sid, price_dates) if price_dates else {}
         metrics["price_reads"] += int(bool(price_dates))
@@ -176,14 +167,17 @@ def _run(service, symbols, cutoffs, dates, settings, days, stop, take, side):
                 state = AnalyticsNotFoundError(f"No bars available for symbol '{symbol}' on timeframe '1Day'.")
             else:
                 price = price_by_date.get(date)
-                state = service._state_from_features(context, "1Day", date, settings, features.iloc[:count],
-                                                     "15Min" if price is not None else "1Day", price)
+                try:
+                    state = service._state_from_features(context, "1Day", date, settings, features.iloc[:count],
+                                                         "15Min" if price is not None else "1Day", price)
+                except DataQualityError as exc:
+                    state = exc.with_traceback(None)
             retain(states, i, symbol, state)
             if symbol in requested:
                 try:
                     label = service._typed_future_from_window(context, "1Day", date, days, stop, take, side,
                         [label_bars[count - 1]] if count else [], windows[i], summaries[i])
-                except AnalyticsNotFoundError as exc:
+                except (AnalyticsNotFoundError, DataQualityError) as exc:
                     # Retain only the error, not a traceback into this request's
                     # frame (which would keep every history/result alive in a cycle).
                     label = exc.with_traceback(None)
