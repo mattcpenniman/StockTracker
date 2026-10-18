@@ -443,6 +443,72 @@ Kernel coverage: single-symbol state, batch state, portfolio state, and events
 calculate indicator features on cache misses. `futurestate` and portfolio
 `futurestate` use price-window labels and do **not** require the indicator kernel.
 
+### Validated Docker rollout (VEC-802)
+
+Compose requires Rust by default (`ANALYTICS_BACKEND=rust`); override explicitly
+for intentional Python deployments. `APP_IMAGE` selects a versioned local or
+registry image, defaulting to `apollo-app`. Keep the release values with the
+deployment record and supply the same `APP_IMAGE` to subsequent Compose commands.
+
+Build from an exact tracked revision, excluding uncommitted host changes:
+
+```bash
+set -euo pipefail
+export BUILD_REVISION=$(git rev-parse origin/master)
+export RELEASE_ID=release-YYYYMMDD-N
+export APP_IMAGE=apollo-app:$RELEASE_ID
+export ANALYTICS_BACKEND=rust
+git archive "$BUILD_REVISION" | docker build \
+  --build-arg BUILD_REVISION="$BUILD_REVISION" --build-arg RELEASE_ID="$RELEASE_ID" \
+  -t "$APP_IMAGE" -
+docker compose run --rm --no-deps app python -m analytics.release_check \
+  --require-rust --expected-revision "$BUILD_REVISION" --expected-release "$RELEASE_ID"
+```
+
+Record the old app image ID and PostgreSQL container/volume identity. Retain a
+rollback image tag and a database backup (`pg_dump -Fc`) before rollout. Apply the
+additive coverage schema using the app's supported initializer, then replace only
+the app; PostgreSQL and its existing volume stay running:
+
+```bash
+docker compose run --rm --no-deps app python -c 'import app; app._init_db_if_needed()'
+docker compose up -d --no-build --no-deps app
+docker compose exec -T app python -m analytics.release_check \
+  --require-rust --expected-revision "$BUILD_REVISION" --expected-release "$RELEASE_ID"
+curl --fail http://127.0.0.1:5005/api/health/analytics
+```
+
+Use your configured host port. Check the actual container's OCI labels/image ID,
+HTTP build identity/readiness, and serving-process native-call deltas around fresh
+historical state, events, batch and portfolio requests. Repeat requests should hit
+caches without new native calls. Check event JSON and daily future-label horizons
+separately. For rollback, set `APP_IMAGE` to the retained old image and repeat the
+app-only `up` command; the additive coverage table can remain.
+
+Reproduce measurements with `analytics/deployment_probe.py` (real PostgreSQL and
+provider paths, including provider writes if a request needs sync):
+
+```bash
+python analytics/deployment_probe.py --base-url http://127.0.0.1:5005 --require-success
+docker exec -i stock-tracker-app python - --instrument --cold-each \
+  --case daily_state --case intraday_events --case portfolio_state --require-success \
+  < analytics/deployment_probe.py
+docker exec -i stock-tracker-app python - --instrument --parity < analytics/deployment_probe.py
+```
+
+The instrumented probe runs a **separate process** in the actual image, with fresh
+service caches when requested; it does not patch serving workers. It counts SQL
+(including pool liveness checks), fetched rows, provider calls and native calls;
+reports feature/kernel, signals, event assembly, repository/frame conversion,
+ranking and JSON timing; and records cumulative process peak RSS on Linux. Nested
+phase timings overlap. Parity compares full historical JSON in fresh Python/Rust
+service instances with `1e-7` absolute/relative numeric tolerance and exact
+structural/label equality; moving current snapshots are excluded. HTTP mode
+measures serving-worker latency but cannot directly instrument its SQL/providers.
+Historical cutoffs and symbols are explicit in `CASES`; run probes sequentially
+for comparable evidence. VEC-802's live deployment measurements are in Vector:
+`vector doc show DOC-222` (release `vec-802-20261018`).
+
 ### Query parameters
 
 - `timeframe`: supported values are `1D`/`1Day`, `1Hour`, `15Min`, `5Min`, `1Min`
