@@ -142,8 +142,11 @@ class AnalyticsService:
                 f"No bars available for symbol '{context['symbol']}' on timeframe '{indicator_timeframe}'."
             )
 
-        features = compute_signal_columns(compute_feature_frame(bars, indicator_timeframe, settings), settings)
-        latest = features.iloc[-1]
+        features = compute_feature_frame(bars, indicator_timeframe, settings)
+        # State returns one snapshot, not historical events. All five exposed
+        # signal flags are calculated from the anchor below, so constructing
+        # full-history signal columns here would only duplicate that work.
+        latest = features.iloc[-1].to_dict()
         anchor_bar = latest
         if price_timeframe != indicator_timeframe:
             anchor_bars = self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt)
@@ -279,7 +282,10 @@ class AnalyticsService:
                 "volume_anomaly": bool(latest.get("volume_anomaly")) if pd.notna(latest.get("volume_anomaly")) else False,
             },
             "signals": {
-                **latest_signal_payload(latest),
+                **latest_signal_payload({
+                    **latest, "is_breakout": is_breakout, "is_breakdown": is_breakdown,
+                    "above_sma20": above_sma20, "above_sma50": above_sma50, "above_sma200": above_sma200,
+                }),
                 "is_breakout": is_breakout,
                 "is_breakdown": is_breakdown,
                 "breakout_strength": breakout_strength,

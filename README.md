@@ -129,6 +129,33 @@ and service with exact full-JSON equality on each alternating pair. Event reques
 are cold; other measured requests are warm. Full timings, query counts, methodology
 and deployed-baseline results are maintained in Vector: `vector doc show DOC-223`.
 
+### Portfolio snapshot overhead (VEC-806)
+
+Portfolio/state snapshots calculate indicators over full history, but use only
+the latest row and the existing scalar anchor-signal calculations for the output.
+They do not build historical signal columns that are then discarded. Event
+endpoints still calculate their complete event history.
+
+Analytics bar queries transport timestamps as exact integer epoch microseconds,
+then convert them to UTC in pandas. This avoids a Python datetime allocation per
+database row without changing timestamp precision, query cutoffs, or ordering.
+
+To compare actual portfolio HTTP latency between two single-process serving
+instances backed by the same data:
+
+```bash
+python -m analytics.portfolio_endpoint_benchmark \
+  --before-url http://127.0.0.1:5007 --after-url http://192.168.1.80:5005 \
+  --repeats 20 --output /tmp/portfolio-results.json
+```
+
+Use `--asof current` to measure the current portfolio (normal freshness sync can
+occur). The probe alternates instance order, compares exact full-response hashes,
+and verifies Rust-call deltas for both cold and warm requests. One warmup pair is
+excluded. Distinct `event_limit` settings force cold state-cache keys without
+changing state math. This probe assumes exclusive benchmark traffic and one
+serving process per instance so health counters refer to the measured worker.
+
 ### Bounded analytics price reads (VEC-780)
 
 Price anchors use an inclusive latest-at-or-before query (`ORDER BY bar_time DESC
