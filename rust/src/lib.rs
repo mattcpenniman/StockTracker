@@ -445,5 +445,50 @@ fn feature_columns<'py>(
 #[pymodule]
 fn apollo_indicators(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(feature_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(future_window_indices, m)?)?;
     Ok(())
+}
+
+// Experimental comparator: one owned conversion per chunk, no timestamps or
+// payload objects in native code. Not selected by the production service.
+#[pyfunction]
+#[pyo3(signature = (windows, anchors, stop_loss, take_profit, short))]
+fn future_window_indices(
+    py: Python<'_>,
+    windows: Vec<Vec<(f64, f64)>>,
+    anchors: Vec<f64>,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    short: bool,
+) -> PyResult<Vec<(i64, i64, i64, i64)>> {
+    if windows.len() != anchors.len() {
+        return Err(PyValueError::new_err("Window/anchor length mismatch"));
+    }
+    Ok(py.allow_threads(move || {
+        windows
+            .iter()
+            .zip(anchors)
+            .map(|(bars, close)| {
+                let direction = if short { -1.0 } else { 1.0 };
+                let stop = stop_loss.map(|pct| close * (1.0 - direction * pct));
+                let take = take_profit.map(|pct| close * (1.0 + direction * pct));
+                let (mut high, mut low, mut stop_hit, mut take_hit) = (-1, -1, -1, -1);
+                for (i, &(h, l)) in bars.iter().enumerate() {
+                    if !h.is_nan() && (high < 0 || h > bars[high as usize].0) {
+                        high = i as i64;
+                    }
+                    if !l.is_nan() && (low < 0 || l < bars[low as usize].1) {
+                        low = i as i64;
+                    }
+                    if stop_hit < 0 && stop.map_or(false, |s| if short { h >= s } else { l <= s }) {
+                        stop_hit = i as i64;
+                    }
+                    if take_hit < 0 && take.map_or(false, |t| if short { l <= t } else { h >= t }) {
+                        take_hit = i as i64;
+                    }
+                }
+                (high, low, stop_hit, take_hit)
+            })
+            .collect()
+    }))
 }
