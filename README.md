@@ -594,6 +594,7 @@ Optional migration env vars:
 - `GET /api/state/<symbol>` - analytics state JSON for one symbol
 - `GET /api/state/<symbol>/<timeframe>` - analytics state JSON for an explicit timeframe
 - `POST /api/state/batch` - analytics state JSON for many symbols
+- `POST /api/portfolio/history` - bounded stored-data daily features and realized labels for many cutoffs
 - `GET /api/events/<symbol>` - recent deterministic event JSON for one symbol
 - `GET /api/events/<symbol>/<timeframe>` - event JSON for an explicit timeframe
 - `GET /api/futurestate/<symbol>` - realized future max/min/end price window from an `asof` date using the next N future bars
@@ -605,6 +606,65 @@ Optional migration env vars:
 - `POST /update-earnings` - refresh the earnings calendar table in PostgreSQL
 
 ## External API
+
+### Historical daily portfolio sweeps (VEC-811)
+
+```bash
+curl -s http://127.0.0.1:5000/api/portfolio/history \
+  -H 'Content-Type: application/json' \
+  -d '{"symbols":["NVDA","AAPL"],"cutoffs":["2026-03-17","2026-06-16T00:00:00Z"],"timeframe":"1D","settings":{"breakout_lookback":55},"days":20,"stop_loss_pct":0.05,"take_profit_pct":0.10,"side":"long"}'
+```
+
+Omit `symbols` to snapshot current saved portfolio membership once (optionally
+`"include_hidden": true`). Date-only cutoffs mean end-of-day UTC; explicit
+timestamps retain their instant. One daily history/feature series is reused per
+symbol, with bounded stored 15-minute price anchors and typed daily future windows.
+The read never fetches provider data: use `/api/coverage/prepare` explicitly for
+missing daily/benchmark and intraday coverage before rerunning.
+
+Response `dates[]` entries contain `date_index`, original `cutoff`, normalized
+`requested_asof`, `features` (existing batch-state schema) and `labels` (existing
+batch-futurestate schema). Join by `(date_index, symbol)`; actual state price and
+daily-label anchor timestamps may differ. Ranks, errors and SPY/QQQ alignment are
+per date. Keep realized future labels separate from historical model inputs;
+inspect coverage and partial-window flags. Current saved membership does not
+represent historical holdings.
+
+Limits: 120 dates, 50 input symbols, 3,000 date-symbol pairs, 1–252 future bars,
+20,000 daily history bars per symbol, 32 MiB compact JSON result, 64 KiB request.
+Oversized requests return 413 without partial output; invalid inputs return 400.
+One sweep per worker (busy: 503 / Retry-After: 1); split larger datasets into
+requests. Full-history initialization is preserved rather than truncated.
+The complete contract, settings, service entrypoint and causality audit are in
+[`analytics/HISTORICAL.md`](analytics/HISTORICAL.md) and `/api-docs`.
+
+Read-only PostgreSQL measurements on 37 stored symbols, Rust indicators, horizon
+20: median 12-date sweep **11.38 → 2.48 s (4.59x)** and 60-date sweep
+**53.27 → 6.59 s (8.08x)**. Complete feature/label JSON matched on all 444/2,220
+date-symbol samples, including coverage/errors/benchmarks. Bulk feature
+computations stayed at 39 (including SPY/QQQ) rather than 468/2,340. At 60 dates,
+reads/rows fell from 540/3,977,819 to 116/71,239; process peak RSS was 201.0 versus
+183.8 MiB. The JSON API probe returned the same full result in 7.17 s / 11.86 MiB.
+Five concurrent cached interactive requests/s increased p95 from 30 to 87 ms
+during the 60-date bulk sweep (maximum 735 ms), so synchronous work still has
+interactive cost. These are isolated service/test-client measurements, not
+network or production-worker capacity measurements.
+
+Reproduce each variant/count in a fresh process with a read-only `DATABASE_URL`
+(`options=-cdefault_transaction_read_only%3Don`); the harness checks read-only
+mode, disables DDL/provider I/O, reports independent peak RSS and full-result
+fingerprints. Repeat with `--variant bulk`, `--date-count 12` and/or
+`--impact-jobs 3`; `--probe-api` also checks the HTTP JSON entrypoint.
+
+```bash
+python -m analytics.historical_benchmark --variant sequential --date-count 60 \
+  --repeats 3 --impact-jobs 1 --output /tmp/sequential60.json
+python -m analytics.historical_benchmark --variant bulk --date-count 60 \
+  --repeats 3 --impact-jobs 3 --probe-api --output /tmp/bulk60.json
+# After also generating sequential12.json and bulk12.json:
+python -m analytics.historical_benchmark --compare-files \
+  /tmp/sequential12.json /tmp/bulk12.json /tmp/sequential60.json /tmp/bulk60.json
+```
 
 ### GET /api/stocks
 ```bash

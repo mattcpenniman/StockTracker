@@ -191,6 +191,25 @@ class AnalyticsRepository:
         return self.fetch_bars_many(symbol_ids, timeframe, asof, latest=latest,
                                     after=after, limit=limit, _labels=True)
 
+    def fetch_historical_price_anchors(self, symbol_id, cutoffs):
+        """At most one 15-minute anchor per cutoff; never materialize intraday history."""
+        if not cutoffs:
+            return {}
+        with self.get_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT requested.position, (EXTRACT(EPOCH FROM bars.bar_time) * 1000000)::bigint,
+                       bars.open, bars.high, bars.low, bars.close, bars.volume
+                FROM unnest(%s::timestamptz[]) WITH ORDINALITY AS requested(cutoff, position)
+                CROSS JOIN LATERAL (
+                    SELECT bar_time, open, high, low, close, volume FROM stock_bars
+                    WHERE symbol_id = %s AND timeframe = '15Min' AND bar_time <= requested.cutoff
+                    ORDER BY bar_time DESC LIMIT 1
+                ) bars ORDER BY requested.position
+            """, (cutoffs, symbol_id))
+            rows = cur.fetchall()
+        frame = self._bar_frame([row[1:] for row in rows], timestamp_unit="us")
+        return {int(row[0]) - 1: frame.iloc[idx].to_dict() for idx, row in enumerate(rows)}
+
     def fetch_label_window(self, symbol_id, timeframe, asof, days):
         anchors = self.fetch_label_bars_many([symbol_id], timeframe, asof, latest=True)
         anchor = anchors[symbol_id]

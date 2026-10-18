@@ -4268,6 +4268,49 @@ def get_analytics_batch_state() -> Response:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.post("/api/portfolio/history")
+def get_portfolio_history() -> Response:
+    from analytics.historical import HistoricalBusyError, HistoricalLimitError, historical_settings
+
+    try:
+        if request.content_length is not None and request.content_length > 65536:
+            raise HistoricalLimitError("Historical request body exceeds 64 KiB.")
+        raw = request.stream.read(65537)
+        if len(raw) > 65536:
+            raise HistoricalLimitError("Historical request body exceeds 64 KiB.")
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("A JSON object is required.") from exc
+        if not isinstance(body, dict):
+            raise ValueError("A JSON object is required.")
+        allowed = {"symbols", "include_hidden", "cutoffs", "timeframe", "settings", "days",
+                   "stop_loss_pct", "take_profit_pct", "side"}
+        if body.keys() - allowed:
+            raise ValueError("Unknown request fields: " + ", ".join(sorted(body.keys() - allowed)))
+        if _normalize_analytics_timeframe(body.get("timeframe") or "1Day") != "1Day":
+            raise ValueError("Historical sweeps support daily timeframe only (1D/1Day).")
+        include_hidden = body.get("include_hidden", False)
+        if not isinstance(include_hidden, bool):
+            raise ValueError("'include_hidden' must be a boolean.")
+        if "symbols" in body and "include_hidden" in body:
+            raise ValueError("'include_hidden' only applies when symbols are omitted.")
+        symbols = body["symbols"] if "symbols" in body else _portfolio_symbols(include_hidden=include_hidden)
+        result = analytics_service.get_historical_portfolio(
+            symbols, body.get("cutoffs"), historical_settings(body.get("settings", {})),
+            body.get("days", 20), body.get("stop_loss_pct"), body.get("take_profit_pct"), body.get("side", "long"))
+        result["ok"] = True
+        return jsonify(result)
+    except HistoricalLimitError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 413
+    except HistoricalBusyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503, {"Retry-After": "1"}
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.get("/api/portfolio/state")
 def get_portfolio_analytics_state() -> Response:
     try:
@@ -4471,6 +4514,29 @@ def api_docs() -> Response:
 
         <h2>Analytics Endpoints</h2>
         <p>These endpoints expose non-visual market state JSON built from already-synced OHLCV bars in PostgreSQL.</p>
+
+        <h2>POST /api/portfolio/history</h2>
+        <p>Bounded synchronous daily historical sweep, with one history read and feature computation per symbol.
+        Omit <code>symbols</code> to use current saved portfolio membership; <code>include_hidden</code> is a JSON boolean (default false).
+        Explicit symbols are normalized/deduplicated. Cutoff order and duplicates are retained; date-only means end-of-day UTC.
+        Only <code>1D</code>/<code>1Day</code> is supported. <code>settings</code> accepts AnalyticsSettings fields for the entire sweep.
+        Defaults: days=20, side=long, thresholds=null. Percentages are fractions.</p>
+<pre><code>curl -s http://127.0.0.1:5000/api/portfolio/history -H 'Content-Type: application/json' \\
+  -d '{"symbols":["NVDA","AAPL"],"cutoffs":["2026-03-17","2026-06-16T00:00:00Z"],"timeframe":"1D","settings":{"breakout_lookback":55},"days":20,"stop_loss_pct":0.05,"take_profit_pct":0.10,"side":"long"}'</code></pre>
+        <p>Response: <code>ok, timeframe, symbols, date_count, sample_count, limits, execution, dates</code>.
+        Each <code>dates[]</code> item has <code>date_index, cutoff, requested_asof, features, labels</code>.
+        Features and labels use the existing batch-state and batch-futurestate schemas, including per-symbol errors,
+        quality/coverage and actual timestamps. Each date has independent ranks and SPY/QQQ alignment.
+        Join by <code>(date_index, symbol)</code>: features may use stored 15-minute price anchors; realized labels always use daily bars.
+        Keep realized future labels separate from historical model inputs. Partial horizons retain their existing quality flags.</p>
+        <p>Limits: 120 dates, 50 input symbols, 3,000 date-symbol pairs, 1–252 future bars, 20,000 daily history bars per symbol,
+        32 MiB compact JSON output, 64 KiB request. Size limits return 413 without partial output; invalid inputs return 400.
+        One sweep per worker; busy returns 503 with Retry-After: 1. Split larger requests into chunks.
+        Full-history seeds are preserved; oversized histories are rejected rather than truncated.
+        Execution counters report history/price/tail reads, rows and feature computations.</p>
+        <p>This entrypoint never synchronizes providers or creates metadata. Prepare missing daily/benchmark and 15-minute coverage explicitly
+        with <code>POST /api/coverage/prepare</code>, then rerun. Recent anchors are not proof of complete data;
+        <code>completeness_verified</code> remains false. Saved membership is current, not historical holdings.</p>
 
         <h2>GET /api/state/&lt;symbol&gt;</h2>
         <p>Returns current or backdated analytics state for one symbol. Optional query parameters: <code>timeframe</code>, <code>asof</code>, <code>breakout_lookback</code>, <code>buffer_pct</code>, <code>volume_confirmation</code>, <code>volume_multiple</code>. If you request an intraday timeframe like <code>15Min</code>, the anchor price comes from the intraday bar at or before <code>asof</code> while moving averages and regimes still use daily bars.</p>
