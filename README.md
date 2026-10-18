@@ -156,6 +156,84 @@ excluded. Distinct `event_limit` settings force cold state-cache keys without
 changing state math. This probe assumes exclusive benchmark traffic and one
 serving process per instance so health counters refer to the measured worker.
 
+### High-rate, multi-date portfolio load test (VEC-807)
+
+The stdlib HTTP load generator exercises both historical portfolio endpoints with
+fixed-clock arrival rates and bounded concurrency. It reports per-endpoint/date
+p50/p95/p99, offered and completed throughput, client admission/scheduler drops,
+HTTP/application errors, response sizes and data-quality observations. An HTTP
+200 with missing symbols is a failure; stale coverage/benchmark warnings and
+incomplete future windows are counted separately. JSON contains raw request
+records as well as summaries; overloaded stages fully drain before the next.
+
+```bash
+python -m analytics.portfolio_load --base-url http://127.0.0.1:5008 \
+  --dates 2026-03-17,2026-06-16,2026-09-16 --rates 5,25,50,100 \
+  --duration 15 --concurrency 32 --warmup --output /tmp/portfolio-hot.json
+```
+
+Use `--endpoint state` or `--endpoint futurestate` for isolated endpoint load.
+For a date sweep exceeding the current 256-entry per-symbol caches:
+
+```bash
+python -m analytics.portfolio_load --base-url http://127.0.0.1:5008 \
+  --dates 2026-02-17,2026-02-24,2026-03-17,2026-03-24,2026-04-15,2026-04-22,2026-05-15,2026-05-22,2026-06-16,2026-07-15,2026-08-18,2026-09-16 \
+  --rates 1,5,10 --duration 30 --concurrency 16 --warmup \
+  --output /tmp/portfolio-sweep.json
+```
+
+Select dates covered by your own portfolio data with enough future trading bars.
+Date-only cutoffs use the application's end-of-day semantics: state may use
+15-minute price anchors while daily indicators and daily future labels retain
+their existing timeframes. `--warmup` requests each case once and aborts on
+partial portfolios; a working set exceeding the cache cannot remain warm.
+Latency percentiles cover completed requests, including drain; client drops
+must be considered alongside them when interpreting overload capacity.
+
+An isolated serving/profiling entrypoint uses the same routes and stored data,
+prohibits provider calls and bypasses deployment DDL. For the compose setup,
+from the repository root, with the existing image containing the Rust extension:
+
+```bash
+IMAGE=$(docker inspect stock-tracker-app --format '{{.Config.Image}}')
+docker run -d --rm --name apollo-portfolio-load --network apollo_default \
+  -p 127.0.0.1:5008:5000 -v "$PWD:/work:ro" -v /tmp:/results -w /work \
+  -e PYTHONDONTWRITEBYTECODE=1 -e ANALYTICS_BACKEND=rust \
+  -e 'DATABASE_URL=postgresql://stock_user:stock_pass@postgres:5432/stock_tracker?options=-cdefault_transaction_read_only%3Don' \
+  "$IMAGE" python -m analytics.portfolio_load_local serve
+
+# Run profiles after HTTP load has finished, without competing benchmark traffic.
+docker exec apollo-portfolio-load python -m analytics.portfolio_load_local profile \
+  --repeats 3 --output /results/portfolio-profile-rust.json
+docker exec -e ANALYTICS_BACKEND=python apollo-portfolio-load \
+  python -m analytics.portfolio_load_local profile \
+  --repeats 3 --output /results/portfolio-profile-python.json
+
+# Use --timing-only for uninstrumented cold/warm wall-clock comparisons.
+docker exec apollo-portfolio-load python -m analytics.portfolio_load_local profile \
+  --timing-only --repeats 5 --output /results/portfolio-timing-rust.json
+docker stop apollo-portfolio-load
+python -m unittest tests.test_portfolio_load
+```
+
+Adapt image/network/credentials to your environment. This setup uses a separate
+threaded Werkzeug process and a read-only database connection; the application
+container and its caches are not the load target. Profiling uses sequential Flask
+test-client requests with fresh services for cold samples and immediate warm
+repeats. cProfile overhead is substantial: use it for hotspot attribution and
+`--timing-only`/HTTP runs for latency. Each profile output records observed backend
+dispatch counters, per-function call counts and cumulative/self times.
+
+Measured 2026-10-18 on 37 actual portfolio symbols: the three-date mixed workload
+handled 25 req/s below 50 ms p95, saturating around 37–38 req/s; twelve dates
+exceeding the caches saturated near 3.3 req/s. Rust already reduced cold state
+median from 2,378 to 838 ms, but cold future labels spent ~59% of profiled time
+materializing tiny pandas frames. Warm requests were dominated by membership
+DataFrame creation, copying and JSON cleanup. These are single-worker local
+observations with existing coverage warnings, not production capacity guarantees.
+Full tables, methodology, coverage findings and prioritized Rust/Python/cache
+recommendations are maintained in Vector: `vector doc show DOC-228`.
+
 ### Bounded analytics price reads (VEC-780)
 
 Price anchors use an inclusive latest-at-or-before query (`ORDER BY bar_time DESC
