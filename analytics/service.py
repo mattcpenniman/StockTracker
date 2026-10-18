@@ -151,7 +151,7 @@ class AnalyticsService:
         result["data_quality"].update(clean_json_value({
             "ohlcv_validation": {"status": "passed", "valid_bar_count": len(bars), "policy": "reject_entire_symbol_on_invalid_bar"},
             "session_coverage": session_coverage(pd.to_datetime(bars.timestamps, unit="us", utc=True) if isinstance(bars, StateBars) else bars["timestamp"]),
-            "corporate_action_consistency": corporate_action_diagnostics(bars),
+            "corporate_action_consistency": corporate_action_diagnostics(bars, context),
             "completeness_verified": False,
         }))
         return result
@@ -166,7 +166,7 @@ class AnalyticsService:
         result["data_quality"].update(clean_json_value({
             "ohlcv_validation": {"status": "passed", "valid_bar_count": len(features), "policy": "reject_entire_symbol_on_invalid_bar"},
             "session_coverage": session_coverage(features["timestamp"]),
-            "corporate_action_consistency": corporate_action_diagnostics(features),
+            "corporate_action_consistency": corporate_action_diagnostics(features, context),
             "completeness_verified": False,
         }))
         return result

@@ -83,7 +83,8 @@ class AnalyticsRepository:
                            b.adjustment_modes,
                            b.adjusted_through,
                            b.checked_at,
-                           b.source
+                           b.source,
+                           b.corporate_actions
                     FROM symbol_metadata sm
                     LEFT JOIN symbol_sync_state ss ON ss.symbol_id = sm.id
                     LEFT JOIN market_data_basis b ON b.symbol_id = sm.id
@@ -117,7 +118,8 @@ class AnalyticsRepository:
             "adjustment_basis": {"revision": row[16], "modes": row[17],
                                  "adjusted_through": row[18].isoformat(), "checked_at": row[19].isoformat(),
                                  "source": row[20], "policy": "full_retained_history_refresh",
-                                 "economic_actions_verified": False} if row[16] else None,
+                                 "economic_actions_verified": False,
+                                 "corporate_actions": row[21]} if row[16] else None,
         }
 
     def fetch_bars(

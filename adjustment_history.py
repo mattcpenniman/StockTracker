@@ -1,15 +1,17 @@
 """Conservative provider-basis refresh: stage every retained timeframe, publish once.
 
-No factors are inferred from price moves. Revision is a digest of provider OHLCV,
-configuration and source, not a claim that the provider handles ADR conversions.
+No factors are inferred from price moves. Revision fingerprints provider OHLCV,
+configuration, source and reviewed issuer conversions, not all economic actions.
 """
 import hashlib
 import json
 from datetime import datetime, timezone
+from corporate_actions import action_manifest, normalize_actions
 
 
 def refresh_history(conn, symbol_id, symbol, timeframe, start, end, *, fetch,
-                    normalize, write, mode, source, now, deltas, finalized_through):
+                    normalize, write, mode, source, now, deltas, finalized_through,
+                    fetch_raw=None):
     with conn.cursor() as cur:
         # Serialize all preparations for this symbol across processes/timeframes.
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (symbol_id,))
@@ -26,8 +28,22 @@ def refresh_history(conn, symbol_id, symbol, timeframe, start, end, *, fetch,
         staged = {}
         checked_at = now()
         modes = {tf: mode(tf) for tf in bounds}
+        actions = action_manifest(symbol)
         for tf, (lo, hi) in sorted(bounds.items()):
             bars = fetch(symbol, tf, lo, hi)
+            # Validate provider input and raw reference before converting units.
+            if symbol == "AZN":
+                normalize(symbol_id, tf, bars)
+            def raw_reference(sym, frame, left, right):
+                if fetch_raw is None:
+                    raise ValueError("AZN conversion requires raw provider reference data.")
+                raw = fetch_raw(sym, frame, left, right)
+                normalize(symbol_id, frame, raw)
+                return raw
+            bars, evidence = normalize_actions(symbol, tf, bars, modes[tf],
+                fetch_raw=raw_reference, start=lo, end=hi)
+            if evidence:
+                actions["reviewed_actions"].append(evidence)
             rows = normalize(symbol_id, tf, bars)
             times = [row[2] for row in rows]
             if len(set(times)) != len(times) or any(t < lo or t > hi for t in times):
@@ -41,7 +57,7 @@ def refresh_history(conn, symbol_id, symbol, timeframe, start, end, *, fetch,
         if now().date() != checked_at.date() or any(mode(tf) != modes[tf] for tf in bounds):
             raise RuntimeError("Adjustment basis changed during preparation; retry.")
         digest = hashlib.sha256(json.dumps({
-            "source": source, "modes": modes,
+            "source": source, "modes": modes, "corporate_actions": actions,
             "bars": {tf: sorted(rows, key=lambda row: row[2]) for tf, (_, rows) in sorted(staged.items())},
         }, default=str, sort_keys=True).encode()).hexdigest()
         cur.execute("SELECT revision FROM market_data_basis WHERE symbol_id = %s", (symbol_id,))
@@ -61,12 +77,13 @@ def refresh_history(conn, symbol_id, symbol, timeframe, start, end, *, fetch,
                     VALUES (%s, %s, %s, %s, %s, %s)""",
                     (symbol_id, tf, lo, covered_end, digest, modes[tf]))
         cur.execute("""INSERT INTO market_data_basis
-            (symbol_id, revision, source, adjustment_modes, adjusted_through, checked_at)
-            VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+            (symbol_id, revision, source, adjustment_modes, adjusted_through, checked_at, corporate_actions)
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb)
             ON CONFLICT (symbol_id) DO UPDATE SET revision = EXCLUDED.revision,
                 source = EXCLUDED.source, adjustment_modes = EXCLUDED.adjustment_modes,
-                adjusted_through = EXCLUDED.adjusted_through, checked_at = EXCLUDED.checked_at""",
-            (symbol_id, digest, source, json.dumps(modes), checked_at.date(), checked_at))
+                adjusted_through = EXCLUDED.adjusted_through, checked_at = EXCLUDED.checked_at,
+                corporate_actions = EXCLUDED.corporate_actions""",
+            (symbol_id, digest, source, json.dumps(modes), checked_at.date(), checked_at, json.dumps(actions)))
         if previous is None or previous[0] != digest:
             cur.execute("""UPDATE symbol_sync_state SET last_bar_synced_at = clock_timestamp(),
                 updated_at = clock_timestamp() WHERE symbol_id = %s""", (symbol_id,))

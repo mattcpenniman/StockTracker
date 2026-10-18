@@ -27,6 +27,7 @@ from live_prices import PriceCache, YahooQuotes
 from database import get_connection
 from market_sync import SyncFlights
 from adjustment_history import refresh_history
+from corporate_actions import POLICY_REVISION
 
 # Load environment variables from a .env file in the same directory (if present)
 try:
@@ -323,6 +324,7 @@ def _init_db_if_needed() -> None:
                     );
                     ALTER TABLE market_data_coverage ADD COLUMN IF NOT EXISTS adjustment_revision TEXT;
                     ALTER TABLE market_data_coverage ADD COLUMN IF NOT EXISTS adjustment_mode TEXT;
+                    ALTER TABLE market_data_basis ADD COLUMN IF NOT EXISTS corporate_actions JSONB NOT NULL DEFAULT '{}'::jsonb;
                 """)
                 # Enforce new writes without claiming legacy rows were audited.
                 cur.execute(f"""
@@ -917,14 +919,14 @@ def _extract_symbol_bars(payload: Dict, symbol: str) -> List[Dict]:
     return []
 
 
-def _fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: datetime) -> List[Dict]:
+def _fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: datetime, *, adjustment_override=None) -> List[Dict]:
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe '{timeframe}'.")
 
     symbol = symbol.upper()
     page_token = None
     bars: List[Dict] = []
-    adjustment = _alpaca_bar_adjustment_for_timeframe(timeframe)
+    adjustment = adjustment_override or _alpaca_bar_adjustment_for_timeframe(timeframe)
 
     while True:
         payload = _alpaca_get_json(
@@ -1045,6 +1047,7 @@ def _refresh_adjusted_history(symbol_id, symbol, timeframe, start, end):
         return refresh_history(conn, symbol_id, symbol, timeframe, start, end,
             fetch=_fetch_alpaca_bars, normalize=_normalize_bar_rows, write=_upsert_stock_bars,
             mode=_alpaca_bar_adjustment_for_timeframe, source=ALPACA_DATA_BASE_URL,
+            fetch_raw=lambda sym, tf, lo, hi: _fetch_alpaca_bars(sym, tf, lo, hi, adjustment_override="raw"),
             now=_utcnow, deltas=TIMEFRAME_DELTAS,
             finalized_through=_utcnow() - timedelta(minutes=max(CHART_DELAY_MINUTES, 0)))
 
@@ -1249,7 +1252,7 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int, before: dateti
             )
             latest_bar_row = cur.fetchone()
 
-            cur.execute("""SELECT revision, source, adjustment_modes, adjusted_through, checked_at
+            cur.execute("""SELECT revision, source, adjustment_modes, adjusted_through, checked_at, corporate_actions
                 FROM market_data_basis WHERE symbol_id = %s""", (symbol_id,))
             basis = cur.fetchone()
 
@@ -1299,6 +1302,7 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int, before: dateti
             "revision": basis[0], "source": basis[1], "modes": basis[2],
             "adjusted_through": basis[3].isoformat(), "checked_at": basis[4].isoformat(),
             "policy": "full_retained_history_refresh", "economic_actions_verified": False,
+            "corporate_actions": basis[5],
         } if basis else None,
     }
 
@@ -1667,6 +1671,11 @@ def _historical_price_coverage(symbol: str, timeframe: str, start: datetime, end
                 (symbol_id, timeframe, end, symbol_id, timeframe),
             )
             anchor, latest = cur.fetchone()
+            if symbol.strip().upper() == "AZN":
+                cur.execute("SELECT corporate_actions FROM market_data_basis WHERE symbol_id = %s", (symbol_id,))
+                basis = cur.fetchone()
+                if not basis or basis[0].get("policy_revision") != POLICY_REVISION:
+                    return None, None, []
             cur.execute(
                 """
                 SELECT window_start, window_end FROM market_data_coverage c
@@ -4740,6 +4749,7 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
         <h3>Historical coverage and daily preparation</h3>
         <p>Every actual provider ingestion refreshes the full retained history and verified-window envelopes for all stored timeframes of that symbol. Publication of bars, adjustment provenance, replacement coverage receipts and cache invalidation is atomic; concurrent preparations serialize per symbol, and analytics reads use one database snapshot. Daily and intraday requests share <code>ALPACA_BAR_ADJUSTMENT</code> (default <code>split</code>). Changed configurations invalidate coverage receipts. This conservative policy increases provider I/O and holds a database connection while fetching history. Missing retained timestamps or failed pages abort the refresh and preserve the preceding generation.</p>
         <p><code>adjustment_basis</code> (under state/label <code>data_quality</code>, and at top level for events/charts) reports the latest content/configuration revision, provider source, modes, adjusted-through date and check time. The revision fingerprints the provider history; it is not a corporate-action event ID or a historical data-vintage archive. Legacy rows have null provenance until successfully refreshed. <code>economic_actions_verified=false</code> remains explicit: provider split adjustment does not certify ADR conversions or other non-split actions (VEC-830), and no correction is inferred from move magnitude. Default split-adjusted returns are price returns without dividend reinvestment.</p>
+        <p><code>adjustment_basis.corporate_actions</code> records the reviewed unit-conversion policy, issuer sources, factors, per-timeframe raw-reference digests and unresolved distributions. AZN history before 2 February 2026 is expressed in current ordinary-share units: OHLC and VWAP multiply by 2, volume divides by 2 (nearest integer, half up), trade count is unchanged. Raw and split modes both use these canonical units; split retains the provider's other split handling. Same-timestamp raw comparisons prevent double conversion if the provider already applies the issuer factor; an unrecognized basis or missing reference aborts publication. AZN dividend/all modes remain unsupported pending reconciliation. SNX's 1 December 2020 Concentrix distribution is issuer-confirmed, but its parent-only price series is preserved and explicitly flagged: a distributed share is not a split and this API does not reconstruct total shareholder return. Reviewed factors do not certify other economic actions or session completeness.</p>
         <p>HTTP success and <code>ok=true</code> report execution, not validated investment performance or complete history. Ingestion rejects an entire provider page before writing if required OHLCV is missing, nonnumeric, nonfinite, nonpositive OHLC, outside its high/low range, or has negative/fractional volume. Zero volume is valid. Analytics rejects the entire affected symbol/window, never fills or drops invalid bars, and keeps other portfolio symbols in <code>states</code> with failures in <code>errors</code>. Shared historical sweeps reject the symbol for all requested cutoffs if their loaded history is malformed. The database constraint enforces new writes; its NOT VALID migration does not certify pre-existing rows.</p>
         <p><strong>Completed-bar policy:</strong> All state paths (single, batch, portfolio and historical), benchmarks, events and future-label anchors consume only completed stored bars. Daily OHLCV may include extended hours and becomes eligible at the <strong>next America/New_York midnight</strong> after its UTC-labelled session date (both legacy 00Z and provider 04Z/05Z labels). DST follows that timezone. Neither a regular close nor an early close releases the full-day aggregate. Intraday bars, including premarket/postmarket, become eligible at <code>bar_start + full interval &lt;= cutoff</code>; intervals are not shortened at exchange closes. No partial bars are built. At 14:00Z a 13:45Z 15-minute bar is eligible, a 14:00Z bar is not. Date-only cutoffs remain 23:59:59.999999 UTC, so that New York date's daily aggregate is still unavailable; use the following NY midnight to include it. Holidays/weekends do not create synthetic bars. Price-dependent calculations use the eligible price anchor. Future labels use the next N stored bars strictly after their eligible anchor; the first label bar can overlap the requested instant and deliberately contains future data.</p>
         <p><code>data_quality.bar_availability</code>, <code>indicator_available_at</code>, <code>price_available_at</code> and label <code>anchor_available_at</code> expose this policy. Completion is conservative event-time eligibility, not proof of provider publication time: receipt times and revisions are not versioned. <code>ohlcv_validation</code> certifies numeric/range checks only. <code>historical_coverage</code> separates indicators and price; labels report anchor coverage and <code>complete_future_window</code> (bar count only). Current requests evaluate against now rounded down to the minute; historical requests use the cutoff. Daily freshness uses the NYSE calendar's latest eligible session (holidays, weekends, DST and early closes accounted for); intraday freshness compares regular-session completed intervals, not extended-hours completeness. <code>expected_latest_completed</code>, <code>freshness_status</code>, <code>anchor_completed</code> and remediation <code>action</code> explain results. Legacy <code>within_tolerance</code> means no missing expected eligible session/interval, not proof of complete history.</p>

@@ -1138,6 +1138,35 @@ If keeping a rollback, update the host `.env`/release selection to that image as
 well; the inline override lasts only for the command. Keep PostgreSQL and its
 volume running. The rollback path was prepared, not exercised on the live app.
 
+### Issuer unit-conversion repair (VEC-830)
+
+After deploying the conversion-aware ingestion code and running the supported
+schema initializer, run `python -m analytics.repair_corporate_actions` in the app
+environment to repair retained AZN history. The command re-fetches every retained
+timeframe, reconciles pre-2-February-2026 provider observations against raw bars,
+and publishes current ordinary-share units with issuer factor provenance,
+replacement coverage receipts and cache invalidation in one transaction. It does
+not multiply existing stored values in place. Repeated runs are idempotent with
+unchanged provider content. Missing raw references or unrecognized provider
+adjustments abort publication. Keep the usual database backup before a rollout.
+
+AZN OHLC/VWAP use 2 old ADSs per ordinary share; pre-action volume is halved and
+rounded to the nearest integer (half up), and trade counts are unchanged. Both
+`raw` and `split` modes canonicalize this unit transition; split mode retains
+provider split handling. Dividend/all modes fail explicitly for AZN until their
+basis is reconciled. `adjustment_basis.corporate_actions` stores issuer URLs,
+factor verification, raw-reference digests, applied timeframes and unresolved
+actions. `economic_actions_verified=false` continues to mean that the entire
+series has not been economically certified. Legacy AZN history is explicitly
+flagged until repaired, and legacy preparation receipts cannot bypass repair.
+
+SNX's 1-Dec-2020 one-for-one CNXC distribution is confirmed by SYNNEX's FY2020
+10-K (Item 1, p1), but its -52.58% parent-only move is not certified as erroneous.
+The series is preserved and the distribution explicitly flagged. Default returns
+are price returns, without dividends/distribution reinvestment; this change does
+not turn them into total shareholder returns. Other large moves remain review
+candidates, with no magnitude-based normalization.
+
 ### Validated Docker rollout (VEC-802)
 
 Compose requires Rust by default (`ANALYTICS_BACKEND=rust`); override explicitly
