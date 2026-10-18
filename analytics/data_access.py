@@ -120,7 +120,8 @@ class AnalyticsRepository:
         limit: int | None = None,
     ) -> pd.DataFrame:
         sql = """
-            SELECT bar_time, open, high, low, close, volume
+            SELECT (EXTRACT(EPOCH FROM bar_time) * 1000000)::bigint AS bar_time_us,
+                   open, high, low, close, volume
             FROM stock_bars
             WHERE symbol_id = %s
               AND timeframe = %s
@@ -145,10 +146,10 @@ class AnalyticsRepository:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
 
-        return self._bar_frame(rows)
+        return self._bar_frame(rows, timestamp_unit="us")
 
     @staticmethod
-    def _bar_frame(rows) -> pd.DataFrame:
+    def _bar_frame(rows, timestamp_unit=None) -> pd.DataFrame:
         if not rows:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
@@ -156,7 +157,7 @@ class AnalyticsRepository:
             rows,
             columns=["bar_time", "open", "high", "low", "close", "volume"],
         )
-        timestamps = pd.to_datetime(df["bar_time"], utc=True)
+        timestamps = pd.to_datetime(df["bar_time"], utc=True, cache=False, unit=timestamp_unit)
         return pd.DataFrame(
             {
                 "timestamp": timestamps,
@@ -187,7 +188,7 @@ class AnalyticsRepository:
                 raise ValueError("'limit' must be greater than zero.")
             sql += " JOIN unnest(%s::timestamptz[]) WITH ORDINALITY AS anchors(bar_time, position) USING (position)"
             params.append([after[sid].astimezone(timezone.utc) for sid in ids])
-        sql += " CROSS JOIN LATERAL (SELECT bar_time, open, high, low, close, volume FROM stock_bars WHERE symbol_id = requested.symbol_id AND timeframe = %s"
+        sql += " CROSS JOIN LATERAL (SELECT (EXTRACT(EPOCH FROM bar_time) * 1000000)::bigint AS bar_time_us, open, high, low, close, volume FROM stock_bars WHERE symbol_id = requested.symbol_id AND timeframe = %s"
         params.append(timeframe)
         if asof is not None:
             sql += " AND bar_time <= %s"
@@ -198,14 +199,14 @@ class AnalyticsRepository:
         if latest or limit is not None:
             sql += " LIMIT %s"
             params.append(1 if latest else limit)
-        sql += ") bars ORDER BY requested.position, bars.bar_time"
+        sql += ") bars ORDER BY requested.position, bars.bar_time_us"
         with self.get_conn() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
         grouped = {sid: [] for sid in ids}
         for row in rows:
             grouped[row[0]].append(row[1:])
-        return {sid: self._bar_frame(values) for sid, values in grouped.items()}
+        return {sid: self._bar_frame(values, timestamp_unit="us") for sid, values in grouped.items()}
 
 
 class BatchReads:
