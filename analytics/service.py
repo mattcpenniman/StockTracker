@@ -327,6 +327,25 @@ class AnalyticsService:
         features = compute_feature_frame(bars, timeframe, settings)
         events = generate_events(features, settings, event_limit=event_limit or settings.event_limit)
         payload = serialize_events(context["symbol"], timeframe, events)
+        # The route historically built an entire daily state only to obtain its
+        # price timestamp. Preserve that exact anchor/fallback policy with bounded
+        # reads, reusing the already computed event series where possible.
+        daily_bars = features if timeframe == "1Day" else self.repository.fetch_latest_bar(
+            context["symbol_id"], "1Day", asof_dt,
+        )
+        if daily_bars.empty:
+            raise AnalyticsNotFoundError(
+                f"No bars available for symbol '{context['symbol']}' on timeframe '1Day'."
+            )
+        anchor_timestamp = daily_bars.iloc[-1]["timestamp"]
+        price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
+        if price_timeframe != "1Day":
+            price_bars = features if price_timeframe == timeframe else self.repository.fetch_latest_bar(
+                context["symbol_id"], price_timeframe, asof_dt,
+            )
+            if not price_bars.empty:
+                anchor_timestamp = price_bars.iloc[-1]["timestamp"]
+        payload["as_of"] = isoformat_utc(anchor_timestamp)
         self._events_cache.set(cache_key, payload)
         return payload
 
