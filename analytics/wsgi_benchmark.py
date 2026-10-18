@@ -87,6 +87,9 @@ def warm(base, cases, pids):
 
 def sessions(conn, name):
     with conn.cursor() as cur:
+        # pg_stat_activity can reuse a transaction-scoped statistics snapshot.
+        # This also makes repeated polling safe for callers inside `with conn`.
+        cur.execute("SELECT pg_stat_clear_snapshot()")
         cur.execute("""SELECT state, count(*), max(extract(epoch FROM clock_timestamp()-xact_start))
                        FROM pg_stat_activity WHERE application_name=%s GROUP BY state""", (name,))
         return {state: {"count": count, "max_transaction_age_seconds": float(age or 0)}
@@ -103,23 +106,29 @@ class Monitor:
         self.thread = Thread(target=self.run, daemon=True)
 
     def run(self):
+        conn = None
         try:
-            with psycopg2.connect(self.dsn, application_name="vec815-monitor") as conn:
-                conn.autocommit = True
-                while not self.stop.is_set():
-                    sample = {"at": time.time(), "phase": self.phase, "sessions": sessions(conn, self.name)}
-                    for label, identity in (("app", self.app_id), ("db", self.db_id)):
-                        stats = api(f"containers/{identity}/stats?stream=false&one-shot=true")
-                        sample[label] = {"cpu_ns": stats["cpu_stats"]["cpu_usage"]["total_usage"],
-                                         "memory_bytes": stats["memory_stats"].get("usage", 0)}
-                    # /top returns host PIDs. RSS includes shared pages in each PID;
-                    # container memory is retained separately, not summed as PSS.
-                    top = api(f"containers/{self.app_id}/top?ps_args=-eo%20pid,ppid,rss,args")
-                    sample["processes"] = top
-                    self.samples.append(sample)
-                    self.stop.wait(1)
+            # Do not wrap this long-lived monitor in `with conn`: psycopg2 2.9
+            # starts a transaction there even on an autocommit connection.
+            conn = psycopg2.connect(self.dsn, application_name="vec815-monitor")
+            conn.autocommit = True
+            while not self.stop.is_set():
+                sample = {"at": time.time(), "phase": self.phase, "sessions": sessions(conn, self.name)}
+                for label, identity in (("app", self.app_id), ("db", self.db_id)):
+                    stats = api(f"containers/{identity}/stats?stream=false&one-shot=true")
+                    sample[label] = {"cpu_ns": stats["cpu_stats"]["cpu_usage"]["total_usage"],
+                                     "memory_bytes": stats["memory_stats"].get("usage", 0)}
+                # /top returns host PIDs. RSS includes shared pages in each PID;
+                # container memory is retained separately, not summed as PSS.
+                top = api(f"containers/{self.app_id}/top?ps_args=-eo%20pid,ppid,rss,args")
+                sample["processes"] = top
+                self.samples.append(sample)
+                self.stop.wait(1)
         except Exception as exc:
             self.errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def main():
@@ -164,6 +173,8 @@ def main():
                           "-e", f"WSGI_THREADS={args.threads}", "-e", f"DB_POOL_SIZE={run['pool_size']}",
                           args.image)
         monitor = Monitor(identity, args.db_container, dsn, name)
+        run["resource_samples"] = monitor.samples
+        run["monitor_errors"] = monitor.errors
         try:
             start = time.monotonic()
             deadline = start + 60
@@ -227,6 +238,7 @@ def main():
                     conn.autocommit = True
                     while time.monotonic() < deadline:
                         with conn.cursor() as cur:
+                            cur.execute("SELECT pg_stat_clear_snapshot()")
                             cur.execute("SELECT count(*) FROM pg_stat_activity WHERE application_name=%s AND wait_event='PgSleep'", (name,))
                             if cur.fetchone()[0]:
                                 break

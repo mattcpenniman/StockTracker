@@ -123,3 +123,15 @@ class WSGILifecycleTests(unittest.TestCase):
         self.assertNotEqual(self.process.wait(timeout=30), 0)
         self.log.seek(0)
         self.assertIn("Worker analytics startup failed", self.log.read())
+
+    def test_session_monitor_refreshes_postgres_statistics_snapshot(self):
+        from analytics.wsgi_benchmark import sessions
+        name = self.name + "_target"
+        with psycopg2.connect(self.dsn) as observer:
+            self.assertEqual(sessions(observer, name), {})
+            target = psycopg2.connect(self.dsn, application_name=name)
+            try:
+                self.assertEqual(sessions(observer, name)["idle"]["count"], 1)
+            finally:
+                target.close()
+            self.assertEqual(sessions(observer, name), {})
