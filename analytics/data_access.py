@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 from database import get_connection
 from . import future_labels
+from .state_bars import StateBars
 
 
 DATABASE_URL = os.environ.get(
@@ -221,7 +222,13 @@ class AnalyticsRepository:
         summary = future_labels.scan_windows([bars], [anchors[-1].close], stop, take, side)[0] if anchors else None
         return anchors, bars, summary
 
-    def fetch_bars_many(self, symbol_ids, timeframe, asof=None, *, latest=False, after=None, limit=None, _labels=False):
+    def fetch_state_bars(self, symbol_id, timeframe, asof=None, *, latest=False):
+        return self.fetch_state_bars_many([symbol_id], timeframe, asof, latest=latest)[symbol_id]
+
+    def fetch_state_bars_many(self, symbol_ids, timeframe, asof=None, *, latest=False):
+        return self.fetch_bars_many(symbol_ids, timeframe, asof, latest=latest, _state=True)
+
+    def fetch_bars_many(self, symbol_ids, timeframe, asof=None, *, latest=False, after=None, limit=None, _labels=False, _state=False):
         """Compatible reads; LATERAL limits apply per symbol, never to the batch.
 
         Full daily history is intentionally retained for indicator initialization.
@@ -261,6 +268,8 @@ class AnalyticsRepository:
             grouped[row[0]].append(row[1:])
         if _labels:
             return self._label_records(grouped)
+        if _state:
+            return {sid: StateBars.from_rows(values) for sid, values in grouped.items()}
         return {sid: self._bar_frame(values, timestamp_unit="us") for sid, values in grouped.items()}
 
     @staticmethod
@@ -312,8 +321,10 @@ class BatchReads:
     def fetch_symbol_context(self, symbol):
         return self.contexts.get(str(symbol).strip().upper())
 
-    def _read(self, symbol_id, timeframe, asof, *, latest=False, after=None, limit=None):
+    def _read(self, symbol_id, timeframe, asof, *, latest=False, after=None, limit=None, state=False):
         key = (timeframe, asof, latest, limit)
+        if state:
+            key += ("state",)
         frames = self.frames.setdefault(key, {})
         if symbol_id not in frames:
             size = 100 if latest or after is not None else 10
@@ -326,9 +337,17 @@ class BatchReads:
                 latest_frames = self.frames[(timeframe, asof, True, None)]
                 anchors = {sid: frame.iloc[-1]["timestamp"] for sid, frame in latest_frames.items() if not frame.empty}
                 ids = [sid for sid in ids if sid in anchors]
-            frames.update(self.repository.fetch_bars_many(ids, timeframe, asof if after is None else None,
-                                                        latest=latest, after=anchors, limit=limit))
+            if state:
+                frames.update(self.repository.fetch_state_bars_many(ids, timeframe, asof, latest=latest))
+            else:
+                frames.update(self.repository.fetch_bars_many(ids, timeframe, asof if after is None else None,
+                                                            latest=latest, after=anchors, limit=limit))
         return frames[symbol_id]
+
+    def fetch_state_bars(self, symbol_id, timeframe, asof=None, *, latest=False):
+        if not callable(getattr(type(self.repository), "fetch_state_bars_many", None)):
+            return self.fetch_latest_bar(symbol_id, timeframe, asof) if latest else self.fetch_bars(symbol_id, timeframe, asof)
+        return self._read(symbol_id, timeframe, asof, latest=latest, state=True)
 
     def fetch_bars(self, symbol_id, timeframe, asof=None):
         return self._read(symbol_id, timeframe, asof)

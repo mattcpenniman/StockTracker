@@ -12,6 +12,7 @@ import pandas as pd
 
 from .config import AnalyticsSettings
 from .utils import safe_ratio
+from .state_bars import StateBars
 
 try:
     from apollo_indicators import feature_columns as _rust_feature_columns
@@ -245,8 +246,42 @@ def latest_price_payload(row: pd.Series) -> dict:
     }
 
 
-def sufficiency_flags(df: pd.DataFrame) -> dict:
-    count = len(df)
+def compute_feature_snapshot(bars, timeframe, settings):
+    """Return only the latest row, retaining the full-frame oracle/fallback.
+
+    Native snapshot mode shares the existing series kernel (including all seed
+    history), but exports scalars without NumPy output arrays or a feature frame.
+    Older installed extensions continue to use the compatible full-frame API.
+    """
+    if isinstance(bars, StateBars):
+        backend = os.environ.get("ANALYTICS_BACKEND", "auto").lower()
+        if backend not in {"auto", "python", "rust"}:
+            raise ValueError("ANALYTICS_BACKEND must be auto, python, or rust.")
+        if backend == "rust" and _rust_feature_columns is None:
+            raise RuntimeError("Rust analytics is not installed; run: pip install ./rust")
+        if backend != "python" and _rust_feature_columns is not None and not bars.empty:
+            arrays = bars.native_inputs()
+            eligible = all(np.isfinite(a).all() for a in arrays[:4]) and (arrays[0] > 0).all()
+            if eligible:
+                try:
+                    columns = _rust_feature_columns(*arrays,
+                        math.sqrt(TRADING_PERIODS_PER_YEAR.get(timeframe, 252.0)),
+                        settings.breakout_lookback, settings.sma_slope_lookback,
+                        settings.buffer_pct, snapshot=True)
+                except TypeError as exc:
+                    # Rolling extension deployments may still have the old ABI.
+                    if "snapshot" not in str(exc):
+                        raise
+                else:
+                    _record_dispatch("native")
+                    columns["volume_anomaly"] = columns["volume_ratio_20"] >= settings.volume_multiple
+                    return {**bars.latest(), **columns}
+        bars = bars.to_frame()
+    return compute_feature_frame(bars, timeframe, settings).iloc[-1].to_dict()
+
+
+def sufficiency_flags(df: pd.DataFrame | int) -> dict:
+    count = df if isinstance(df, int) else len(df)
     return {
         "bar_count": count,
         "has_sufficient_history_20": count >= 20,

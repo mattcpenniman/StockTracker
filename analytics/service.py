@@ -9,7 +9,8 @@ from .config import AnalyticsSettings
 from .cache import CacheCapacityError, _StateCache
 from .coverage import historical_coverage
 from .data_access import AnalyticsRepository, BatchReads
-from .indicators import compute_feature_frame, latest_price_payload, sufficiency_flags
+from .indicators import compute_feature_frame, compute_feature_snapshot, latest_price_payload, sufficiency_flags
+from .state_bars import StateBars
 from .regimes import (
     classify_momentum_regime,
     classify_position_in_range,
@@ -116,37 +117,43 @@ class AnalyticsService:
         indicator_timeframe = "1Day"
         price_timeframe = self._preferred_price_timeframe(timeframe, asof_dt)
         # Keep full daily history: EMA/RSI initialization and YTD depend on it.
-        bars = self.repository.fetch_bars(context["symbol_id"], indicator_timeframe, asof_dt)
+        read_state = (self.repository.fetch_state_bars if callable(getattr(type(self.repository), "fetch_state_bars", None)) else None)
+        bars = (read_state(context["symbol_id"], indicator_timeframe, asof_dt) if read_state else
+                self.repository.fetch_bars(context["symbol_id"], indicator_timeframe, asof_dt))
         if bars.empty:
             raise AnalyticsNotFoundError(
                 f"No bars available for symbol '{context['symbol']}' on timeframe '{indicator_timeframe}'."
             )
 
-        features = compute_feature_frame(bars, indicator_timeframe, settings)
+        latest = compute_feature_snapshot(bars, indicator_timeframe, settings)
         # State returns one snapshot, not historical events. All five exposed
         # signal flags are calculated from the anchor below, so constructing
         # full-history signal columns here would only duplicate that work.
         anchor_bar = None
         if price_timeframe != indicator_timeframe:
-            anchor_bars = self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt)
+            anchor_bars = (read_state(context["symbol_id"], price_timeframe, asof_dt, latest=True) if read_state else
+                           self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt))
             if anchor_bars.empty:
                 price_timeframe = indicator_timeframe
             else:
-                anchor_bar = anchor_bars.iloc[-1]
+                anchor_bar = anchor_bars.latest() if isinstance(anchor_bars, StateBars) else anchor_bars.iloc[-1]
 
-        return self._state_from_features(context, timeframe, asof_dt, settings, features, price_timeframe, anchor_bar)
+        return self._state_from_snapshot(context, timeframe, asof_dt, settings, latest, len(bars), price_timeframe, anchor_bar)
 
     def _state_from_features(self, context, timeframe, asof_dt, settings, features, price_timeframe, anchor_bar=None):
         """Shared snapshot assembly; features must be a cutoff-bounded prefix."""
-        indicator_timeframe = "1Day"
         latest = features.iloc[-1].to_dict()
+        return self._state_from_snapshot(context, timeframe, asof_dt, settings, latest, len(features), price_timeframe, anchor_bar)
+
+    def _state_from_snapshot(self, context, timeframe, asof_dt, settings, latest, bar_count, price_timeframe, anchor_bar=None):
+        indicator_timeframe = "1Day"
         anchor_bar = latest if anchor_bar is None else anchor_bar
         anchor_timestamp = anchor_bar["timestamp"]
         anchor_close = float(anchor_bar["close"])
         trend_regime = classify_trend_regime(latest)
         momentum_regime = classify_momentum_regime(latest)
         volatility_regime = classify_volatility_regime(latest, settings)
-        quality = sufficiency_flags(features)
+        quality = sufficiency_flags(bar_count)
         quality.update(
             {
                 "last_bar_timestamp": anchor_timestamp,

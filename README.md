@@ -360,6 +360,44 @@ in-window throughput rose from 58.1 to 92.1 req/s in the short local load test.
 Methodology, full latency/drop tables, data-quality observations and validation
 are maintained in Vector: `vector doc show DOC-233`.
 
+### Cold state snapshots (VEC-809)
+
+State endpoints use request-local typed OHLCV columns and the Rust extension's
+`feature_columns(..., snapshot=True)` mode (extension 0.1.1+). Only the latest
+feature scalars cross the output boundary; there is no historical feature
+DataFrame on the eligible native state path. The same native series kernel
+retains all EMA/RSI/MACD seed history, trailing windows and YTD semantics.
+Native working series are still allocated internally. Event generation and
+multi-date historical reuse retain the full-frame API; both feed the same state
+payload assembler. Missing/nonfinite or nonpositive-close histories retain the
+Python oracle. Older extension wheels use the compatible full-frame path.
+Integer UTC microsecond timestamps and original integer volume are preserved.
+
+On the current post-VEC-811 implementation, alternating cold Flask requests on
+stored data improved median latency from **81→55 / 284→182 / 929→579 ms** for
+1/10/37 symbols (plus SPY/QQQ), with exact complete JSON parity and unchanged
+SQL reads/rows. These gains are additional to upstream reuse/cache work. Full
+methodology, 252/5,000-bar tests, peak RSS, boundary timings, actual SQL plans and
+HTTP sweep results are in Vector: `vector doc show DOC-237`.
+
+```bash
+# Existing stored data: refuses a writable default transaction; no DDL/provider I/O.
+DATABASE_URL='<read-only DSN>' ANALYTICS_BACKEND=rust \
+  python -m analytics.snapshot_benchmark --repeats 5 --explain \
+  --output /tmp/snapshot-comparison.json
+# Repeat in fresh processes with --variant reference / --variant snapshot for RSS.
+# Synthetic history lengths: creates/drops a private schema on a disposable DB;
+# timed endpoint reads still enforce read-only transactions.
+ANALYTICS_TEST_DATABASE_URL='<disposable DSN>' ANALYTICS_BACKEND=rust \
+  python -m analytics.snapshot_benchmark --fixture-bars 5000 --repeats 5 \
+  --output /tmp/snapshot-5000.json
+```
+
+`--serve PORT --variant reference|snapshot` runs an isolated local worker for
+the VEC-807 `analytics.portfolio_load` cold/sweep workload. Internal native-versus-
+pandas feature parity uses `rtol=1e-8, atol=1e-10`; transport/same-backend and
+serialized state parity use exact equality, including quality/error fields.
+
 ### Typed future-label batches (VEC-810)
 
 Future labels use UTC-microsecond `LabelBar` records containing only timestamp,
