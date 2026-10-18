@@ -334,6 +334,32 @@ observations with existing coverage warnings, not production capacity guarantees
 Full tables, methodology, coverage findings and prioritized Rust/Python/cache
 recommendations are maintained in Vector: `vector doc show DOC-228`.
 
+### Focused portfolio membership reads (VEC-813)
+
+Analytics portfolio routes read only ordered symbols from PostgreSQL, filtering
+hidden rows in SQL. Python preserves the existing Unicode normalization and
+first-occurrence deduplication rules. Each request reads current membership
+through the shared pool, so forecast additions, deletions and visibility edits
+take effect immediately.
+
+The alternating benchmark loads the actual pre-change helper from git history,
+asserts full response equality on both Flask routes, and records warm latency,
+query counts, separate allocation probes and process RSS observations:
+
+```bash
+DATABASE_URL='<read-only DSN>' ANALYTICS_BACKEND=rust \
+  python -m analytics.membership_benchmark --repeats 30 --output /tmp/membership.json
+```
+
+It uses stored data, prohibits provider calls and bypasses schema DDL. The
+isolated HTTP server above also accepts `--membership-baseline-ref 9d391c3`
+(requires git) to compare endpoint-only load with the old helper on current code.
+Measured visible membership median fell from 6.57 to 0.97 ms; all 180 alternating
+route pairs had identical full JSON. At 100 offered futurestate requests/s,
+in-window throughput rose from 58.1 to 92.1 req/s in the short local load test.
+Methodology, full latency/drop tables, data-quality observations and validation
+are maintained in Vector: `vector doc show DOC-233`.
+
 ### Typed future-label batches (VEC-810)
 
 Future labels use UTC-microsecond `LabelBar` records containing only timestamp,

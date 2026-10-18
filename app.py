@@ -1557,14 +1557,19 @@ def _parse_bool_query_param(name: str, default: bool = False) -> bool:
 
 
 def _portfolio_symbols(include_hidden: bool = False) -> List[str]:
-    df = _read_df()
-    if df.empty:
-        return []
-    if not include_hidden:
-        df = df[~df["hidden"].astype(bool)].copy()
-    if df.empty:
-        return []
-    symbols = df["symbol"].dropna().astype(str).str.upper().str.strip().tolist()
+    _init_db_if_needed()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT symbol FROM {DB_TABLE}"
+                + ("" if include_hidden else " WHERE hidden IS NOT TRUE")
+                + " ORDER BY symbol ASC"
+            )
+            rows = cur.fetchall()
+    # Preserve raw database ordering before normalization and first-occurrence
+    # deduplication. Python handles Unicode case/whitespace just as pandas did;
+    # SQL upper/trim/distinct would change those semantics or the ordering.
+    symbols = [str(row[0]).upper().strip() for row in rows if row[0] is not None]
     return [symbol for symbol in dict.fromkeys(symbols) if symbol]
 
 

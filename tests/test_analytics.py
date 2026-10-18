@@ -1460,14 +1460,8 @@ class StateEndpointHelperTests(unittest.TestCase):
         self.assertTrue(mock_service.get_symbol_state.called)
 
     @patch("app.analytics_service")
-    @patch("app._read_df")
-    def test_portfolio_state_endpoint_uses_visible_portfolio_symbols(self, mock_read_df, mock_service) -> None:
-        mock_read_df.return_value = pd.DataFrame(
-            {
-                "symbol": ["NVDA", "MSFT", "TSLA"],
-                "hidden": [False, True, False],
-            }
-        )
+    @patch("app._portfolio_symbols", return_value=["NVDA", "TSLA"])
+    def test_portfolio_state_endpoint_uses_visible_portfolio_symbols(self, mock_symbols, mock_service) -> None:
         mock_service.get_batch_state.return_value = {
             "timeframe": "1Day",
             "requested_asof": "2023-09-20T23:59:59.999999Z",
@@ -1483,14 +1477,13 @@ class StateEndpointHelperTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["portfolio_symbol_count"], 2)
         self.assertEqual(payload["count"], 2)
+        mock_symbols.assert_called_once_with(include_hidden=False)
         mock_service.get_batch_state.assert_called_once()
         self.assertEqual(mock_service.get_batch_state.call_args.args[0], ["NVDA", "TSLA"])
 
     @patch("app.analytics_service")
-    @patch("app._read_df")
-    def test_portfolio_future_state_endpoint_requires_asof_and_days(self, mock_read_df, mock_service) -> None:
-        mock_read_df.return_value = pd.DataFrame({"symbol": ["NVDA"], "hidden": [False]})
-
+    @patch("app._portfolio_symbols", return_value=["NVDA"])
+    def test_portfolio_future_state_endpoint_requires_asof_and_days(self, mock_symbols, mock_service) -> None:
         with flask_app.test_client() as client:
             missing_days = client.get("/api/portfolio/futurestate?asof=2023-09-20")
             missing_asof = client.get("/api/portfolio/futurestate?days=20")
@@ -1500,14 +1493,8 @@ class StateEndpointHelperTests(unittest.TestCase):
         self.assertFalse(mock_service.get_batch_future_state.called)
 
     @patch("app.analytics_service")
-    @patch("app._read_df")
-    def test_portfolio_future_state_endpoint_uses_portfolio_symbols(self, mock_read_df, mock_service) -> None:
-        mock_read_df.return_value = pd.DataFrame(
-            {
-                "symbol": ["NVDA", "MSFT"],
-                "hidden": [False, True],
-            }
-        )
+    @patch("app._portfolio_symbols", return_value=["NVDA"])
+    def test_portfolio_future_state_endpoint_uses_portfolio_symbols(self, mock_symbols, mock_service) -> None:
         mock_service.get_batch_future_state.return_value = {
             "timeframe": "1Day",
             "requested_asof": "2023-09-20T23:59:59.999999Z",
@@ -1525,6 +1512,7 @@ class StateEndpointHelperTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["portfolio_symbol_count"], 1)
         self.assertEqual(payload["count"], 1)
+        mock_symbols.assert_called_once_with(include_hidden=False)
         mock_service.get_batch_future_state.assert_called_once()
         self.assertEqual(mock_service.get_batch_future_state.call_args.args[:4], (["NVDA"], "1Day", parse_asof("2023-09-20"), 20))
 
