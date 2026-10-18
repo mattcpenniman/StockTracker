@@ -13,6 +13,7 @@ import pandas as pd
 
 from app import app as flask_app, _market_snapshot_needs_sync, _state_payload_has_desired_price_anchor
 from analytics.config import AnalyticsSettings
+from analytics.cache import CacheCapacityError
 from analytics.indicators import compute_feature_frame
 from analytics import indicators
 from analytics.regimes import (
@@ -29,6 +30,35 @@ from analytics.utils import clean_json_value, parse_asof
 import app as dashboard
 from analytics.dashboard_benchmark import baseline_namespace, dashboard_fixture, variants
 from analytics.events_benchmark import baseline_generate_events, event_fixture
+
+
+class CacheAdmissionEndpointTests(unittest.TestCase):
+    def test_single_symbol_admission_errors_are_retryable(self):
+        for path, method in (("/api/state/NVDA?asof=2026-03-17", "get_symbol_state"),
+                             ("/api/events/NVDA?asof=2026-03-17", "get_events"),
+                             ("/api/futurestate/NVDA?asof=2026-03-17&days=20", "get_future_state")):
+            for errors in ([CacheCapacityError("retry later")],
+                           [AnalyticsNotFoundError("missing"), CacheCapacityError("retry later")]):
+                with self.subTest(path=path, backfill=len(errors) == 2), \
+                     patch.object(dashboard.analytics_service, method, side_effect=errors), \
+                     patch.object(dashboard, "_prepare_historical_price_anchor"), \
+                     patch.object(dashboard, "_backfill_analytics_symbol_if_needed"), \
+                     patch.object(dashboard, "_init_db_if_needed"), flask_app.test_client() as client:
+                    response = client.get(path)
+                self.assertEqual(response.status_code, 503, response.get_json())
+                self.assertEqual(response.headers["Retry-After"], "1")
+                self.assertEqual(response.get_json(), {"ok": False, "error": "retry later"})
+
+    def test_cache_health_is_per_worker_and_bounded_cardinality(self):
+        service = AnalyticsService(Mock())
+        service.repository.ping.return_value = True
+        with patch.object(dashboard, "analytics_service", service), \
+             patch.object(dashboard, "_init_db_if_needed"), flask_app.test_client() as client:
+            caches = client.get("/api/health/analytics").get_json()["caches"]
+        self.assertEqual(set(caches), {"scope", "state", "event", "future"})
+        self.assertEqual(caches["scope"], "per_worker")
+        self.assertEqual(caches["state"]["max_bytes"], 8388608)
+        self.assertEqual(caches["state"]["in_flight"], 0)
 
 
 class FutureLabelHorizonTests(unittest.TestCase):
@@ -507,7 +537,7 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
         service = AnalyticsService(repo)
         settings = AnalyticsSettings()
         cached = {"symbol": "NVDA", "cached": True}
-        service._state_cache.set(service._state_cache_key(context, "1Day", None, settings), cached)
+        service._state_cache.get_or_compute(service._state_cache_key(context, "1Day", None, settings), lambda: cached)
         before = indicators.backend_diagnostics()["execution"]
         self.assertEqual(service.get_symbol_state("NVDA", "1Day", None, settings), cached)
         self.assertEqual(before, indicators.backend_diagnostics()["execution"])
