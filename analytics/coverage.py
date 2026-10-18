@@ -1,6 +1,7 @@
 """NYSE regular-session diagnostics, separate from input/economic validity."""
 from functools import lru_cache
 
+import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 
@@ -10,6 +11,21 @@ from .utils import clean_json_value
 @lru_cache(maxsize=128)
 def _schedule(start, end):
     return mcal.get_calendar("NYSE").schedule(start_date=start, end_date=end)
+
+
+@lru_cache(maxsize=128)
+def _year_end_date(year):
+    return _schedule(f"{year}-12-01", f"{year}-12-31").index[-1].date()
+
+
+def year_end_bars(timestamps):
+    """Daily bars dated on the final NYSE session (UTC daily-bar labels).
+
+    This certifies the anchor date only, not provider adjustment provenance.
+    """
+    stamps = pd.DatetimeIndex(timestamps)
+    dates = stamps.date
+    return np.asarray([date == _year_end_date(year) for date, year in zip(dates, stamps.year)], dtype=bool)
 
 
 def _utc(value):

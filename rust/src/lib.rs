@@ -181,6 +181,7 @@ fn calculate(
     low: &[f64],
     volume: &[f64],
     years: &[i32],
+    year_end: &[bool],
     annualization: f64,
     breakout: usize,
     slope: usize,
@@ -196,16 +197,21 @@ fn calculate(
         c.insert(name, zip(close, &shift(close, lag), |x, y| x / y - 1.0));
     }
     let mut year = years[0];
-    let mut start = close[0];
+    let mut start = f64::NAN;
     c.insert(
         "ytd_return",
         close
             .iter()
             .zip(years)
-            .map(|(&x, &y)| {
+            .enumerate()
+            .map(|(i, (&x, &y))| {
                 if y != year {
+                    start = if y == year + 1 && year_end[i - 1] {
+                        close[i - 1]
+                    } else {
+                        f64::NAN
+                    };
                     year = y;
-                    start = x;
                 }
                 x / start - 1.0
             })
@@ -388,7 +394,7 @@ fn calculate(
 }
 
 #[pyfunction]
-#[pyo3(signature = (close, high, low, volume, years, annualization, breakout, slope, buffer, snapshot=false))]
+#[pyo3(signature = (close, high, low, volume, years, annualization, breakout, slope, buffer, snapshot=false, year_end=None))]
 #[allow(clippy::too_many_arguments)]
 fn feature_columns<'py>(
     py: Python<'py>,
@@ -402,6 +408,7 @@ fn feature_columns<'py>(
     slope: usize,
     buffer: f64,
     snapshot: bool,
+    year_end: Option<PyReadonlyArray1<'py, bool>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (close, high, low, volume, years) = (
         close.as_slice()?,
@@ -410,11 +417,23 @@ fn feature_columns<'py>(
         volume.as_slice()?,
         years.as_slice()?,
     );
+    // Legacy callers without calendar eligibility fail closed for YTD.
+    let missing = vec![false; close.len()];
+    let year_end = match &year_end {
+        Some(flags) => flags.as_slice()?,
+        None => &missing,
+    };
     if breakout == 0
         || slope == 0
-        || [high.len(), low.len(), volume.len(), years.len()]
-            .iter()
-            .any(|&n| n != close.len())
+        || [
+            high.len(),
+            low.len(),
+            volume.len(),
+            years.len(),
+            year_end.len(),
+        ]
+        .iter()
+        .any(|&n| n != close.len())
     {
         return Err(PyValueError::new_err(
             "Equal-length arrays and positive lookbacks are required",
@@ -430,6 +449,7 @@ fn feature_columns<'py>(
                 low,
                 volume,
                 years,
+                year_end,
                 annualization,
                 breakout,
                 slope,

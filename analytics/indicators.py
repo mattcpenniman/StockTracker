@@ -14,6 +14,7 @@ from .config import AnalyticsSettings
 from .utils import safe_ratio
 from .state_bars import StateBars
 from .quality import validate_bars
+from .coverage import year_end_bars
 
 try:
     from apollo_indicators import feature_columns as _rust_feature_columns
@@ -129,8 +130,12 @@ def _compute_feature_frame_python(
     df["return_20"] = close.pct_change(20)
     df["return_60"] = close.pct_change(60)
 
-    year_start_close = close.groupby(df["timestamp"].dt.year).transform("first")
-    df["ytd_return"] = (close / year_start_close) - 1.0
+    years = df["timestamp"].dt.year
+    # Only the preceding calendar year's final session is a YTD anchor.
+    # Mapping by year (not forward filling) cannot bridge a missing whole year.
+    ends = year_end_bars(df["timestamp"]) & ~years.duplicated(keep="last")
+    anchors = dict(zip(years[ends] + 1, close[ends]))
+    df["ytd_return"] = close / years.map(anchors) - 1.0
 
     df["sma_20"] = close.rolling(20, min_periods=20).mean()
     df["sma_50"] = close.rolling(50, min_periods=50).mean()
@@ -223,14 +228,21 @@ def compute_feature_frame(
         result = _compute_feature_frame_python(bars, timeframe, settings)
         _record_dispatch("ineligible_data")
         return result
-    columns = _rust_feature_columns(
-        *arrays,
-        np.ascontiguousarray(df["timestamp"].dt.year, dtype=np.int32),
-        math.sqrt(TRADING_PERIODS_PER_YEAR.get(timeframe, 252.0)),
-        settings.breakout_lookback,
-        settings.sma_slope_lookback,
-        settings.buffer_pct,
-    )
+    try:
+        columns = _rust_feature_columns(
+            *arrays,
+            np.ascontiguousarray(df["timestamp"].dt.year, dtype=np.int32),
+            math.sqrt(TRADING_PERIODS_PER_YEAR.get(timeframe, 252.0)),
+            settings.breakout_lookback,
+            settings.sma_slope_lookback,
+            settings.buffer_pct,
+            year_end=year_end_bars(df["timestamp"]),
+        )
+    except TypeError as exc:
+        if "year_end" not in str(exc):
+            raise
+        _record_dispatch("ineligible_data")
+        return _compute_feature_frame_python(bars, timeframe, settings)
     _record_dispatch("native")
     columns["volume_anomaly"] = columns["volume_ratio_20"] >= settings.volume_multiple
     # A single construction avoids dozens of pandas rolling calls and insertions.
@@ -270,10 +282,11 @@ def compute_feature_snapshot(bars, timeframe, settings):
                     columns = _rust_feature_columns(*arrays,
                         math.sqrt(TRADING_PERIODS_PER_YEAR.get(timeframe, 252.0)),
                         settings.breakout_lookback, settings.sma_slope_lookback,
-                        settings.buffer_pct, snapshot=True)
+                        settings.buffer_pct, snapshot=True,
+                        year_end=year_end_bars(pd.to_datetime(bars.timestamps, unit="us", utc=True)))
                 except TypeError as exc:
                     # Rolling extension deployments may still have the old ABI.
-                    if "snapshot" not in str(exc):
+                    if "snapshot" not in str(exc) and "year_end" not in str(exc):
                         raise
                 else:
                     _record_dispatch("native")
@@ -291,6 +304,14 @@ def sufficiency_flags(df: pd.DataFrame | int, latest=None, settings=None) -> dic
         "has_sufficient_history_50": count >= 50,
         "has_sufficient_history_200": count >= 200,
         "history_basis": "validated_observations_not_completed_sessions",
+        "ytd": {
+            "status": "qualified" if pd.notna((latest or {}).get("ytd_return")) else "unavailable",
+            "reason": "stored_price_adjustment_basis_unverified" if pd.notna((latest or {}).get("ytd_return")) else "missing_previous_year_end_close",
+            "basis": "price_return_from_previous_calendar_year_final_session_close",
+            "calendar": "NYSE",
+            "source_timeframe": "1Day",
+            "adjustment_basis_verified": False,
+        },
         "metric_history": {
             name: {"required_valid_bars": required, "usable": count >= required and
                    bool(pd.notna((latest or {}).get(name))) and bool(np.isfinite(float((latest or {})[name])))}

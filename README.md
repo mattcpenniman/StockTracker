@@ -1190,6 +1190,17 @@ Returned state JSON includes:
 - Volume: `avg_volume_20`, `volume_ratio_20`, `volume_anomaly`
 - Normalized metrics: `breakout_strength`, `breakdown_strength`, `trend_strength`, `extension_from_mean`, `volume_zscore`, `return_zscore`
 
+`returns.ytd` is daily-close price return: current daily close divided by the
+preceding calendar year's final trading-session close, minus one. It includes
+the first trading day's return and uses the same stored adjustment basis for
+both prices; dividends are not reinvested. The anchor must be present on the
+final NYSE session date (including weekend/holiday year ends). Missing anchors,
+new listings and incomplete prior-year histories produce `null`, never a
+first-in-year or older-year substitute. `data_quality.ytd` reports availability
+and qualifies available values as adjustment-basis-unverified. This applies to
+Python/Rust, snapshots and historical sweeps. The daily indicator close supplies
+YTD even when the response's `price` is a newer 15-minute anchor.
+
 When `GET /api/state` is queried with an intraday timeframe such as `15Min`, the anchor price comes from that intraday bar at or before `asof`, while moving averages, regimes, RSI, MACD, ATR, and other indicator stacks remain based on daily bars. Price-sensitive fields like `distance_from_sma_*_pct`, `range_position_20_pct`, `above_sma*`, and `extension_from_mean` are recalculated from the intraday anchor price.
 
 ### Regime labels
