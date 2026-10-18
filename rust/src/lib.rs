@@ -388,6 +388,7 @@ fn calculate(
 }
 
 #[pyfunction]
+#[pyo3(signature = (close, high, low, volume, years, annualization, breakout, slope, buffer, snapshot=false))]
 #[allow(clippy::too_many_arguments)]
 fn feature_columns<'py>(
     py: Python<'py>,
@@ -400,6 +401,7 @@ fn feature_columns<'py>(
     breakout: usize,
     slope: usize,
     buffer: f64,
+    snapshot: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (close, high, low, volume, years) = (
         close.as_slice()?,
@@ -437,7 +439,11 @@ fn feature_columns<'py>(
     };
     let result = PyDict::new(py);
     for (name, values) in columns {
-        result.set_item(name, values.into_pyarray(py))?;
+        if snapshot {
+            result.set_item(name, values[values.len() - 1])?;
+        } else {
+            result.set_item(name, values.into_pyarray(py))?;
+        }
     }
     Ok(result)
 }
