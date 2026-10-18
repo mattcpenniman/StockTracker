@@ -871,6 +871,184 @@ Kernel coverage: single-symbol state, batch state, portfolio state, and events
 calculate indicator features on cache misses. `futurestate` and portfolio
 `futurestate` use price-window labels and do **not** require the indicator kernel.
 
+### Production WSGI processes (VEC-815)
+
+The container starts `python -m production`, which performs the supported schema
+initialization once, closes its DB pools, then **execs Gunicorn 23.0.0**. Gunicorn
+is PID 1, with no Flask debugger, reloader, or extra launcher process. It does
+**not preload**: each worker imports the application and creates its own caches,
+locks, sync single-flights and lazy quote executors. The exec boundary removes
+all schema-initializer state before any fork; the existing pool fork callbacks
+remain a defense for other callers. Never enable `--preload` on this application.
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `WSGI_WORKERS` | 2 | Independent serving processes |
+| `WSGI_THREADS` | 2 | `gthread` request threads per worker |
+| `DB_POOL_SIZE` | 2 in production | Maximum connections **per worker per exact DSN**; lazy allocation |
+| `DB_POOL_TIMEOUT_SECONDS` | 30 | Pool acquisition/connect waiting budget |
+| `WSGI_TIMEOUT` | 120 | Gunicorn worker heartbeat timeout; **not a request deadline** for gthread |
+| `WSGI_GRACEFUL_TIMEOUT` | 120 | Time allowed to drain on graceful shutdown before forced termination |
+| `WSGI_STOP_GRACE_PERIOD` | 130s | Compose's container stop allowance; keep greater than graceful timeout |
+| `WSGI_INIT_DB` | 1 | `0` skips launcher DDL when a deploy job already provisioned the schema |
+| `HOST` / `PORT` | 0.0.0.0 / 5000 in Docker | Listening address inside the container |
+
+Production defaults apply with `python -m production` or the checked-in Gunicorn
+config. Other entrypoints retain the pool module's four-connection default.
+Use `python app.py` deliberately for local development with Flask debug/reload.
+Do not serve production with that development command. `WSGI_APP` is an advanced
+launcher override; its default is `wsgi:application`. The benchmark-only
+`analytics.wsgi_load:application` forbids providers and adds a shutdown-test route;
+it is for disposable load containers only.
+
+Each worker validates the required DB tables/columns in a completed read-only
+transaction and executes the finite native/backend smoke calculation **before
+serving requests**. Missing schema or invalid/required-but-unavailable Rust aborts
+worker boot and causes Gunicorn startup to fail. Workers mark schema readiness so
+normal requests do not repeat DDL. Schema changes require a new release/startup.
+The smoke uses the selected backend: intentional `ANALYTICS_BACKEND=python` is
+supported, while Compose defaults to required Rust. Startup smoke dispatches do
+not inflate serving native counters or populate analytical result caches.
+
+`runtime.process` reports the responding PID, parent PID, per-DSN pool limit and
+worker-local startup checks. `X-Worker-Pid` identifies the responding process on
+every WSGI response. Build identity is the same artifact across workers, while
+native counters, caches, quote freshness and sync flights are **per process**.
+One healthy response, including Compose's healthcheck, is not proof of aggregate
+worker readiness or aggregate cache hit rates. Match the configured process count
+with `docker top`, check every `WSGI worker ready` log, and observe each serving
+PID via health (the benchmark's `all_workers` helper does this explicitly).
+Gunicorn binds the listener before boot completes; connection availability alone
+does not establish readiness. During rolling replacement, track the current PID
+set; a cached health sample from a dead worker is not current evidence.
+
+There is no periodic background market-data/live-price loop. Quote refreshes are
+on demand, with at most one refresh coordinator and eight symbol-fetch threads
+per worker by default. These executors start threads only when used. Additional
+processes can duplicate provider refreshes and historical misses: single-flight
+coalescing is not cross-process. Historical capacity probes prohibit provider
+calls and use read-only DB transactions; do not substitute live-moving requests
+when comparing process counts.
+
+`WSGI_THREADS` limits request threads, not all OS threads. Native numerical
+libraries can create additional threads on import: the measured image had 26 OS
+threads per active worker with two request threads, even without quote refreshes.
+Those native-library settings were held identical across all process-count runs.
+
+**Resource budget:** default production DB maximum is `2 workers × 2 = 4`
+connections for one DSN, plus a transient schema-initialization connection before
+workers start. Add other applications, monitors/admin reserve, extra DSNs and
+both old/new replicas during rolling overlap before comparing to PostgreSQL
+`max_connections`. Reloads can temporarily overlap old/new worker generations;
+include that too. Pool size bounds connections, not executing requests. Caches
+default to at most 24 MiB of accounted entries **per worker** across three groups
+(48 MiB for two workers), plus interpreter/imports, result frames, decoded JSON,
+request/quote threads and allocator retention. RSS is substantially larger than
+cache charges. Warming one process does not warm another; warm every desired
+case/PID or include cold misses in the capacity estimate. Default 256 entries
+cannot hold all twelve dates for 37 symbols in every worker.
+
+For startup and rollback, use the versioned-image build/check procedure below.
+If schema was applied separately, set `WSGI_INIT_DB=0` for the launch. Replace
+only the app and allow drain:
+
+```bash
+export WSGI_WORKERS=2 WSGI_THREADS=2 DB_POOL_SIZE=2
+export WSGI_TIMEOUT=120 WSGI_GRACEFUL_TIMEOUT=120 WSGI_STOP_GRACE_PERIOD=130s
+docker compose up -d --no-build --no-deps app
+docker inspect stock-tracker-app --format '{{json .Config.Cmd}} {{.Image}}'
+docker top stock-tracker-app -eo pid,ppid,rss,args
+docker compose logs app
+curl --fail http://127.0.0.1:5005/api/health/analytics
+# Roll back to the retained, previously validated image:
+APP_IMAGE=apollo-app:YOUR_RETAINED_RELEASE docker compose up -d --no-build --no-deps app
+```
+
+SIGTERM stops admission and drains in-flight work up to the graceful timeout;
+worker exit explicitly closes pools. Normal pooled transactions commit/rollback
+and return connections, so idle sessions must not remain idle-in-transaction.
+Forced termination can interrupt requests and roll back transactions. A client
+disconnect does not cancel analytic computation. Gunicorn's default connection
+backlog/worker connection queues and gthread heartbeat are not end-to-end load
+shedding or request deadlines; size upstream admission/timeout limits separately.
+Compose replacement can have downtime; it is not itself a zero-downtime rollout.
+
+#### Reproducing process capacity and shutdown measurements
+
+Build the intended clean revision into an image first. On the Docker host, use a
+read-only DSN whose DB address is reachable from both the host and Docker network:
+
+```bash
+DATABASE_URL='postgresql://USER:PASSWORD@DB_IP/stock_tracker?options=-cdefault_transaction_read_only%3Don' \
+  python -m analytics.wsgi_benchmark --image apollo-app:YOUR_RELEASE \
+    --network apollo_default --workers 1,2,4 --threads 2 --connection-budget 8 \
+    --duration 15 --soak-seconds 180 --output /tmp/wsgi-capacity.json
+ANALYTICS_TEST_DATABASE_URL='postgresql://USER:PASSWORD@DB_IP/stock_tracker' \
+  python -m unittest tests.test_wsgi tests.test_database
+```
+
+The host needs psycopg2 and local Docker socket access. Disposable containers use
+the actual production launcher/config with only provider guards and a slow-request
+test route added. Each worker verifies its own schema and Rust execution. The
+probe requires read-only defaults, warms **every endpoint/date/PID**, then uses
+the unchanged VEC-807 open-loop client with fixed 32 hot / 16 sweep in-flight
+caps. The 1/2/4-worker pool limits are 8/4/2, keeping the total ceiling at eight;
+two request threads per process remain fixed. It captures cold warmup timings,
+per-worker cache/native health, complete-window throughput, p50/p95/p99, failed
+and dropped arrivals, continuous one-second Docker CPU/memory/process RSS and
+tagged PostgreSQL sessions, a three-minute overload per process count, recovery,
+and SIGTERM while a DB request is observed in flight. The final assertions require
+successful complete responses, no leaked transaction-idle sessions, exit 0 and
+zero remaining app DB sessions. Stages drain fully; latency covers completed
+requests including drain, while throughput counts only completions within the
+offering window. Admission drops have no latency. Docker DB CPU includes other
+clients sharing that PostgreSQL instance; process RSS double-counts shared pages.
+
+#### Measured tradeoffs (2026-10-18)
+
+Full results, endpoint p50/p95/p99, hot/sweep/drop tables, continuous resource
+methodology and raw-artifact references are in **Vector DOC-239: VEC-815 Production
+WSGI multi-process capacity and resource budgets**. The measured image is clean
+revision `50dc359`, release `vec-815-capacity`, immutable image `d97ae978e5ac...`.
+It includes previously merged analytics optimizations; only comparisons between
+process counts in this same image isolate process-model gains.
+
+| Workers (2 request threads each) | 180-second hot completion req/s at 250 offered | Combined p50 / p95 / p99 ms | Client capacity / scheduler drops | Mean app / DB CPU % | Peak app cgroup MiB | Actual peak DB sessions |
+| ---: | ---: | --- | ---: | --- | ---: | ---: |
+| 1 | 65.39 | 481.84 / 577.53 / 630.29 | 32,145 / 1,052 | 101.54 / 15.07 | 128.68 | 2 |
+| 2 | 118.80 | 263.34 / 487.88 / 540.61 | 20,954 / 2,631 | 202.40 / 27.84 | 227.25 | 4 |
+| 4 | 208.26 | 54.76 / 127.15 / 204.87 | 433 / 7,069 | 375.41 / 48.59 | 436.65 | 8 |
+
+All **85,148 measured completed requests** across hot, twelve-date sweep, soak
+and recovery returned HTTP 200, 37/37 symbols, zero symbol errors and no incomplete
+future windows. Existing state stale/benchmark coverage warnings remain. Every
+worker passed DB/native startup, every in-flight SIGTERM probe completed, exit
+codes were zero and no app DB sessions remained after shutdown. All process
+counts recovered to 25 req/s with no drops and p95 33.74 / 36.30 / 35.24 ms.
+
+Two workers at 100 offered req/s completed 99.73 req/s with combined p95 47.19 ms,
+zero capacity drops and two scheduler-missed arrivals. Twelve-date sweep at 10
+offered req/s completed 6.00 / 9.93 / 9.93 req/s in-window; combined p95 was
+3,363.19 / 975.89 / 721.04 ms. Four-worker hot arrivals were **client-scheduler
+limited** (15.7% scheduler drops in the soak), so 208 req/s is observed throughput,
+not a proven maximum server rate or a lossless 250 req/s claim. Tests ran on the
+shared 24-CPU host/DB; the three-minute overload per process count is not an SLA
+or hours-long memory-leak study.
+
+The selected two-worker default balances the measured latency/capacity gain with
+memory and connections. Observed worker RSS peaked around 148–150 MiB after
+historical sweeps; this is larger than retained cache charges. Each worker
+duplicates 117 state and 111 future computations and 902,002 accounted cache
+bytes for the hot set. First-per-PID hot state medians were 566–610 ms, versus
+roughly 25–33 ms when hot at moderate load. The default twelve-date caches evict
+in every worker; process count does not create a shared working set. Four
+processes improve capacity further at roughly double two-worker cgroup memory.
+
+**Delivery state:** the new production command/image was verified in isolated
+containers (including the default unmodified WSGI app), not rolled out to the
+live service. At verification, port 5005 still served `vec-806-20261018` with
+`python app.py`; PR-open/merged and deployed are separate states.
+
 ### Validated Docker rollout (VEC-802)
 
 Compose requires Rust by default (`ANALYTICS_BACKEND=rust`); override explicitly
