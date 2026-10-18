@@ -2,6 +2,43 @@
 
 Single-file Flask app for tracking stock forecast prices with a PostgreSQL backend.
 
+## Coherent stored adjustment history (VEC-831)
+
+Every actual chart sync or missing-window preparation now re-fetches all retained
+timeframes and verified-window envelopes for the symbol before publishing any
+historical change. PostgreSQL serializes preparations per symbol and atomically
+commits OHLCV, `market_data_basis`, replacement coverage receipts and the analytics
+invalidation timestamp. Missing retained timestamps, invalid bars, failed pages or
+failed writes leave the previous historical generation intact. Analytics uses a
+repeatable-read snapshot across contexts, daily/intraday bars and label windows.
+
+`ALPACA_BAR_ADJUSTMENT` applies to **all** historical timeframes (default `split`);
+intraday no longer silently overrides the daily configuration. The basis records
+provider URL, modes, an OHLCV/configuration digest revision, adjusted-through date
+and check time. Repeated identical preparation does not compound adjustments.
+Coverage receipts are revisioned and ignored after configuration/source changes;
+legacy receipts have no verified basis until refreshed. State/label quality and
+event/chart payloads expose `adjustment_basis`. The revision is the latest fetched
+provider basis, not an archived point-in-time data vintage or corporate-action ID.
+
+This deliberately trades provider bandwidth and a checked-out connection during
+fetching for correctness without a separate corporate-action feed. Preparation
+window limits bound the requested extension, **not** the retained history refresh.
+A covered request still reuses its receipt; use chart synchronization to check
+already-covered history for newly published corrections. Provider revisions
+between page requests cannot be snapshot-pinned by the bars API; a UTC date rollover
+or configuration change during staging aborts preparation. Refresh provenance does
+not certify non-split economics: ADR conversions and related authoritative-factor
+work remain tracked in VEC-830, and `economic_actions_verified` stays false. No
+adjustment is inferred from move magnitude. Split-only returns exclude dividend
+reinvestment; other configured modes retain the provider's semantics.
+
+Run the split/failure/concurrency integration fixtures against a test PostgreSQL:
+
+```bash
+ANALYTICS_TEST_DATABASE_URL=<postgresql-dsn> /tmp/opencode/apollo-venv/bin/python -m unittest tests.test_adjustment_history
+```
+
 ## Features
 - Add or update stock forecasts from the web UI
 - Persist stock data in PostgreSQL

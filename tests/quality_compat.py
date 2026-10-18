@@ -11,6 +11,7 @@ def legacy_quality_contract(value):
         "session_warning_symbols", "corporate_action_warning_symbols",
         "stale_symbols",
         "bar_availability", "indicator_available_at", "price_available_at", "anchor_available_at",
+        "adjustment_basis",
     }
     if isinstance(value, dict):
         return {key: legacy_quality_contract(item) for key, item in value.items() if key not in added_or_redefined}
