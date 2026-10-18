@@ -9,6 +9,7 @@ import pandas as pd
 from database import get_connection
 from . import future_labels
 from .state_bars import StateBars
+from .quality import OHLCV_SQL_CHECK
 
 
 DATABASE_URL = os.environ.get(
@@ -22,6 +23,7 @@ class LabelBar(NamedTuple):
     high: float
     low: float
     close: float
+    ohlcv_valid: bool = True
 
     def __getitem__(self, key):
         return getattr(self, key) if isinstance(key, str) else tuple.__getitem__(self, key)
@@ -247,7 +249,7 @@ class AnalyticsRepository:
                 raise ValueError("'limit' must be greater than zero.")
             sql += " JOIN unnest(%s::timestamptz[]) WITH ORDINALITY AS anchors(bar_time, position) USING (position)"
             params.append([after[sid].astimezone(timezone.utc) for sid in ids])
-        columns = "high, low, close" if _labels else "open, high, low, close, volume"
+        columns = f"high, low, close, COALESCE(({OHLCV_SQL_CHECK}), false) AS ohlcv_valid" if _labels else "open, high, low, close, volume"
         sql += f" CROSS JOIN LATERAL (SELECT (EXTRACT(EPOCH FROM bar_time) * 1000000)::bigint AS bar_time_us, {columns} FROM stock_bars WHERE symbol_id = requested.symbol_id AND timeframe = %s"
         params.append(timeframe)
         if asof is not None:
@@ -275,7 +277,8 @@ class AnalyticsRepository:
     @staticmethod
     def _label_records(grouped):
         return {sid: [LabelBar(_EPOCH + timedelta(microseconds=int(row[0])),
-                    *(float(value) if value is not None else float("nan") for value in row[1:]))
+                    *(float(value) if value is not None else float("nan") for value in row[1:4]),
+                    bool(row[4]) if len(row) > 4 else True)
                       for row in rows] for sid, rows in grouped.items()}
 
 

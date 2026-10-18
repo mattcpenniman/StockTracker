@@ -1,33 +1,80 @@
-"""Calendar-independent trailing-age diagnostics, not a trading calendar audit."""
-from __future__ import annotations
+"""NYSE regular-session diagnostics, separate from input/economic validity."""
+from functools import lru_cache
 
 import pandas as pd
+import pandas_market_calendars as mcal
 
 from .utils import clean_json_value
 
 
-def historical_coverage(requested_asof, actual_timestamp):
-    """Expose lag without assuming every calendar date is a trading session.
+@lru_cache(maxsize=128)
+def _schedule(start, end):
+    return mcal.get_calendar("NYSE").schedule(start_date=start, end_date=end)
 
-    Seven calendar days is a conservative warning threshold, not proof of
-    completeness. In particular, recent anchors can still have missing bars.
-    """
-    requested = pd.Timestamp(requested_asof) if requested_asof is not None else None
-    actual = pd.Timestamp(actual_timestamp)
-    if actual.tzinfo is None:
-        actual = actual.tz_localize("UTC")
-    if requested is not None and requested.tzinfo is None:
-        requested = requested.tz_localize("UTC")
-    lag = (requested - actual).total_seconds() if requested is not None else None
-    status = "not_evaluated" if lag is None else (
-        "anchor_after_cutoff" if lag < 0 else "stale_trailing" if lag > 7 * 86400 else "within_tolerance"
-    )
+
+def _utc(value):
+    stamp = pd.Timestamp(value)
+    return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+
+
+def historical_coverage(requested_asof, actual_timestamp, timeframe="1Day", *, now=None):
+    requested = _utc(requested_asof) if requested_asof is not None else None
+    cutoff = requested if requested is not None else _utc(now or pd.Timestamp.now(tz="UTC").floor("min"))
+    actual = _utc(actual_timestamp)
+    lag = (cutoff - actual).total_seconds()
+    schedule = _schedule((cutoff - pd.Timedelta(days=40)).date().isoformat(), cutoff.date().isoformat())
+    completed = schedule[schedule.market_close <= cutoff]
+    expected = None
+    if timeframe == "1Day":
+        expected = completed.index[-1].date() if len(completed) else None
+        stale = actual.date() < expected if expected else None
+        freshness = "missing_completed_session" if stale else "current_completed_session" if expected else "unknown"
+        anchor_session = _schedule(actual.date().isoformat(), actual.date().isoformat())
+        anchor_completed = bool(len(anchor_session) and anchor_session.market_close.iloc[0] <= cutoff)
+    else:
+        minutes = {"1Hour": 60, "15Min": 15, "5Min": 5, "1Min": 1}.get(timeframe)
+        candidates = []
+        if minutes:
+            for row in reversed(list(schedule.itertuples())):
+                starts = pd.date_range(row.market_open, row.market_close, freq=f"{minutes}min", inclusive="left")
+                candidates.extend(start for start in starts if min(start + pd.Timedelta(minutes=minutes), row.market_close) <= cutoff)
+                if candidates:
+                    break
+        expected = max(candidates) if candidates else None
+        stale = actual < expected if expected is not None else None
+        freshness = "missing_completed_interval" if stale else "current_completed_interval" if expected is not None else "unknown"
+        anchor_session = _schedule(actual.date().isoformat(), actual.date().isoformat())
+        anchor_completed = None
+        if minutes:
+            anchor_completed = False
+            if len(anchor_session):
+                opening, closing = anchor_session.iloc[0][["market_open", "market_close"]]
+                anchor_completed = bool(opening <= actual < closing and
+                    (actual - opening).total_seconds() % (minutes * 60) == 0 and
+                    min(actual + pd.Timedelta(minutes=minutes), closing) <= cutoff)
     return clean_json_value({
-        "requested_asof": requested,
-        "actual_bar_timestamp": actual,
-        "lag_seconds": lag,
-        "status": status,
-        "stale": lag > 7 * 86400 if lag is not None else None,
-        "max_lag_calendar_days": 7,
+        "requested_asof": requested, "evaluated_at": cutoff, "actual_bar_timestamp": actual,
+        "lag_seconds": lag, "status": "anchor_after_cutoff" if lag < 0 else "stale_trailing" if stale else "within_tolerance" if stale is not None else "not_evaluated",
+        "stale": stale, "freshness_status": freshness, "expected_latest_completed": str(expected) if expected is not None else None,
+        "anchor_completed": anchor_completed,
+        "calendar": "NYSE", "calendar_scope": "US equity regular sessions; extended-hours coverage not verified",
         "completeness_verified": False,
+        "action": "Resync missing completed sessions/intervals; check provider availability or symbol trading status." if stale else None,
     })
+
+
+def session_coverage(timestamps, timeframe="1Day"):
+    stamps = pd.DatetimeIndex(pd.to_datetime(timestamps, utc=True))
+    dates = stamps.normalize().tz_localize(None) if timeframe == "1Day" else stamps.tz_convert("America/New_York").normalize().tz_localize(None)
+    schedule = _schedule(dates.min().date().isoformat(), dates.max().date().isoformat())
+    missing = schedule.index.difference(dates.unique())
+    unexpected = dates.unique().difference(schedule.index)
+    return {
+        "status": "warning" if len(missing) or len(unexpected) else "sessions_present",
+        "calendar": "NYSE", "scope": "session presence within observed bounds; not listing-lifetime or intraday interval completeness",
+        "missing_session_count": len(missing), "missing_sessions": [d.date().isoformat() for d in missing[:20]],
+        "unexpected_session_count": len(unexpected), "unexpected_sessions": [d.date().isoformat() for d in unexpected[:20]],
+        "session_presence_verified": not len(missing) and not len(unexpected),
+        "completeness_verified": False,
+        "action": "Backfill missing sessions; investigate halts/listing dates and out-of-calendar bars." if len(missing) or len(unexpected) else None,
+    }

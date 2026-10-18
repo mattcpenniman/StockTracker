@@ -516,11 +516,15 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
                     bars.loc[50, "close"] = 0
                 else:
                     bars = bars.iloc[:0]
-                compute_feature_frame(bars, "1Day", AnalyticsSettings())
+                if scenario != "empty":
+                    with self.assertRaisesRegex(ValueError, "Invalid OHLCV"):
+                        compute_feature_frame(bars, "1Day", AnalyticsSettings())
+                else:
+                    compute_feature_frame(bars, "1Day", AnalyticsSettings())
             execution = indicators.backend_diagnostics()["execution"]
             self.assertEqual(execution["native_calls"], 1)
-            self.assertEqual(execution["python_fallback_calls"], 4)
-            self.assertEqual(execution["fallback_reasons"]["ineligible_data"], 3)
+            self.assertEqual(execution["python_fallback_calls"], 1)
+            self.assertEqual(execution["fallback_reasons"]["ineligible_data"], 0)
             self.assertEqual(execution["fallback_reasons"]["empty_input"], 1)
 
     def test_health_keeps_diagnostics_when_database_fails(self):
@@ -567,6 +571,7 @@ class RustIndicatorTests(unittest.TestCase):
         for count in (1, 14, 20, 26, 55, 200, 252, 1200):
             bars = _fixture_bars(count)
             bars["close"] = 100 * np.exp(np.cumsum(rng.normal(0, 0.015, count)))
+            bars["open"] = bars["close"]
             bars["high"] = bars["close"] + rng.uniform(0.1, 3, count)
             bars["low"] = bars["close"] - rng.uniform(0.1, 3, count)
             bars["volume"] = rng.integers(0, 10_000_000, count).astype(float)
@@ -594,6 +599,9 @@ class RustIndicatorTests(unittest.TestCase):
                     bars[["open", "high", "low", "close"]] = 100.1 if scenario == "fractional_flat" else 100.0
                 elif scenario == "down":
                     bars["close"] = bars["close"][::-1].to_numpy()
+                    bars["open"] = bars["close"]
+                    bars["high"] = bars["close"] + 1
+                    bars["low"] = bars["close"] - 1
                 elif scenario == "zero_volume":
                     bars["volume"] = 0.0
                 elif scenario == "missing":
@@ -604,6 +612,10 @@ class RustIndicatorTests(unittest.TestCase):
                     bars.loc[100, "close"] = 0.0
                 else:
                     bars = bars.iloc[:0]
+                if scenario in {"missing", "missing_timestamp", "zero_price"}:
+                    with self.assertRaisesRegex(ValueError, "Invalid OHLCV"):
+                        compute_feature_frame(bars, "1Day", AnalyticsSettings())
+                    continue
                 expected = indicators._compute_feature_frame_python(bars, "1Day", AnalyticsSettings())
                 with patch.dict(os.environ, ANALYTICS_BACKEND="rust"):
                     actual = compute_feature_frame(bars, "1Day", AnalyticsSettings())
@@ -647,6 +659,7 @@ class SignalTests(unittest.TestCase):
     def test_breakdown_and_volume_spike_events(self) -> None:
         bars = _fixture_bars(30)
         bars.loc[:, "close"] = [100.0] * 29 + [80.0]
+        bars.loc[:, "open"] = bars["close"]
         bars.loc[:, "high"] = bars["close"] + 1.0
         bars.loc[:, "low"] = bars["close"] - 1.0
         bars.loc[:, "volume"] = [1000.0] * 29 + [5000.0]
@@ -664,6 +677,7 @@ class SignalTests(unittest.TestCase):
         for count in (0, 1, 14, 20, 26, 55, 200, 252, 500):
             bars = _fixture_bars(count)
             bars["close"] = 100 * np.exp(np.cumsum(rng.normal(0, 0.03, count)))
+            bars["open"] = bars["close"]
             bars["high"] = bars["close"] + 1
             bars["low"] = bars["close"] - 1
             bars["volume"] = rng.integers(0, 10000, count)
@@ -988,7 +1002,8 @@ class ServiceTests(unittest.TestCase):
         repo.fetch_bars.side_effect = lambda symbol_id, timeframe, asof=None, start=None: bars_by_id[symbol_id]
         service = AnalyticsService(repository=repo)
 
-        payload = service.get_batch_state(["AAA", "BBB"], "1Day", None, AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))
+        asof = bars_by_id[1]["timestamp"].iloc[-1]
+        payload = service.get_batch_state(["AAA", "BBB"], "1Day", asof, AnalyticsSettings(volume_confirmation=False, buffer_pct=0.0))
         states = {state["symbol"]: state for state in payload["states"]}
 
         self.assertEqual(payload["benchmarks"], ["SPY", "QQQ"])
@@ -1335,8 +1350,8 @@ class ServiceTests(unittest.TestCase):
                     utc=True,
                 ),
                 "open": [400.0, 378.0, 418.0],
-                "high": [402.0, 379.0, 421.0],
-                "low": [399.0, 379.0, 417.0],
+                "high": [402.0, 380.0, 421.0],
+                "low": [399.0, 378.0, 417.0],
                 "close": [401.0, 380.0, 420.0],
                 "volume": [900.0, 800.0, 1000.0],
             }

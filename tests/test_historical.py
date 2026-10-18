@@ -121,15 +121,15 @@ class HistoricalTests(unittest.TestCase):
         self.assertNotEqual(result["dates"][0]["features"]["states"][0]["portfolio"],
                             result["dates"][1]["features"]["states"][0]["portfolio"])
 
-    @unittest.skipUnless(indicators._rust_feature_columns, "native eligibility boundary")
-    def test_later_invalid_bar_does_not_change_earlier_dispatch_or_payload(self):
+    def test_invalid_history_rejects_symbol_for_entire_shared_sweep(self):
         dates = ["2024-06-03", "2024-07-02"]
         for value in (0.0, float("nan")):
             self.repo.frames[1, "1Day"].loc[self.repo.frames[1, "1Day"].timestamp > parse_asof("2024-06-15"), "close"] = value
             result = self.service.get_historical_portfolio(["B"], dates, AnalyticsSettings(), 2)
             for row in result["dates"]:
-                self.assertEqual(row["features"], AnalyticsService(self.repo).get_batch_state(
-                    ["B"], "1Day", parse_asof(row["cutoff"]), AnalyticsSettings()))
+                self.assertEqual(row["features"]["states"], [])
+                self.assertEqual(row["features"]["errors"][0]["symbol"], "B")
+                self.assertIn("Invalid OHLCV", row["features"]["errors"][0]["error"])
 
     def test_no_cache_pollution_and_reads_scale_with_symbols_not_dates(self):
         for n in (12, 60):

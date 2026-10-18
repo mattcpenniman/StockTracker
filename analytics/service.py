@@ -7,7 +7,8 @@ import pandas as pd
 
 from .config import AnalyticsSettings
 from .cache import CacheCapacityError, _StateCache
-from .coverage import historical_coverage
+from .coverage import historical_coverage, session_coverage
+from .quality import DataQualityError, validate_bars, corporate_action_diagnostics
 from .data_access import AnalyticsRepository, BatchReads
 from .indicators import compute_feature_frame, compute_feature_snapshot, latest_price_payload, sufficiency_flags
 from .state_bars import StateBars
@@ -62,6 +63,7 @@ class AnalyticsService:
             asof,
             isoformat_utc(context.get("last_bar_synced_at")),
             settings.cache_key(),
+            pd.Timestamp.now(tz="UTC").floor("min").isoformat() if asof is None else None,
         )
 
     def _preferred_price_timeframe(self, requested_timeframe: str, asof_dt) -> str:
@@ -81,6 +83,7 @@ class AnalyticsService:
             context["symbol"], timeframe,
             isoformat_utc(asof_dt), days, stop_loss_pct, take_profit_pct, side,
             isoformat_utc(context.get("last_bar_synced_at")),
+            pd.Timestamp.now(tz="UTC").floor("min").isoformat() if asof_dt is None else None,
         )
 
     def _load_feature_frame(
@@ -136,14 +139,32 @@ class AnalyticsService:
             if anchor_bars.empty:
                 price_timeframe = indicator_timeframe
             else:
+                validate_bars(anchor_bars)
                 anchor_bar = anchor_bars.latest() if isinstance(anchor_bars, StateBars) else anchor_bars.iloc[-1]
 
-        return self._state_from_snapshot(context, timeframe, asof_dt, settings, latest, len(bars), price_timeframe, anchor_bar)
+        result = self._state_from_snapshot(context, timeframe, asof_dt, settings, latest, len(bars), price_timeframe, anchor_bar)
+        result["data_quality"].update(clean_json_value({
+            "ohlcv_validation": {"status": "passed", "valid_bar_count": len(bars), "policy": "reject_entire_symbol_on_invalid_bar"},
+            "session_coverage": session_coverage(pd.to_datetime(bars.timestamps, unit="us", utc=True) if isinstance(bars, StateBars) else bars["timestamp"]),
+            "corporate_action_consistency": corporate_action_diagnostics(bars),
+            "completeness_verified": False,
+        }))
+        return result
 
     def _state_from_features(self, context, timeframe, asof_dt, settings, features, price_timeframe, anchor_bar=None):
         """Shared snapshot assembly; features must be a cutoff-bounded prefix."""
         latest = features.iloc[-1].to_dict()
-        return self._state_from_snapshot(context, timeframe, asof_dt, settings, latest, len(features), price_timeframe, anchor_bar)
+        validate_bars(features)
+        if anchor_bar is not None:
+            validate_bars(pd.DataFrame([anchor_bar]))
+        result = self._state_from_snapshot(context, timeframe, asof_dt, settings, latest, len(features), price_timeframe, anchor_bar)
+        result["data_quality"].update(clean_json_value({
+            "ohlcv_validation": {"status": "passed", "valid_bar_count": len(features), "policy": "reject_entire_symbol_on_invalid_bar"},
+            "session_coverage": session_coverage(features["timestamp"]),
+            "corporate_action_consistency": corporate_action_diagnostics(features),
+            "completeness_verified": False,
+        }))
+        return result
 
     def _state_from_snapshot(self, context, timeframe, asof_dt, settings, latest, bar_count, price_timeframe, anchor_bar=None):
         indicator_timeframe = "1Day"
@@ -153,7 +174,7 @@ class AnalyticsService:
         trend_regime = classify_trend_regime(latest)
         momentum_regime = classify_momentum_regime(latest)
         volatility_regime = classify_volatility_regime(latest, settings)
-        quality = sufficiency_flags(bar_count)
+        quality = sufficiency_flags(bar_count, latest, settings)
         quality.update(
             {
                 "last_bar_timestamp": anchor_timestamp,
@@ -166,7 +187,7 @@ class AnalyticsService:
                 "sync_error": context.get("sync_error"),
                 "historical_coverage": {
                     "indicators": historical_coverage(asof_dt, latest["timestamp"]),
-                    "price": historical_coverage(asof_dt, anchor_timestamp),
+                    "price": historical_coverage(asof_dt, anchor_timestamp, price_timeframe),
                 },
             }
         )
@@ -398,6 +419,9 @@ class AnalyticsService:
                 f"No future bars available for symbol '{context['symbol']}' on timeframe '{timeframe}' for the requested window."
             )
         anchor = anchors[-1]
+        for bar in [anchor, *bars]:
+            if not bar.ohlcv_valid or not (0 < bar.low <= bar.close <= bar.high < float("inf")):
+                raise DataQualityError(f"Invalid OHLCV in label window at {bar.timestamp}; resync the symbol.")
         close = anchor.close
         direction = 1 if side == "long" else -1
         stop = close * (1.0 - direction * stop_loss_pct) if stop_loss_pct is not None else None
@@ -429,6 +453,7 @@ class AnalyticsService:
             )
 
         anchor_bar = anchor_bars.iloc[-1]
+        validate_bars(anchor_bars)
         anchor_timestamp = anchor_bar["timestamp"]
         anchor_close = float(anchor_bar["close"])
         future_bars = self.repository.fetch_future_bars(
@@ -443,6 +468,7 @@ class AnalyticsService:
             )
 
         end_bar = future_bars.iloc[-1]
+        validate_bars(future_bars)
         high_idx = future_bars["high"].idxmax()
         low_idx = future_bars["low"].idxmin()
         max_bar = future_bars.loc[high_idx]
@@ -513,8 +539,10 @@ class AnalyticsService:
                 "as_of": anchor_timestamp,
                 "requested_asof": isoformat_utc(asof_dt),
                 "data_quality": {
-                    "historical_coverage": historical_coverage(asof_dt, anchor_timestamp),
+                    "historical_coverage": historical_coverage(asof_dt, anchor_timestamp, timeframe),
                     "complete_future_window": complete_window,
+                    "ohlcv_validation": {"status": "passed", "policy": "reject_entire_symbol_on_invalid_bar"},
+                    "completeness_verified": False,
                 },
                 "horizon_days": days,
                 "side": side,
@@ -614,7 +642,7 @@ class AnalyticsService:
                     if isinstance(result, Exception):
                         raise result
                 benchmark_states[benchmark] = result
-            except (AnalyticsNotFoundError, CacheCapacityError) as exc:
+            except (AnalyticsNotFoundError, CacheCapacityError, DataQualityError) as exc:
                 benchmark_errors.append({"symbol": benchmark, "error": str(exc)})
 
         for benchmark, state in benchmark_states.items():
@@ -675,7 +703,7 @@ class AnalyticsService:
         for symbol in symbols:
             try:
                 states.append(scoped.get_symbol_state(symbol, timeframe, asof_dt, settings))
-            except (AnalyticsNotFoundError, CacheCapacityError) as exc:
+            except (AnalyticsNotFoundError, CacheCapacityError, DataQualityError) as exc:
                 errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
 
         self._add_portfolio_ranks(states)
@@ -697,6 +725,8 @@ class AnalyticsService:
                 "errors": errors,
                 "benchmark_errors": benchmark_errors,
                 "data_quality": {
+                    "session_warning_symbols": [state["symbol"] for state in states if state.get("data_quality", {}).get("session_coverage", {}).get("status") == "warning"],
+                    "corporate_action_warning_symbols": [state["symbol"] for state in states if state.get("data_quality", {}).get("corporate_action_consistency", {}).get("status") == "warning"],
                     "stale_symbols": [state["symbol"] for state in states if any(
                         item.get("stale") for item in state.get("data_quality", {}).get("historical_coverage", {}).values()
                     )],
@@ -738,7 +768,7 @@ class AnalyticsService:
                         side=side,
                     )
                 )
-            except (AnalyticsNotFoundError, CacheCapacityError) as exc:
+            except (AnalyticsNotFoundError, CacheCapacityError, DataQualityError) as exc:
                 errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
 
         return self._future_batch_payload(timeframe, asof_dt, days, side, future_states, errors)

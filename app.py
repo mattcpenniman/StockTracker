@@ -18,6 +18,7 @@ from flask import Flask, Response, jsonify, request
 import matplotlib.pyplot as plt
 
 from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
+from analytics.quality import validate_bars, OHLCV_SQL_CHECK
 from analytics.cache import CacheCapacityError
 from analytics.utils import isoformat_utc, parse_asof
 from analytics.runtime import runtime_diagnostics
@@ -309,6 +310,16 @@ def _init_db_if_needed() -> None:
                     )
                     """
                 )
+                # Enforce new writes without claiming legacy rows were audited.
+                cur.execute(f"""
+                    DO $$ BEGIN
+                        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                            WHERE conrelid = 'stock_bars'::regclass AND conname = 'stock_bars_valid_ohlcv') THEN
+                            ALTER TABLE stock_bars ADD CONSTRAINT stock_bars_valid_ohlcv
+                                CHECK ({OHLCV_SQL_CHECK}) NOT VALID;
+                        END IF;
+                    END $$;
+                """)
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS latest_quotes (
@@ -953,15 +964,21 @@ def _normalize_bar_row(symbol_id: int, timeframe: str, payload: Dict) -> Tuple:
     bar_time = _parse_market_timestamp(payload.get("t"))
     if bar_time is None:
         raise ValueError("Alpaca bar is missing a valid timestamp.")
+    # Fail the entire provider page before opening a transaction. No filling,
+    # dropping, or partial acceptance of malformed market observations.
+    validate_bars(pd.DataFrame([{
+        "timestamp": bar_time, **{name: payload.get(key) for name, key in
+        (("open", "o"), ("high", "h"), ("low", "l"), ("close", "c"), ("volume", "v"))}
+    }]))
     return (
         symbol_id,
         timeframe,
         bar_time,
-        float(payload.get("o", 0.0)),
-        float(payload.get("h", 0.0)),
-        float(payload.get("l", 0.0)),
-        float(payload.get("c", 0.0)),
-        int(payload.get("v", 0) or 0),
+        float(payload["o"]),
+        float(payload["h"]),
+        float(payload["l"]),
+        float(payload["c"]),
+        int(payload["v"]),
         int(payload.get("n", 0) or 0) if payload.get("n") is not None else None,
         float(payload.get("vw")) if payload.get("vw") is not None else None,
     )
@@ -4684,7 +4701,9 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
         <p>Portfolio reads perform no provider I/O. Explicit intraday requests require verified provider coverage over the seven-day anchor lookback through <code>asof + days</code>, capped at the delayed present. Uncovered symbols return per-symbol errors with preparation bounds; prepare them using <code>POST /api/coverage/prepare</code> and retry. Single-symbol intraday reads fetch only missing coverage ranges for envelopes up to 31 calendar days and report required provider failures; larger uncovered envelopes require explicit preparation in smaller windows. Successful empty windows cover market closures; unfinished delayed tails are rechecked, not permanently covered. This calendar search does not guarantee N trading bars; inspect <code>complete_window</code>.</p>
         <p>Returns realized forward performance for every visible stock in the saved portfolio from the same <code>asof</code> anchor. This is intended for labeling historical training examples after fetching technicals from <code>/api/portfolio/state</code>. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameters include <code>timeframe</code>, <code>hidets</code>, <code>include_hidden=1</code>, <code>side</code>, <code>stoploss</code>, and <code>takeprofit</code>. For <code>1Day</code>, <code>days</code> means future trading bars rather than calendar days.</p>
         <h3>Historical coverage and daily preparation</h3>
-        <p>HTTP success and <code>ok=true</code> report request execution, not complete history. State responses expose <code>requested_asof</code> and <code>data_quality.historical_coverage</code> separately for indicators and price. Future labels expose the same diagnostics for their anchor, plus <code>complete_future_window</code>. Each coverage object reports the actual bar timestamp, lag in seconds, and status: <code>within_tolerance</code> (at most seven calendar days), <code>stale_trailing</code> (older), <code>anchor_after_cutoff</code>, or <code>not_evaluated</code> (no historical cutoff). This is a conservative age warning, not a trading-calendar or interior-gap audit: <code>completeness_verified</code> is false. Weekends and holidays do not require exact-date bars. Batch summaries list stale symbols and incomplete label windows; per-symbol errors remain separate.</p>
+        <p>HTTP success and <code>ok=true</code> report execution, not validated investment performance or complete history. Ingestion rejects an entire provider page before writing if required OHLCV is missing, nonnumeric, nonfinite, nonpositive OHLC, outside its high/low range, or has negative/fractional volume. Zero volume is valid. Analytics rejects the entire affected symbol/window, never fills or drops invalid bars, and keeps other portfolio symbols in <code>states</code> with failures in <code>errors</code>. Shared historical sweeps reject the symbol for all requested cutoffs if their loaded history is malformed. The database constraint enforces new writes; its NOT VALID migration does not certify pre-existing rows.</p>
+        <p><code>data_quality.ohlcv_validation</code> certifies only numeric/range checks on consumed bars. <code>historical_coverage</code> separates indicators and price; labels report anchor coverage and <code>complete_future_window</code> (bar count only). Current requests evaluate against now, with freshness cached for at most one minute. Historical requests evaluate against the cutoff. NYSE regular-session closes and completed intraday intervals account for weekends, holidays, DST and early closes. <code>expected_latest_completed</code>, <code>freshness_status</code>, <code>anchor_completed</code> and remediation <code>action</code> explain results. Legacy <code>within_tolerance</code> now means no missing latest completed session/interval, not a seven-day allowance or proof that the selected anchor is complete. Check <code>anchor_completed</code>; selection/availability semantics are tracked in VEC-829.</p>
+        <p>State <code>session_coverage</code> reports missing and out-of-calendar session dates within observed history bounds, with counts and up to 20 examples. This assumes US-equity NYSE regular sessions, not symbol-specific halts, listing lifetime, extended hours, or full intraday interval coverage. <code>metric_history</code> reports metric-specific valid-bar warmup and finite-value availability; legacy 20/50/200 flags count validated observations, not completed sessions. Check these independently of session coverage. Corporate-action consistency is <code>unknown</code> without authoritative adjustment provenance; absolute one-bar moves of at least 50% produce a review warning, never automatic rejection or normalization. Inspect VEC-830/VEC-831 and the flagged timestamps. A recent anchor, enough rows or passing numeric checks does not verify the economic adjustment basis. Overall <code>completeness_verified</code> remains false. Batch summaries list stale, session-warning and corporate-action-warning symbols.</p>
         <p>Benchmark quality appears under each state's <code>data_quality.benchmark_coverage</code>. Missing or stale benchmarks report <code>benchmark_errors</code>; relative returns are omitted for stale benchmarks or unequal indicator timestamps. For daily training, join by symbol AND indicator/label anchor timestamp, require a complete future window, and inspect coverage. A timed daily state may use an intraday price while its indicators and daily labels use daily bars; joining by symbol alone is insufficient. Preserve timestamps rather than using <code>hidets</code> when pairing.</p>
         <p><code>POST /api/coverage/prepare</code> explicitly prepares daily bars using JSON <code>symbols</code>, <code>start</code>, <code>end</code>, and optional boolean <code>include_benchmarks</code> (default true, adds SPY and QQQ). Use ISO timestamps for precise bounds. Limits: 50 unique symbols including benchmarks and 400 calendar days per request; end must be at or before the delayed present. Select a window containing indicator warmup, the cutoff and future-label horizon; split longer histories into bounded requests. Only gaps in previously verified provider windows are fetched. Completed empty windows cover closures too; recent unfinalized tails may be fetched again. Provider failures are collected per symbol in <code>errors</code>; <code>ok=true</code> does not mean every symbol prepared. Preparation verifies provider responses, not that a provider supplied every trading session. Subsequent analytics reads expose actual anchors and realized horizon counts.</p>
         <pre>curl -s http://127.0.0.1:5000/api/coverage/prepare -H 'Content-Type: application/json' -d '{"symbols":["NVDA"],"start":"2025-11-01T00:00:00Z","end":"2026-10-01T00:00:00Z"}'</pre>

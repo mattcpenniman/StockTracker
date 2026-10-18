@@ -14,6 +14,7 @@ from analytics.config import AnalyticsSettings
 from analytics.service import AnalyticsService
 from analytics.utils import clean_json_value, parse_asof
 from analytics.warm_response_benchmark import baseline_types
+from tests.quality_compat import legacy_quality_contract
 
 
 def repository():
@@ -78,10 +79,10 @@ class WarmResponseTests(unittest.TestCase):
                 expected = request(before, type(self).before_settings)
                 for _ in range(2):
                     actual = request(after, AnalyticsSettings)
-                    self.assertEqual(actual, expected)
+                    self.assertEqual(legacy_quality_contract(actual), legacy_quality_contract(expected))
                     self.assertEqual(json.loads(json.dumps(actual, allow_nan=False)), actual)
                     vandalize(actual)
-                self.assertEqual(request(after, AnalyticsSettings), expected)
+                self.assertEqual(legacy_quality_contract(request(after, AnalyticsSettings)), legacy_quality_contract(expected))
         single = after.get_symbol_state("A", "1Day", parse_asof("2025-09-15"), AnalyticsSettings())
         self.assertNotIn("portfolio", single)
         self.assertNotIn("relative", single)
@@ -132,7 +133,7 @@ class WarmResponseTests(unittest.TestCase):
                     self.assertEqual(cold.status_code, 200, cold.get_json())
                     self.assertEqual(cold.get_json(), warm.get_json())
                     payloads.append(cold.get_json())
-                self.assertEqual(*payloads)
+                self.assertEqual(*(legacy_quality_contract(p) for p in payloads))
 
     def test_settings_key_matches_old_format_once_and_covers_every_field(self):
         settings = AnalyticsSettings()

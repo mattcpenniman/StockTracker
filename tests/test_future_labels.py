@@ -34,8 +34,8 @@ class MemoryLabels(AnalyticsRepository):
 
     def fetch_bars_many(self, ids, timeframe, asof=None, **kwargs):
         records = self.fetch_label_bars_many(ids, timeframe, asof, **kwargs)
-        return {sid: pd.DataFrame([dict(timestamp=b.timestamp, high=b.high, low=b.low, close=b.close) for b in bars],
-                                 columns=["timestamp", "high", "low", "close"]) for sid, bars in records.items()}
+        return {sid: pd.DataFrame([dict(timestamp=b.timestamp, open=b.close, high=b.high, low=b.low, close=b.close, volume=0) for b in bars],
+                                 columns=["timestamp", "open", "high", "low", "close", "volume"]) for sid, bars in records.items()}
 
     def fetch_latest_bar(self, sid, tf, asof=None):
         return self.fetch_bars_many([sid], tf, asof, latest=True)[sid]
@@ -71,10 +71,10 @@ class TypedLabelTests(unittest.TestCase):
             for close in (0.0, 100.0, float("nan"), float("inf")):
                 # Repeated extrema, a same-bar double hit and nonfinite close.
                 fixed = [LabelBar(ts, 100, 100, close),
-                         LabelBar(ts + timedelta(microseconds=1), 110, 90, float("inf")),
+                         LabelBar(ts + timedelta(microseconds=1), 110, 90, 100 if close == 100 else float("inf")),
                          LabelBar(ts + timedelta(minutes=1), 110, 90, 102)]
                 random_bars = [LabelBar(ts + timedelta(minutes=i + 2), rng.randrange(100, 120),
-                                       rng.randrange(80, 100), rng.randrange(90, 110)) for i in range(20)]
+                                       rng.randrange(80, 100), 100) for i in range(20)]
                 repo = MemoryLabels(fixed + random_bars)
                 for side in ("long", "short"):
                     for stop, take in ((None, None), (0, 0), (0.05, 0.05), (None, 0.10), (0.10, None)):
@@ -84,7 +84,15 @@ class TypedLabelTests(unittest.TestCase):
                                 expected = ReferenceService(repo).get_batch_future_state(*args)
                                 with patch.object(repo, "_bar_frame", side_effect=AssertionError("pandas frame")):
                                     actual = AnalyticsService(repo).get_batch_future_state(*args)
-                                self.assertEqual(actual, expected)
+                                if close != 100:
+                                    self.assertEqual(actual["future_states"], [])
+                                    self.assertEqual(expected["future_states"], [])
+                                    self.assertEqual([e["symbol"] for e in actual["errors"]], [e["symbol"] for e in expected["errors"]])
+                                    self.assertIn("Invalid OHLCV", actual["errors"][0]["error"])
+                                    self.assertIn("Invalid OHLCV", expected["errors"][0]["error"])
+                                    continue
+                                else:
+                                    self.assertEqual(actual, expected)
                                 json.dumps(actual, allow_nan=False)
                                 self.assertEqual(actual["future_states"][0]["as_of"], "2026-03-17T13:30:00.123456Z")
                                 self.assertEqual(actual["future_states"][0]["future_state"]["max_price_timestamp"],

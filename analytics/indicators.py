@@ -13,6 +13,7 @@ import pandas as pd
 from .config import AnalyticsSettings
 from .utils import safe_ratio
 from .state_bars import StateBars
+from .quality import validate_bars
 
 try:
     from apollo_indicators import feature_columns as _rust_feature_columns
@@ -204,6 +205,7 @@ def compute_feature_frame(
     settings: AnalyticsSettings,
 ) -> pd.DataFrame:
     """Use the fused native kernel when installed, retaining the pandas reference."""
+    validate_bars(bars)
     backend = os.environ.get("ANALYTICS_BACKEND", "auto").lower()
     if backend not in {"auto", "python", "rust"}:
         raise ValueError("ANALYTICS_BACKEND must be auto, python, or rust.")
@@ -254,6 +256,7 @@ def compute_feature_snapshot(bars, timeframe, settings):
     Older installed extensions continue to use the compatible full-frame API.
     """
     if isinstance(bars, StateBars):
+        validate_bars(bars)
         backend = os.environ.get("ANALYTICS_BACKEND", "auto").lower()
         if backend not in {"auto", "python", "rust"}:
             raise ValueError("ANALYTICS_BACKEND must be auto, python, or rust.")
@@ -280,11 +283,31 @@ def compute_feature_snapshot(bars, timeframe, settings):
     return compute_feature_frame(bars, timeframe, settings).iloc[-1].to_dict()
 
 
-def sufficiency_flags(df: pd.DataFrame | int) -> dict:
+def sufficiency_flags(df: pd.DataFrame | int, latest=None, settings=None) -> dict:
     count = df if isinstance(df, int) else len(df)
     return {
         "bar_count": count,
         "has_sufficient_history_20": count >= 20,
         "has_sufficient_history_50": count >= 50,
         "has_sufficient_history_200": count >= 200,
+        "history_basis": "validated_observations_not_completed_sessions",
+        "metric_history": {
+            name: {"required_valid_bars": required, "usable": count >= required and
+                   bool(pd.notna((latest or {}).get(name))) and bool(np.isfinite(float((latest or {})[name])))}
+            for name, required in {
+                "return_1": 2, "return_5": 6, "return_20": 21, "return_60": 61,
+                "sma_20": 20, "sma_50": 50, "sma_200": 200, "ema_12": 12,
+                "ema_26": 26, "rsi_14": 15, "macd_signal": 34, "atr_14": 14,
+                "macd": 26, "macd_hist": 34, "stddev_20": 21,
+                "realized_vol_20": 21, "high_20": 20, "low_20": 20,
+                "high_55": 55, "low_55": 55, "high_252": 252, "low_252": 252,
+                "return_20_over_vol_20": 21, "return_60_over_vol_20": 61,
+                "volatility_ratio": 40, "return_zscore": 21, "avg_volume_20": 20,
+                "volume_ratio_20": 20, "volume_zscore": 20,
+                "breakout_level": (settings.breakout_lookback if settings else 20) + 1,
+                "breakdown_level": (settings.breakout_lookback if settings else 20) + 1,
+                "sma20_slope": 20 + (settings.sma_slope_lookback if settings else 5),
+                "sma50_slope": 50 + (settings.sma_slope_lookback if settings else 5),
+            }.items()
+        },
     }

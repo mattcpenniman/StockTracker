@@ -3,6 +3,7 @@ gunicorn==23.0.0
 yfinance
 pandas
 numpy>=1.23
+pandas-market-calendars>=5.1,<6
 python-dotenv
 psycopg2-binary
 yfinance
