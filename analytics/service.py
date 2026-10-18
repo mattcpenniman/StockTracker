@@ -634,7 +634,9 @@ class AnalyticsService:
                 relative_quality[benchmark] = {
                     "indicator_bar_timestamp": benchmark_timestamp,
                     "aligned": aligned,
-                    "historical_coverage": coverage,
+                    # Coverage is a flat JSON-normalized mapping. Give each
+                    # returned state its own mapping, even for in-portfolio SPY.
+                    "historical_coverage": dict(coverage),
                 }
                 if not aligned or coverage.get("stale"):
                     continue
@@ -644,7 +646,9 @@ class AnalyticsService:
                     state_return = state_returns.get(field)
                     benchmark_return = benchmark_returns.get(field)
                     if state_return is not None and benchmark_return is not None and pd.notna(state_return) and pd.notna(benchmark_return):
-                        relative[f"rel_return_{benchmark.lower()}_{field.removeprefix('r_')}"] = float(state_return) - float(benchmark_return)
+                        # Finite inputs can overflow on subtraction. Normalize
+                        # only this new value, not the already-clean symbol tree.
+                        relative[f"rel_return_{benchmark.lower()}_{field.removeprefix('r_')}"] = clean_json_value(float(state_return) - float(benchmark_return))
 
             for error in benchmark_errors:
                 relative_quality.setdefault(error["symbol"], {"status": "missing", "error": error["error"]})
@@ -680,12 +684,16 @@ class AnalyticsService:
         return self._state_batch_payload(timeframe, asof_dt, states, errors, benchmarks, benchmark_errors)
 
     def _state_batch_payload(self, timeframe, asof_dt, states, errors, benchmarks, benchmark_errors):
-        return clean_json_value(
+        # Symbol serializers normalize before the cache's strict JSON encoding.
+        # get_or_compute decodes an independently owned tree for EVERY caller
+        # (producer, waiter and hit), so enrichment needs no deepcopy/COW here.
+        # Historical sweeps also supply serializer-normalized, owned trees.
+        # Normalize the small envelope only; never revisit cached subtrees.
+        payload = clean_json_value(
             {
                 "timeframe": timeframe,
                 "requested_asof": isoformat_utc(asof_dt),
                 "benchmarks": benchmarks,
-                "states": states,
                 "errors": errors,
                 "benchmark_errors": benchmark_errors,
                 "data_quality": {
@@ -696,6 +704,8 @@ class AnalyticsService:
                 },
             }
         )
+        payload["states"] = states
+        return payload
 
     def get_batch_future_state(
         self,
@@ -734,13 +744,12 @@ class AnalyticsService:
         return self._future_batch_payload(timeframe, asof_dt, days, side, future_states, errors)
 
     def _future_batch_payload(self, timeframe, asof_dt, days, side, future_states, errors):
-        return clean_json_value(
+        payload = clean_json_value(
             {
                 "timeframe": timeframe,
                 "requested_asof": isoformat_utc(asof_dt),
                 "horizon_days": days,
                 "side": side,
-                "future_states": future_states,
                 "errors": errors,
                 "data_quality": {
                     "stale_symbols": [state["symbol"] for state in future_states if state["data_quality"]["historical_coverage"]["stale"]],
@@ -749,6 +758,8 @@ class AnalyticsService:
                 },
             }
         )
+        payload["future_states"] = future_states
+        return payload
 
     def get_historical_portfolio(self, symbols, cutoffs, settings, days=20,
                                  stop_loss_pct=None, take_profit_pct=None, side="long"):

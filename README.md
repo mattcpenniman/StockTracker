@@ -360,6 +360,39 @@ in-window throughput rose from 58.1 to 92.1 req/s in the short local load test.
 Methodology, full latency/drop tables, data-quality observations and validation
 are maintained in Vector: `vector doc show DOC-233`.
 
+### Warm portfolio response ownership (VEC-814)
+
+Symbol serializers normalize JSON before insertion into immutable byte caches.
+Each cache caller receives an independently decoded object graph, so portfolio
+ranks, relative returns and benchmark quality can be enriched in place without
+copying the whole symbol again. Batch assembly normalizes only its small envelope
+and newly calculated relative returns; it does not recursively rebuild clean
+symbol subtrees. Frozen settings reuse one complete settings-key tuple per
+instance across batch planning and symbol lookups.
+
+The baseline-pinned benchmark compares complete cold/warm responses, alternates
+warm latency pairs, and separately records traced allocation peaks and profiles:
+
+```bash
+DATABASE_URL='<read-only DSN>' ANALYTICS_BACKEND=rust \
+  python -m analytics.warm_response_benchmark --repeats 30 --output /tmp/warm.json
+
+# Separate terminals, isolated servers with benchmark-only RSS diagnostics:
+DATABASE_URL='<read-only DSN>' ANALYTICS_BACKEND=rust \
+  python -m analytics.warm_response_benchmark --serve 5014 --variant before
+DATABASE_URL='<read-only DSN>' ANALYTICS_BACKEND=rust \
+  python -m analytics.warm_response_benchmark --serve 5015 --variant after
+python -m analytics.warm_response_benchmark --load --output /tmp/warm-load.json
+```
+
+Requires git history and the stored 37-symbol portfolio used by DOC-228. It
+enforces read-only database transactions, bypasses DDL and prohibits providers.
+Against the current SQL-membership baseline, warm state medians fell 25–26% and
+futurestate 18–21%; peak traced memory fell about 2% / 4%. Mixed throughput at
+100 offered req/s rose 47.2→61.9 req/s. Overloaded state-only p95/p99 worsened
+despite higher throughput. Full gains, regressions, ownership tests and
+reproduction details are in Vector: `vector doc show DOC-238`.
+
 ### Cold state snapshots (VEC-809)
 
 State endpoints use request-local typed OHLCV columns and the Rust extension's

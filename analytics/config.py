@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
+from functools import cached_property
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,12 @@ class AnalyticsSettings:
     volatility_regime_low_multiple: float = 0.75
     volatility_regime_high_multiple: float = 1.5
 
-    def cache_key(self) -> tuple:
-        return tuple(sorted(asdict(self).items()))
+    @cached_property
+    def _cache_key(self) -> tuple:
+        # Settings are frozen scalar values. Build once per settings instance
+        # (normally one request), shared by batch planning and actual lookups.
+        # Keep the old sorted (name, value) representation and every field.
+        return tuple(sorted((field.name, getattr(self, field.name)) for field in fields(self)))
 
+    def cache_key(self) -> tuple:
+        return self._cache_key

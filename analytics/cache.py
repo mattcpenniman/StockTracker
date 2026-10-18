@@ -1,8 +1,11 @@
 """Per-worker byte-accounted LRU and bounded, per-key single-flight.
 
-Only immutable JSON bytes are retained. Decoding outside the lock gives each
-caller its own payload, including the producer. PostgreSQL and analytics never
-run under the cache lock.
+Only immutable JSON bytes are retained. Service serializers must normalize
+NumPy/pandas scalars, nonfinite values and timestamps before insertion; strict
+JSON encoding rejects violations. Decoding outside the lock gives each caller
+its own JSON-normalized payload, including the producer. Portfolio assembly
+relies on this ownership/normalization contract and cleans only new fields.
+PostgreSQL and analytics never run under the cache lock.
 """
 from __future__ import annotations
 
