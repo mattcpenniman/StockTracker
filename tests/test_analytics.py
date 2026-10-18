@@ -1778,7 +1778,8 @@ class HistoricalStateSyncTests(unittest.TestCase):
             self.assertEqual(fetch.call_args.args[-1], self.asof)
             inserts = [c for c in cur.execute.call_args_list if "INSERT INTO market_data_coverage" in c.args[0]]
             self.assertEqual(len(inserts), 1)
-            self.assertEqual(inserts[0].args[1][-1], self.asof - timedelta(minutes=15))
+            self.assertEqual(inserts[0].args[1][3], self.asof - timedelta(minutes=15))
+            self.assertEqual(inserts[0].args[1][5], "split")
             cur.reset_mock()
             fetch.side_effect = RuntimeError("provider down")
             with self.assertRaisesRegex(RuntimeError, "provider down"):

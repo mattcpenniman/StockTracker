@@ -222,7 +222,7 @@ class BatchPostgreSQLTests(unittest.TestCase):
         for method, extra in ((service.get_batch_state, AnalyticsSettings()), (service.get_batch_future_state, 2)):
             repo.queries = 0
             method(*args, extra)
-            self.assertEqual(repo.queries, 1)
+            self.assertEqual(repo.queries, 2)  # snapshot setup + contexts
         try:
             with psycopg2.connect(self.dsn) as conn, conn.cursor() as cur:
                 cur.execute("UPDATE stock_bars SET close=close+10, high=high+10 WHERE symbol_id=(SELECT id FROM symbol_metadata WHERE symbol='D021') AND bar_time=%s AND timeframe='1Day'", (eligible_anchor,))
@@ -242,18 +242,18 @@ class BatchPostgreSQLTests(unittest.TestCase):
             symbols = [f"D{i:03d}" for i in range(105)] + ["D000", "D104"]
             asof = end - timedelta(days=2)
             future = service.get_batch_future_state(symbols, "1Day", asof, 20)
-            self.assertEqual(repo.queries, 5)  # contexts + two anchors + two windows
+            self.assertEqual(repo.queries, 6)  # snapshot + contexts + two anchors + two windows
             self.assertEqual(future["errors"], [])
             self.assertEqual([state["symbol"] for state in future["future_states"]], symbols)
             self.assertTrue(all(state["window"]["future_bar_count"] == 4 for state in future["future_states"]))
             repo.queries = 0
             states = service.get_batch_state(symbols, "1Day", asof, AnalyticsSettings())
-            self.assertEqual(repo.queries, 12)  # contexts + eleven history chunks, including benchmarks
+            self.assertEqual(repo.queries, 13)  # snapshot + contexts + eleven history chunks, including benchmarks
             self.assertEqual(states["errors"], [])
             for method, extra in ((service.get_batch_state, AnalyticsSettings()), (service.get_batch_future_state, 20)):
                 repo.queries = 0
                 method(symbols, "1Day", asof, extra)
-                self.assertEqual(repo.queries, 1)
+                self.assertEqual(repo.queries, 2)  # snapshot setup + contexts
 
 
 if __name__ == "__main__":

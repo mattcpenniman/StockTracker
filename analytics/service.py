@@ -23,6 +23,7 @@ from .serializers import serialize_events, serialize_state_payload, serialize_sy
 from .signals import compute_signal_columns, generate_events, latest_signal_payload
 from .utils import clean_json_value, isoformat_utc
 from .availability import available_at, policy as availability_policy
+from .read_snapshot import coherent_read
 
 
 class AnalyticsNotFoundError(RuntimeError):
@@ -63,6 +64,7 @@ class AnalyticsService:
             timeframe,
             asof,
             isoformat_utc(context.get("last_bar_synced_at")),
+            context.get("adjustment_revision"),
             settings.cache_key(),
             pd.Timestamp.now(tz="UTC").floor("min").isoformat() if asof is None else None,
         )
@@ -84,6 +86,7 @@ class AnalyticsService:
             context["symbol"], timeframe,
             isoformat_utc(asof_dt), days, stop_loss_pct, take_profit_pct, side,
             isoformat_utc(context.get("last_bar_synced_at")),
+            context.get("adjustment_revision"),
             pd.Timestamp.now(tz="UTC").floor("min").isoformat() if asof_dt is None else None,
         )
 
@@ -104,6 +107,7 @@ class AnalyticsService:
         features = compute_signal_columns(features, settings)
         return context, features
 
+    @coherent_read
     def get_symbol_state(
         self,
         symbol: str,
@@ -187,6 +191,7 @@ class AnalyticsService:
                 "indicator_available_at": available_at(latest["timestamp"], indicator_timeframe),
                 "price_available_at": available_at(anchor_timestamp, price_timeframe),
                 "last_sync_timestamp": context.get("last_synced_at"),
+                "adjustment_basis": context.get("adjustment_basis"),
                 "sync_status": context.get("sync_status"),
                 "sync_error": context.get("sync_error"),
                 "historical_coverage": {
@@ -321,6 +326,7 @@ class AnalyticsService:
         payload["requested_asof"] = isoformat_utc(asof_dt)
         return payload
 
+    @coherent_read
     def get_events(
         self,
         symbol: str,
@@ -335,6 +341,7 @@ class AnalyticsService:
             timeframe,
             isoformat_utc(asof_dt),
             isoformat_utc(context.get("last_bar_synced_at")),
+            context.get("adjustment_revision"),
             settings.cache_key(),
             event_limit,
         )
@@ -370,8 +377,10 @@ class AnalyticsService:
             if not price_bars.empty:
                 anchor_timestamp = price_bars.iloc[-1]["timestamp"]
         payload["as_of"] = isoformat_utc(anchor_timestamp)
+        payload["adjustment_basis"] = context.get("adjustment_basis")
         return payload
 
+    @coherent_read
     def get_future_state(
         self,
         symbol: str,
@@ -543,6 +552,7 @@ class AnalyticsService:
                 "as_of": anchor_timestamp,
                 "requested_asof": isoformat_utc(asof_dt),
                 "data_quality": {
+                    "adjustment_basis": context.get("adjustment_basis"),
                     "bar_availability": availability_policy(),
                     "anchor_available_at": available_at(anchor_timestamp, timeframe),
                     "historical_coverage": historical_coverage(asof_dt, anchor_timestamp, timeframe),
@@ -689,6 +699,7 @@ class AnalyticsService:
 
         return list(benchmark_states.keys()), benchmark_errors
 
+    @coherent_read
     def get_batch_state(
         self,
         symbols: list[str],
@@ -743,6 +754,7 @@ class AnalyticsService:
         payload["states"] = states
         return payload
 
+    @coherent_read
     def get_batch_future_state(
         self,
         symbols: list[str],
@@ -797,6 +809,7 @@ class AnalyticsService:
         payload["future_states"] = future_states
         return payload
 
+    @coherent_read
     def get_historical_portfolio(self, symbols, cutoffs, settings, days=20,
                                  stop_loss_pct=None, take_profit_pct=None, side="long"):
         from .historical import historical_portfolio

@@ -152,7 +152,7 @@ class TypedLabelPostgreSQLTests(unittest.TestCase):
                 self.assertEqual(actual, expected)
                 self.assertEqual(len(actual["future_states"]), 205)
                 self.assertEqual(len(actual["errors"]), 2)
-                self.assertEqual(repo.queries, 7)  # metadata + three anchor/window chunks
+                self.assertEqual(repo.queries, 8)  # snapshot + metadata + three anchor/window chunks
                 self.assertLessEqual(repo.rows, 206 + 206 * 2)
                 self.assertEqual(scan.call_count, 3)
                 self.assertTrue(all(len(call.args[0]) <= 100 for call in scan.call_args_list))
@@ -174,11 +174,11 @@ class TypedLabelPostgreSQLTests(unittest.TestCase):
                         service = AnalyticsService(repo)
                         actual = service.get_batch_future_state(*args)
                         self.assertEqual(actual, expected)
-                        self.assertLessEqual(repo.queries, 3)
+                        self.assertLessEqual(repo.queries, 4)  # includes snapshot setup
                         self.assertLessEqual(repo.rows, 2 + horizon)
                         repo.queries = repo.rows = 0
                         self.assertEqual(service.get_batch_future_state(*args), expected)
-                        self.assertEqual(repo.queries, 1 if actual["future_states"] else 2)
+                        self.assertEqual(repo.queries, 2 if actual["future_states"] else 3)
 
 
 if __name__ == "__main__":

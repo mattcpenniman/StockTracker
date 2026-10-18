@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -25,6 +26,7 @@ from analytics.runtime import runtime_diagnostics
 from live_prices import PriceCache, YahooQuotes
 from database import get_connection
 from market_sync import SyncFlights
+from adjustment_history import refresh_history
 
 # Load environment variables from a .env file in the same directory (if present)
 try:
@@ -310,6 +312,18 @@ def _init_db_if_needed() -> None:
                     )
                     """
                 )
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS market_data_basis (
+                        symbol_id BIGINT PRIMARY KEY REFERENCES symbol_metadata(id) ON DELETE CASCADE,
+                        revision TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        adjustment_modes JSONB NOT NULL,
+                        adjusted_through DATE NOT NULL,
+                        checked_at TIMESTAMPTZ NOT NULL
+                    );
+                    ALTER TABLE market_data_coverage ADD COLUMN IF NOT EXISTS adjustment_revision TEXT;
+                    ALTER TABLE market_data_coverage ADD COLUMN IF NOT EXISTS adjustment_mode TEXT;
+                """)
                 # Enforce new writes without claiming legacy rows were audited.
                 cur.execute(f"""
                     DO $$ BEGIN
@@ -835,8 +849,7 @@ def _alpaca_headers() -> Dict[str, str]:
 
 
 def _alpaca_bar_adjustment_for_timeframe(timeframe: str) -> str:
-    if timeframe in {"1Min", "5Min", "15Min", "1Hour"}:
-        return "split"
+    # Daily indicators and intraday anchors must have the same economic basis.
     return ALPACA_BAR_ADJUSTMENT
 
 
@@ -960,16 +973,17 @@ def _fetch_alpaca_latest_bar(symbol: str) -> Dict | None:
     return None
 
 
-def _normalize_bar_row(symbol_id: int, timeframe: str, payload: Dict) -> Tuple:
+def _normalize_bar_row(symbol_id: int, timeframe: str, payload: Dict, *, validated=False) -> Tuple:
     bar_time = _parse_market_timestamp(payload.get("t"))
     if bar_time is None:
         raise ValueError("Alpaca bar is missing a valid timestamp.")
     # Fail the entire provider page before opening a transaction. No filling,
     # dropping, or partial acceptance of malformed market observations.
-    validate_bars(pd.DataFrame([{
-        "timestamp": bar_time, **{name: payload.get(key) for name, key in
-        (("open", "o"), ("high", "h"), ("low", "l"), ("close", "c"), ("volume", "v"))}
-    }]))
+    if not validated:
+        validate_bars(pd.DataFrame([{
+            "timestamp": bar_time, **{name: payload.get(key) for name, key in
+            (("open", "o"), ("high", "h"), ("low", "l"), ("close", "c"), ("volume", "v"))}
+        }]))
     return (
         symbol_id,
         timeframe,
@@ -984,13 +998,25 @@ def _normalize_bar_row(symbol_id: int, timeframe: str, payload: Dict) -> Tuple:
     )
 
 
-def _upsert_stock_bars(symbol_id: int, timeframe: str, bars: List[Dict]) -> int:
+def _normalize_bar_rows(symbol_id: int, timeframe: str, bars: List[Dict]) -> List[Tuple]:
+    if not bars:
+        return []
+    # Full-history refreshes must not allocate/validate a pandas frame per bar.
+    validate_bars(pd.DataFrame([{
+        "timestamp": _parse_market_timestamp(bar.get("t")),
+        **{name: bar.get(key) for name, key in
+           (("open", "o"), ("high", "h"), ("low", "l"), ("close", "c"), ("volume", "v"))}
+    } for bar in bars]))
+    return [_normalize_bar_row(symbol_id, timeframe, bar, validated=True) for bar in bars]
+
+
+def _upsert_stock_bars(symbol_id: int, timeframe: str, bars: List[Dict], *, cursor=None) -> int:
     if not bars:
         return 0
 
-    payload = [_normalize_bar_row(symbol_id, timeframe, item) for item in bars]
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
+    payload = _normalize_bar_rows(symbol_id, timeframe, bars)
+    with (_get_conn() if cursor is None else nullcontext(None)) as conn:
+        with (conn.cursor() if cursor is None else nullcontext(cursor)) as cur:
             execute_values(
                 cur,
                 """
@@ -1006,11 +1032,21 @@ def _upsert_stock_bars(symbol_id: int, timeframe: str, bars: List[Dict]) -> int:
                     volume = EXCLUDED.volume,
                     trade_count = EXCLUDED.trade_count,
                     vwap = EXCLUDED.vwap,
+                    source = 'alpaca',
                     ingested_at = now()
                 """,
                 payload,
             )
     return len(payload)
+
+
+def _refresh_adjusted_history(symbol_id, symbol, timeframe, start, end):
+    with _get_conn() as conn:
+        return refresh_history(conn, symbol_id, symbol, timeframe, start, end,
+            fetch=_fetch_alpaca_bars, normalize=_normalize_bar_rows, write=_upsert_stock_bars,
+            mode=_alpaca_bar_adjustment_for_timeframe, source=ALPACA_DATA_BASE_URL,
+            now=_utcnow, deltas=TIMEFRAME_DELTAS,
+            finalized_through=_utcnow() - timedelta(minutes=max(CHART_DELAY_MINUTES, 0)))
 
 
 def _upsert_latest_quote(symbol_id: int, payload: Dict | None) -> Dict | None:
@@ -1132,6 +1168,7 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int, before: dateti
     with _get_conn() as conn:
         with conn.cursor() as cur:
             before_filter_sql = ""
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             params = [symbol_id, timeframe]
             if before is not None:
                 before_filter_sql = " AND bar_time < %s"
@@ -1212,6 +1249,10 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int, before: dateti
             )
             latest_bar_row = cur.fetchone()
 
+            cur.execute("""SELECT revision, source, adjustment_modes, adjusted_through, checked_at
+                FROM market_data_basis WHERE symbol_id = %s""", (symbol_id,))
+            basis = cur.fetchone()
+
     sync_state = {
         "last_synced_at": state_row[0].astimezone(timezone.utc).isoformat() if state_row and state_row[0] else None,
         "last_successful_sync_at": state_row[1].astimezone(timezone.utc).isoformat() if state_row and state_row[1] else None,
@@ -1254,6 +1295,11 @@ def _get_market_snapshot(symbol: str, timeframe: str, limit: int, before: dateti
         "latest_quote": latest_quote,
         "latest_bar": latest_bar,
         "sync_state": sync_state,
+        "adjustment_basis": {
+            "revision": basis[0], "source": basis[1], "modes": basis[2],
+            "adjusted_through": basis[3].isoformat(), "checked_at": basis[4].isoformat(),
+            "policy": "full_retained_history_refresh", "economic_actions_verified": False,
+        } if basis else None,
     }
 
 
@@ -1302,10 +1348,12 @@ def _sync_market_data_once(symbol: str, timeframe: str, force_full: bool = False
     bars_inserted = 0
     try:
         if start <= end:
-            historical_bars = _fetch_alpaca_bars(symbol, timeframe, start, end)
-            bars_inserted = _upsert_stock_bars(symbol_id, timeframe, historical_bars)
+            historical_bars = _refresh_adjusted_history(symbol_id, symbol, timeframe, start, end)
+            bars_inserted = len(historical_bars)
         else:
-            historical_bars = []
+            # Even without a new bar, configuration/provider corrections need a refresh.
+            historical_bars = _refresh_adjusted_history(symbol_id, symbol, timeframe, end, end)
+            bars_inserted = len(historical_bars)
 
         latest_quote = _upsert_latest_quote(symbol_id, _fetch_alpaca_latest_quote(symbol))
         latest_bar = _upsert_latest_bar(symbol_id, _fetch_alpaca_latest_bar(symbol))
@@ -1406,29 +1454,14 @@ def _sync_market_data_window_once(
 
     bars_inserted = 0
     try:
-        historical_bars = _fetch_alpaca_bars(symbol, timeframe, bounded_start, bounded_end)
-        bars_inserted = _upsert_stock_bars(symbol_id, timeframe, historical_bars)
+        historical_bars = _refresh_adjusted_history(symbol_id, symbol, timeframe, bounded_start, bounded_end)
+        bars_inserted = len(historical_bars)
 
         with _get_conn() as conn:
             with conn.cursor() as cur:
                 effective_latest_bar_time = None
                 if historical_bars:
                     effective_latest_bar_time = _parse_market_timestamp(historical_bars[-1].get("t"))
-                # Record only a completed, delay-bounded provider response. Empty
-                # responses are useful coverage too (weekends and market closures).
-                step = TIMEFRAME_DELTAS[timeframe].total_seconds()
-                finalized_end = datetime.fromtimestamp(
-                    (int(delayed_now.timestamp() // step) - 1) * step, timezone.utc,
-                )
-                covered_end = min(bounded_end, finalized_end)
-                if bounded_start <= covered_end:
-                    cur.execute(
-                        """
-                        INSERT INTO market_data_coverage (symbol_id, timeframe, window_start, window_end)
-                        VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING
-                        """,
-                        (symbol_id, timeframe, bounded_start, covered_end),
-                    )
                 cur.execute(
                     """
                     UPDATE symbol_sync_state
@@ -1622,6 +1655,7 @@ def _historical_price_coverage(symbol: str, timeframe: str, start: datetime, end
     symbol_id = _ensure_symbol_metadata(symbol.strip().upper())
     with _get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             cur.execute(
                 """
                 SELECT
@@ -1635,12 +1669,15 @@ def _historical_price_coverage(symbol: str, timeframe: str, start: datetime, end
             anchor, latest = cur.fetchone()
             cur.execute(
                 """
-                SELECT window_start, window_end FROM market_data_coverage
+                SELECT window_start, window_end FROM market_data_coverage c
+                JOIN market_data_basis b USING (symbol_id)
                 WHERE symbol_id = %s AND timeframe = %s
+                  AND c.adjustment_revision = b.revision AND c.adjustment_mode = %s
+                  AND b.source = %s
                   AND window_end >= %s AND window_start <= %s
                 ORDER BY window_start
                 """,
-                (symbol_id, timeframe, start, end),
+                (symbol_id, timeframe, _alpaca_bar_adjustment_for_timeframe(timeframe), ALPACA_DATA_BASE_URL, start, end),
             )
             return anchor, latest, cur.fetchall()
 
@@ -4701,6 +4738,8 @@ curl -s "http://127.0.0.1:5000/api/futurestate/NVDA/1Day?asof=2023-09-20T00:00:0
         <p>Portfolio reads perform no provider I/O. Explicit intraday requests require verified provider coverage over the seven-day anchor lookback through <code>asof + days</code>, capped at the delayed present. Uncovered symbols return per-symbol errors with preparation bounds; prepare them using <code>POST /api/coverage/prepare</code> and retry. Single-symbol intraday reads fetch only missing coverage ranges for envelopes up to 31 calendar days and report required provider failures; larger uncovered envelopes require explicit preparation in smaller windows. Successful empty windows cover market closures; unfinished delayed tails are rechecked, not permanently covered. This calendar search does not guarantee N trading bars; inspect <code>complete_window</code>.</p>
         <p>Returns realized forward performance for every visible stock in the saved portfolio from the same <code>asof</code> anchor. This is intended for labeling historical training examples after fetching technicals from <code>/api/portfolio/state</code>. Required query parameters: <code>asof</code> and <code>days</code>. Optional query parameters include <code>timeframe</code>, <code>hidets</code>, <code>include_hidden=1</code>, <code>side</code>, <code>stoploss</code>, and <code>takeprofit</code>. For <code>1Day</code>, <code>days</code> means future trading bars rather than calendar days.</p>
         <h3>Historical coverage and daily preparation</h3>
+        <p>Every actual provider ingestion refreshes the full retained history and verified-window envelopes for all stored timeframes of that symbol. Publication of bars, adjustment provenance, replacement coverage receipts and cache invalidation is atomic; concurrent preparations serialize per symbol, and analytics reads use one database snapshot. Daily and intraday requests share <code>ALPACA_BAR_ADJUSTMENT</code> (default <code>split</code>). Changed configurations invalidate coverage receipts. This conservative policy increases provider I/O and holds a database connection while fetching history. Missing retained timestamps or failed pages abort the refresh and preserve the preceding generation.</p>
+        <p><code>adjustment_basis</code> (under state/label <code>data_quality</code>, and at top level for events/charts) reports the latest content/configuration revision, provider source, modes, adjusted-through date and check time. The revision fingerprints the provider history; it is not a corporate-action event ID or a historical data-vintage archive. Legacy rows have null provenance until successfully refreshed. <code>economic_actions_verified=false</code> remains explicit: provider split adjustment does not certify ADR conversions or other non-split actions (VEC-830), and no correction is inferred from move magnitude. Default split-adjusted returns are price returns without dividend reinvestment.</p>
         <p>HTTP success and <code>ok=true</code> report execution, not validated investment performance or complete history. Ingestion rejects an entire provider page before writing if required OHLCV is missing, nonnumeric, nonfinite, nonpositive OHLC, outside its high/low range, or has negative/fractional volume. Zero volume is valid. Analytics rejects the entire affected symbol/window, never fills or drops invalid bars, and keeps other portfolio symbols in <code>states</code> with failures in <code>errors</code>. Shared historical sweeps reject the symbol for all requested cutoffs if their loaded history is malformed. The database constraint enforces new writes; its NOT VALID migration does not certify pre-existing rows.</p>
         <p><strong>Completed-bar policy:</strong> All state paths (single, batch, portfolio and historical), benchmarks, events and future-label anchors consume only completed stored bars. Daily OHLCV may include extended hours and becomes eligible at the <strong>next America/New_York midnight</strong> after its UTC-labelled session date (both legacy 00Z and provider 04Z/05Z labels). DST follows that timezone. Neither a regular close nor an early close releases the full-day aggregate. Intraday bars, including premarket/postmarket, become eligible at <code>bar_start + full interval &lt;= cutoff</code>; intervals are not shortened at exchange closes. No partial bars are built. At 14:00Z a 13:45Z 15-minute bar is eligible, a 14:00Z bar is not. Date-only cutoffs remain 23:59:59.999999 UTC, so that New York date's daily aggregate is still unavailable; use the following NY midnight to include it. Holidays/weekends do not create synthetic bars. Price-dependent calculations use the eligible price anchor. Future labels use the next N stored bars strictly after their eligible anchor; the first label bar can overlap the requested instant and deliberately contains future data.</p>
         <p><code>data_quality.bar_availability</code>, <code>indicator_available_at</code>, <code>price_available_at</code> and label <code>anchor_available_at</code> expose this policy. Completion is conservative event-time eligibility, not proof of provider publication time: receipt times and revisions are not versioned. <code>ohlcv_validation</code> certifies numeric/range checks only. <code>historical_coverage</code> separates indicators and price; labels report anchor coverage and <code>complete_future_window</code> (bar count only). Current requests evaluate against now rounded down to the minute; historical requests use the cutoff. Daily freshness uses the NYSE calendar's latest eligible session (holidays, weekends, DST and early closes accounted for); intraday freshness compares regular-session completed intervals, not extended-hours completeness. <code>expected_latest_completed</code>, <code>freshness_status</code>, <code>anchor_completed</code> and remediation <code>action</code> explain results. Legacy <code>within_tolerance</code> means no missing expected eligible session/interval, not proof of complete history.</p>

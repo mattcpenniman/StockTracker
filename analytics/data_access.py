@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from datetime import datetime, timezone, timedelta
 from typing import NamedTuple
 from typing import Any
@@ -11,6 +12,7 @@ from . import future_labels
 from .state_bars import StateBars
 from .quality import OHLCV_SQL_CHECK
 from .availability import start_bound
+from .read_snapshot import active_read
 
 
 DATABASE_URL = os.environ.get(
@@ -38,6 +40,9 @@ class AnalyticsRepository:
         self.database_url = database_url or DATABASE_URL
 
     def get_conn(self):
+        active = active_read.get()
+        if active is not None and active[0] == self.database_url:
+            return nullcontext(active[1])
         return get_connection(self.database_url)
 
     def ping(self) -> bool:
@@ -73,9 +78,15 @@ class AnalyticsRepository:
                            ss.latest_bar_time,
                            ss.latest_quote_time,
                            ss.sync_status,
-                           ss.sync_error
+                           ss.sync_error,
+                           b.revision,
+                           b.adjustment_modes,
+                           b.adjusted_through,
+                           b.checked_at,
+                           b.source
                     FROM symbol_metadata sm
                     LEFT JOIN symbol_sync_state ss ON ss.symbol_id = sm.id
+                    LEFT JOIN market_data_basis b ON b.symbol_id = sm.id
                     WHERE sm.symbol = ANY(%s)
                     """,
                     (symbols,),
@@ -102,6 +113,11 @@ class AnalyticsRepository:
             "latest_quote_time": row[13],
             "sync_status": row[14] or "idle",
             "sync_error": row[15],
+            "adjustment_revision": row[16],
+            "adjustment_basis": {"revision": row[16], "modes": row[17],
+                                 "adjusted_through": row[18].isoformat(), "checked_at": row[19].isoformat(),
+                                 "source": row[20], "policy": "full_retained_history_refresh",
+                                 "economic_actions_verified": False} if row[16] else None,
         }
 
     def fetch_bars(

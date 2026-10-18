@@ -101,12 +101,23 @@ class MutationEndpointTests(unittest.TestCase):
     def test_stock_upsert_chart_sync_and_coverage_preparation_in_private_schema(self):
         with price_fixture(os.environ["ANALYTICS_TEST_DATABASE_URL"], 260, 0) as (dsn, _), \
              patch.object(dashboard, "_get_conn", lambda: get_connection(dsn)), \
-             patch.object(dashboard, "_fetch_alpaca_bars", return_value=[{
-                 "t": "2020-06-01T04:00:00Z", "o": 100, "h": 105, "l": 98, "c": 103, "v": 1234,
-             }]) as provider, \
+             patch.object(dashboard, "_fetch_alpaca_bars") as provider, \
              patch.object(dashboard, "_fetch_alpaca_latest_quote", return_value=None), \
              patch.object(dashboard, "_fetch_alpaca_latest_bar", return_value=None), \
              dashboard.app.test_client() as client:
+            # A full refresh must return retained observations as well as new ones.
+            def fetch(symbol, timeframe, start, end):
+                with get_connection(dsn) as conn, conn.cursor() as cur:
+                    cur.execute("""SELECT bar_time, open, high, low, close, volume FROM stock_bars
+                        WHERE timeframe = %s AND bar_time BETWEEN %s AND %s ORDER BY bar_time""",
+                        (timeframe, start, end))
+                    bars = [dict(zip(("t", "o", "h", "l", "c", "v"), row)) for row in cur.fetchall()]
+                for bar in bars:
+                    bar["t"] = bar["t"].isoformat()
+                if not any(bar["t"].startswith("2020-06-01") for bar in bars):
+                    bars.append({"t": "2020-06-01T04:00:00Z", "o": 100, "h": 105, "l": 98, "c": 103, "v": 1234})
+                return bars
+            provider.side_effect = fetch
             created = client.post("/api/stocks", json={"symbol": "bench", "forecast_price": 110})
             self.assertEqual(created.status_code, 200, created.get_json())
             updated = client.post("/api/stocks", json={"rows": [{"symbol": "BENCH", "forecast_price": 120}]})
@@ -125,5 +136,5 @@ class MutationEndpointTests(unittest.TestCase):
                 prepared = client.post("/api/coverage/prepare", json=body)
                 self.assertEqual(prepared.status_code, 200, prepared.get_json())
                 self.assertEqual(prepared.get_json()["errors"], [])
-            # A second identical request reuses persisted successful coverage.
-            provider.assert_called_once()
+            # The chart refresh already verified this entire historical envelope.
+            provider.assert_not_called()
