@@ -126,8 +126,7 @@ class AnalyticsService:
         # State returns one snapshot, not historical events. All five exposed
         # signal flags are calculated from the anchor below, so constructing
         # full-history signal columns here would only duplicate that work.
-        latest = features.iloc[-1].to_dict()
-        anchor_bar = latest
+        anchor_bar = None
         if price_timeframe != indicator_timeframe:
             anchor_bars = self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt)
             if anchor_bars.empty:
@@ -135,6 +134,13 @@ class AnalyticsService:
             else:
                 anchor_bar = anchor_bars.iloc[-1]
 
+        return self._state_from_features(context, timeframe, asof_dt, settings, features, price_timeframe, anchor_bar)
+
+    def _state_from_features(self, context, timeframe, asof_dt, settings, features, price_timeframe, anchor_bar=None):
+        """Shared snapshot assembly; features must be a cutoff-bounded prefix."""
+        indicator_timeframe = "1Day"
+        latest = features.iloc[-1].to_dict()
+        anchor_bar = latest if anchor_bar is None else anchor_bar
         anchor_timestamp = anchor_bar["timestamp"]
         anchor_close = float(anchor_bar["close"])
         trend_regime = classify_trend_regime(latest)
@@ -371,6 +377,11 @@ class AnalyticsService:
     def _compute_typed_future_state(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side):
         anchors, bars, summary = self.repository.fetch_label_summary(
             context["symbol_id"], timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side)
+        return self._typed_future_from_window(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side,
+                                              anchors, bars, summary)
+
+    def _typed_future_from_window(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side,
+                                  anchors, bars, summary):
         if not anchors:
             raise AnalyticsNotFoundError(
                 f"No anchor bar available for symbol '{context['symbol']}' on timeframe '{timeframe}' at the requested as-of."
@@ -577,6 +588,7 @@ class AnalyticsService:
         timeframe: str,
         asof_dt,
         settings: AnalyticsSettings,
+        benchmark_results=None,
     ) -> tuple[list[str], list[dict[str, str]]]:
         benchmarks = ("SPY", "QQQ")
         state_by_symbol = {str(state.get("symbol", "")).upper(): state for state in states}
@@ -588,7 +600,13 @@ class AnalyticsService:
                 benchmark_states[benchmark] = state_by_symbol[benchmark]
                 continue
             try:
-                benchmark_states[benchmark] = self.get_symbol_state(benchmark, timeframe, asof_dt, settings)
+                if benchmark_results is None:
+                    result = self.get_symbol_state(benchmark, timeframe, asof_dt, settings)
+                else:
+                    result = benchmark_results[benchmark]
+                    if isinstance(result, Exception):
+                        raise result
+                benchmark_states[benchmark] = result
             except (AnalyticsNotFoundError, CacheCapacityError) as exc:
                 benchmark_errors.append({"symbol": benchmark, "error": str(exc)})
 
@@ -652,6 +670,9 @@ class AnalyticsService:
         self._add_portfolio_ranks(states)
         benchmarks, benchmark_errors = scoped._add_benchmark_relative_returns(states, timeframe, asof_dt, settings)
 
+        return self._state_batch_payload(timeframe, asof_dt, states, errors, benchmarks, benchmark_errors)
+
+    def _state_batch_payload(self, timeframe, asof_dt, states, errors, benchmarks, benchmark_errors):
         return clean_json_value(
             {
                 "timeframe": timeframe,
@@ -703,6 +724,9 @@ class AnalyticsService:
             except (AnalyticsNotFoundError, CacheCapacityError) as exc:
                 errors.append({"symbol": str(symbol).upper(), "error": str(exc)})
 
+        return self._future_batch_payload(timeframe, asof_dt, days, side, future_states, errors)
+
+    def _future_batch_payload(self, timeframe, asof_dt, days, side, future_states, errors):
         return clean_json_value(
             {
                 "timeframe": timeframe,
@@ -718,6 +742,13 @@ class AnalyticsService:
                 },
             }
         )
+
+    def get_historical_portfolio(self, symbols, cutoffs, settings, days=20,
+                                 stop_loss_pct=None, take_profit_pct=None, side="long"):
+        from .historical import historical_portfolio
+
+        return historical_portfolio(self, symbols, cutoffs, settings, days,
+                                    stop_loss_pct, take_profit_pct, side)
 
     def cache_diagnostics(self) -> dict[str, Any]:
         return {"scope": "per_worker", **{name: cache.diagnostics() for name, cache in (
