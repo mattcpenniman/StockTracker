@@ -35,11 +35,16 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--timing-only", action="store_true", help="Disable cProfile for unbiased wall-clock comparisons")
+    parser.add_argument("--membership-baseline-ref", help="Use only the membership helper from this git ref (requires git)")
     args = parser.parse_args()
     if args.repeats < 1 or (args.mode == "profile" and args.output is None):
         parser.error("Use positive repeats and --output for profiling")
+    membership = nullcontext()
+    if args.membership_baseline_ref:
+        from .membership_benchmark import baseline_membership
+        membership = patch.object(app, "_portfolio_symbols", baseline_membership(args.membership_baseline_ref))
     # DDL belongs to deployment, not this read-only benchmark process.
-    with patch.object(app, "_init_db_if_needed"), \
+    with membership, patch.object(app, "_init_db_if_needed"), \
          patch.object(app, "_sync_market_data", prohibited), \
          patch.object(app, "_sync_market_data_window", prohibited), \
          patch.object(app, "_backfill_analytics_symbol_if_needed", prohibited):
