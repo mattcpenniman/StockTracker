@@ -11,9 +11,10 @@ from .config import AnalyticsSettings
 from .data_access import LabelBar
 from .future_labels import scan_windows
 from .indicators import compute_feature_frame
-from .quality import DataQualityError
+from .quality import DataQualityError, validate_bars
 from .service import AnalyticsNotFoundError
 from .utils import isoformat_utc, parse_asof
+from .availability import start_bound
 
 
 LIMITS = dict(max_dates=120, max_symbols=50, max_samples=3000,
@@ -134,14 +135,24 @@ def _run(service, symbols, cutoffs, dates, settings, days, stop, take, side):
         metrics["loaded_rows"] += len(bars)
         if len(bars) > LIMITS["max_history_bars"]:
             raise HistoricalLimitError(f"Daily history for '{symbol}' exceeds 20000 bars; cannot truncate initialization.")
+        history_error = None
+        valid_count = len(bars)
         try:
             features = compute_feature_frame(bars, "1Day", settings) if not bars.empty else bars
         except DataQualityError as exc:
-            for i in range(len(dates)):
-                retain(states, i, symbol, exc.with_traceback(None))
-                if symbol in requested:
-                    retain(labels, i, symbol, exc.with_traceback(None))
-            continue
+            history_error = exc.with_traceback(None)
+            # A malformed later bar must not invalidate earlier cutoffs. Find
+            # the longest valid prefix only on the exceptional path.
+            low, high = 0, len(bars)
+            while low < high:
+                middle = (low + high + 1) // 2
+                try:
+                    validate_bars(bars.iloc[:middle])
+                    low = middle
+                except DataQualityError:
+                    high = middle - 1
+            valid_count = low
+            features = compute_feature_frame(bars.iloc[:valid_count], "1Day", settings) if valid_count else bars.iloc[:0]
         metrics["feature_computations"] += int(not bars.empty)
         price_dates = [d for d in dates if service._preferred_price_timeframe("1Day", d) == "15Min"]
         prices = service.repository.fetch_historical_price_anchors(sid, price_dates) if price_dates else {}
@@ -150,21 +161,33 @@ def _run(service, symbols, cutoffs, dates, settings, days, stop, take, side):
         price_by_date = {date: prices.get(i) for i, date in enumerate(price_dates)}
         label_bars = []
         if symbol in requested and not bars.empty:
-            label_bars = [LabelBar(row.timestamp.to_pydatetime(), float(row.high), float(row.low), float(row.close))
-                          for row in bars.itertuples(index=False)]
+            validity = [True] * len(bars)
+            if history_error is not None:
+                # Preserve per-window label validation, including open/volume
+                # checks which cannot be reconstructed from HLC-only records.
+                prices = bars[["open", "high", "low", "close"]]
+                validity = (prices.gt(0).all(axis=1) & prices.lt(float("inf")).all(axis=1)
+                    & bars.volume.ge(0) & bars.volume.lt(float("inf")) & bars.volume.mod(1).eq(0)
+                    & bars.low.le(bars[["open", "close"]].min(axis=1))
+                    & bars.high.ge(bars[["open", "close"]].max(axis=1)) & bars.low.le(bars.high)).tolist()
+            label_bars = [LabelBar(row.timestamp.to_pydatetime(), float(row.high), float(row.low), float(row.close), valid)
+                          for row, valid in zip(bars.itertuples(index=False), validity)]
             tail = service.repository.fetch_label_bars_many([sid], "1Day",
                     after={sid: label_bars[-1].timestamp}, limit=days)[sid]
             label_bars.extend(tail)
             metrics["tail_reads"] += 1
             metrics["loaded_rows"] += len(tail)
-        # searchsorted is inclusive at the cutoff and returns a prefix length.
-        counts = features.timestamp.searchsorted(pd.to_datetime(dates, utc=True), side="right") if not bars.empty else [0] * len(dates)
+        # Prefixes use the same completion boundary as repository reads.
+        bounds = [start_bound(date, "1Day") for date in dates]
+        counts = bars.timestamp.searchsorted(pd.to_datetime(bounds, utc=True), side="right") if not bars.empty else [0] * len(dates)
         windows = [label_bars[n:n + days] if n else [] for n in counts]
         summaries = scan_windows(windows, [label_bars[n - 1].close if n and label_bars else 0.0 for n in counts],
                                  stop, take, side) if label_bars else [None] * len(dates)
         for i, (date, count) in enumerate(zip(dates, counts)):
             if not count:
                 state = AnalyticsNotFoundError(f"No bars available for symbol '{symbol}' on timeframe '1Day'.")
+            elif count > valid_count:
+                state = history_error
             else:
                 price = price_by_date.get(date)
                 try:

@@ -6,6 +6,7 @@ import pandas as pd
 import pandas_market_calendars as mcal
 
 from .utils import clean_json_value
+from .availability import available_at, start_bound
 
 
 @lru_cache(maxsize=128)
@@ -42,38 +43,32 @@ def historical_coverage(requested_asof, actual_timestamp, timeframe="1Day", *, n
     completed = schedule[schedule.market_close <= cutoff]
     expected = None
     if timeframe == "1Day":
+        completed = schedule[schedule.index.date <= start_bound(cutoff, timeframe).date()]
         expected = completed.index[-1].date() if len(completed) else None
         stale = actual.date() < expected if expected else None
         freshness = "missing_completed_session" if stale else "current_completed_session" if expected else "unknown"
-        anchor_session = _schedule(actual.date().isoformat(), actual.date().isoformat())
-        anchor_completed = bool(len(anchor_session) and anchor_session.market_close.iloc[0] <= cutoff)
+        anchor_completed = bool(available_at(actual, timeframe) <= cutoff)
     else:
         minutes = {"1Hour": 60, "15Min": 15, "5Min": 5, "1Min": 1}.get(timeframe)
         candidates = []
         if minutes:
             for row in reversed(list(schedule.itertuples())):
                 starts = pd.date_range(row.market_open, row.market_close, freq=f"{minutes}min", inclusive="left")
-                candidates.extend(start for start in starts if min(start + pd.Timedelta(minutes=minutes), row.market_close) <= cutoff)
+                candidates.extend(start for start in starts if start + pd.Timedelta(minutes=minutes) <= cutoff)
                 if candidates:
                     break
         expected = max(candidates) if candidates else None
         stale = actual < expected if expected is not None else None
         freshness = "missing_completed_interval" if stale else "current_completed_interval" if expected is not None else "unknown"
-        anchor_session = _schedule(actual.date().isoformat(), actual.date().isoformat())
         anchor_completed = None
         if minutes:
-            anchor_completed = False
-            if len(anchor_session):
-                opening, closing = anchor_session.iloc[0][["market_open", "market_close"]]
-                anchor_completed = bool(opening <= actual < closing and
-                    (actual - opening).total_seconds() % (minutes * 60) == 0 and
-                    min(actual + pd.Timedelta(minutes=minutes), closing) <= cutoff)
+            anchor_completed = bool(available_at(actual, timeframe) <= cutoff)
     return clean_json_value({
         "requested_asof": requested, "evaluated_at": cutoff, "actual_bar_timestamp": actual,
         "lag_seconds": lag, "status": "anchor_after_cutoff" if lag < 0 else "stale_trailing" if stale else "within_tolerance" if stale is not None else "not_evaluated",
         "stale": stale, "freshness_status": freshness, "expected_latest_completed": str(expected) if expected is not None else None,
         "anchor_completed": anchor_completed,
-        "calendar": "NYSE", "calendar_scope": "US equity regular sessions; extended-hours coverage not verified",
+        "calendar": "NYSE", "calendar_scope": "regular-session freshness diagnostic; eligibility uses full NY dates and full intraday intervals, including extended hours",
         "completeness_verified": False,
         "action": "Resync missing completed sessions/intervals; check provider availability or symbol trading status." if stale else None,
     })

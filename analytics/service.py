@@ -22,6 +22,7 @@ from .regimes import (
 from .serializers import serialize_events, serialize_state_payload, serialize_symbol_metadata
 from .signals import compute_signal_columns, generate_events, latest_signal_payload
 from .utils import clean_json_value, isoformat_utc
+from .availability import available_at, policy as availability_policy
 
 
 class AnalyticsNotFoundError(RuntimeError):
@@ -182,6 +183,9 @@ class AnalyticsService:
                 "price_bar_timestamp": anchor_timestamp,
                 "indicator_source_timeframe": indicator_timeframe,
                 "price_source_timeframe": price_timeframe,
+                "bar_availability": availability_policy(),
+                "indicator_available_at": available_at(latest["timestamp"], indicator_timeframe),
+                "price_available_at": available_at(anchor_timestamp, price_timeframe),
                 "last_sync_timestamp": context.get("last_synced_at"),
                 "sync_status": context.get("sync_status"),
                 "sync_error": context.get("sync_error"),
@@ -539,6 +543,8 @@ class AnalyticsService:
                 "as_of": anchor_timestamp,
                 "requested_asof": isoformat_utc(asof_dt),
                 "data_quality": {
+                    "bar_availability": availability_policy(),
+                    "anchor_available_at": available_at(anchor_timestamp, timeframe),
                     "historical_coverage": historical_coverage(asof_dt, anchor_timestamp, timeframe),
                     "complete_future_window": complete_window,
                     "ohlcv_validation": {"status": "passed", "policy": "reject_entire_symbol_on_invalid_bar"},

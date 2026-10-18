@@ -12,6 +12,7 @@ from analytics.future_labels import scan_windows
 from analytics.io_benchmark import measured_repository, price_fixture
 from analytics.service import AnalyticsService, AnalyticsNotFoundError
 from analytics.utils import parse_asof
+from analytics.availability import available_at
 
 
 class ReferenceService(AnalyticsService):
@@ -137,13 +138,13 @@ class TypedLabelPostgreSQLTests(unittest.TestCase):
             with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
                 cur.execute("INSERT INTO symbol_metadata (symbol) SELECT 'A' || n FROM generate_series(1, 205) n")
                 cur.execute("""INSERT INTO stock_bars (symbol_id, timeframe, bar_time, open, high, low, close, volume)
-                    SELECT id, tf, %s::timestamptz + n * interval '1 microsecond', 100, 110, 90, 100, 1
+                    SELECT id, tf, %s::timestamptz + n * CASE WHEN tf='1Day' THEN interval '1 day' ELSE interval '1 microsecond' END, 100, 110, 90, 100, 1
                     FROM symbol_metadata CROSS JOIN unnest(ARRAY['1Day','1Hour','15Min','5Min','1Min']) tf
                     CROSS JOIN generate_series(0, 2) n WHERE symbol != 'BENCH'""", (ts,))
             symbols = [f"A{i}" for i in range(1, 206)] + ["MISSING", "BENCH"]
             for tf in ("1Day", "1Hour", "15Min", "5Min", "1Min"):
                 repo = measured_repository(AnalyticsRepository, dsn)
-                args = (symbols, tf, ts, 1, 0, 0, "long")
+                args = (symbols, tf, available_at(ts, tf), 1, 0, 0, "long")
                 expected = ReferenceService(AnalyticsRepository(dsn)).get_batch_future_state(*args)
                 with patch.object(repo, "_bar_frame", side_effect=AssertionError("frame")), \
                      patch("analytics.future_labels.scan_windows", wraps=scan_windows) as scan:
@@ -157,7 +158,8 @@ class TypedLabelPostgreSQLTests(unittest.TestCase):
                 self.assertTrue(all(len(call.args[0]) <= 100 for call in scan.call_args_list))
                 label = actual["future_states"][0]
                 self.assertEqual(label["as_of"], "2026-03-17T13:30:00.123456Z")
-                self.assertEqual(label["window"]["realized_end_timestamp"], "2026-03-17T13:30:00.123457Z")
+                end = "2026-03-18T13:30:00.123456Z" if tf == "1Day" else "2026-03-17T13:30:00.123457Z"
+                self.assertEqual(label["window"]["realized_end_timestamp"], end)
                 self.assertEqual(label["future_state"]["first_threshold_hit"], "both")
 
     def test_real_bounded_rows_and_no_per_symbol_frames(self):

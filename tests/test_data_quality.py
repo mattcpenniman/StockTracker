@@ -60,7 +60,8 @@ class DataQualityTests(unittest.TestCase):
         before = historical_coverage("2024-07-03T16:59Z", "2024-07-02T04:00Z")
         after = historical_coverage("2024-07-03T17:00Z", "2024-07-02T04:00Z")
         self.assertFalse(before["stale"])
-        self.assertTrue(after["stale"])
+        self.assertFalse(after["stale"])  # full-day aggregate still unavailable at early close
+        self.assertTrue(historical_coverage("2024-07-04T04:00Z", "2024-07-02T04:00Z")["stale"])
         current = historical_coverage(None, "2024-07-02T04:00Z", now="2024-07-04T20:00Z")
         self.assertTrue(current["stale"])
         self.assertIn("Resync", current["action"])

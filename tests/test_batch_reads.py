@@ -14,6 +14,7 @@ from analytics.config import AnalyticsSettings
 from analytics.data_access import AnalyticsRepository
 from analytics.io_benchmark import measured_repository
 from analytics.service import AnalyticsService
+from analytics.utils import parse_asof
 
 
 class BatchQueryTests(unittest.TestCase):
@@ -42,7 +43,7 @@ class BatchQueryTests(unittest.TestCase):
             sql, params = cur.execute.call_args.args
             self.assertIn("CROSS JOIN LATERAL", sql)
             self.assertIn("bar_time <= %s ORDER BY bar_time DESC LIMIT %s)", sql)
-            self.assertEqual(params, [[2, 1], "15Min", anchor.tz_convert("UTC"), 1])
+            self.assertEqual(params, [[2, 1], "15Min", anchor.tz_convert("UTC") - timedelta(minutes=15), 1])
             self.assertEqual(list(frames), [2, 1])
             self.assertTrue(all(frame.empty for frame in frames.values()))
             repo.fetch_bars_many([1, 2], "15Min", after={1: anchor, 2: anchor + timedelta(minutes=15)}, limit=20)
@@ -135,12 +136,17 @@ class BatchPostgreSQLTests(unittest.TestCase):
                     continue
                 if key == "benchmark_errors":
                     item = [error for error in item if error["error"] != "Stale trailing benchmark history at requested asof."]
+                if key == "data_quality":
+                    # The pre-VEC-784 service inferred YTD availability from
+                    # price-anchor year; the current contract uses daily inputs.
+                    item = {k: v for k, v in item.items() if k != "ytd"}
                 cleaned = core(item)
                 if key == "data_quality" and not cleaned:
                     continue
                 result[key] = cleaned
             return result
-        self.assertEqual(core(actual), core(expected))
+        from tests.quality_compat import legacy_quality_contract
+        self.assertEqual(core(legacy_quality_contract(actual)), core(legacy_quality_contract(expected)))
 
     @classmethod
     def setUpClass(cls):
@@ -212,13 +218,14 @@ class BatchPostgreSQLTests(unittest.TestCase):
         args = (["D021", "D021"], "1Day", asof)
         old_state = service.get_batch_state(*args, AnalyticsSettings())
         old_future = service.get_batch_future_state(*args, 2)
+        eligible_anchor = parse_asof(old_future["future_states"][0]["anchor_price"]["timestamp"])
         for method, extra in ((service.get_batch_state, AnalyticsSettings()), (service.get_batch_future_state, 2)):
             repo.queries = 0
             method(*args, extra)
             self.assertEqual(repo.queries, 1)
         try:
             with psycopg2.connect(self.dsn) as conn, conn.cursor() as cur:
-                cur.execute("UPDATE stock_bars SET close=close+10 WHERE symbol_id=(SELECT id FROM symbol_metadata WHERE symbol='D021') AND bar_time=%s AND timeframe='1Day'", (asof,))
+                cur.execute("UPDATE stock_bars SET close=close+10, high=high+10 WHERE symbol_id=(SELECT id FROM symbol_metadata WHERE symbol='D021') AND bar_time=%s AND timeframe='1Day'", (eligible_anchor,))
                 cur.execute("UPDATE symbol_sync_state SET last_bar_synced_at=last_bar_synced_at+interval '1 second' WHERE symbol_id=(SELECT id FROM symbol_metadata WHERE symbol='D021')")
             new_state = service.get_batch_state(*args, AnalyticsSettings())
             new_future = service.get_batch_future_state(*args, 2)
@@ -226,7 +233,7 @@ class BatchPostgreSQLTests(unittest.TestCase):
             self.assertNotEqual(new_future["future_states"][0]["anchor_price"], old_future["future_states"][0]["anchor_price"])
         finally:
             with psycopg2.connect(self.dsn) as conn, conn.cursor() as cur:
-                cur.execute("UPDATE stock_bars SET close=close-10 WHERE symbol_id=(SELECT id FROM symbol_metadata WHERE symbol='D021') AND bar_time=%s AND timeframe='1Day'", (asof,))
+                cur.execute("UPDATE stock_bars SET close=close-10, high=high-10 WHERE symbol_id=(SELECT id FROM symbol_metadata WHERE symbol='D021') AND bar_time=%s AND timeframe='1Day'", (eligible_anchor,))
 
     def test_read_chunks_cross_100_symbols_and_warm_hits_skip_bars(self):
         with batch_fixture(os.environ["ANALYTICS_TEST_DATABASE_URL"], count=105, bars=30) as (dsn, end):
@@ -238,7 +245,7 @@ class BatchPostgreSQLTests(unittest.TestCase):
             self.assertEqual(repo.queries, 5)  # contexts + two anchors + two windows
             self.assertEqual(future["errors"], [])
             self.assertEqual([state["symbol"] for state in future["future_states"]], symbols)
-            self.assertTrue(all(state["window"]["future_bar_count"] == 2 for state in future["future_states"]))
+            self.assertTrue(all(state["window"]["future_bar_count"] == 4 for state in future["future_states"]))
             repo.queries = 0
             states = service.get_batch_state(symbols, "1Day", asof, AnalyticsSettings())
             self.assertEqual(repo.queries, 12)  # contexts + eleven history chunks, including benchmarks

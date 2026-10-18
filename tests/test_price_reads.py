@@ -30,7 +30,7 @@ class PriceQueryTests(unittest.TestCase):
         sql, params = self.cursor.execute.call_args.args
         self.assertIn("bar_time <= %s", sql)
         self.assertTrue(sql.endswith("ORDER BY bar_time DESC LIMIT %s"))
-        self.assertEqual(params, [1, "15Min", asof.tz_convert("UTC"), 1])
+        self.assertEqual(params, [1, "15Min", asof.tz_convert("UTC") - pd.Timedelta(minutes=15), 1])
         self.assertEqual(str(params[2].tzinfo), "UTC")
         self.assertEqual(list(result.columns), ["timestamp", "open", "high", "low", "close", "volume"])
         self.assertTrue(result.empty)
@@ -38,8 +38,9 @@ class PriceQueryTests(unittest.TestCase):
     def test_unbounded_asof_and_strict_forward_window(self):
         self.repo.fetch_latest_bar(1, "1Day")
         sql, params = self.cursor.execute.call_args.args
-        self.assertNotIn("bar_time <=", sql)
-        self.assertEqual(params, [1, "1Day", 1])
+        self.assertIn("bar_time <=", sql)
+        self.assertEqual(params[:2], [1, "1Day"])
+        self.assertEqual(params[-1], 1)
         anchor = pd.Timestamp("2023-01-03T09:30:00.000001-05:00")
         self.repo.fetch_future_bars(1, "15Min", anchor, 20)
         sql, params = self.cursor.execute.call_args.args
@@ -117,13 +118,15 @@ class PostgreSQLPriceParityTests(unittest.TestCase):
                             self.assertEqual(payload["count"], 1)
                             self.assertEqual(payload["errors"][0]["symbol"], "MISSING")
                             payload = payload["future_states"][0]
-                        self.assertEqual(payload["as_of"], "2020-01-01T00:00:00Z")
+                        expected_anchor = "2019-12-31" if asof == "2020-01-01" else "2019-12-30"
+                        expected_end = "2020-01-28" if asof == "2020-01-01" else "2020-01-27"
+                        self.assertEqual(payload["as_of"], expected_anchor + "T00:00:00Z")
                         self.assertEqual(payload["anchor_price"]["source_timeframe"], "1Day")
                         self.assertEqual(payload["window"]["source_timeframe"], "1Day")
                         self.assertEqual(payload["future_state"]["source_timeframe"], "1Day")
                         self.assertEqual(payload["window"]["future_bar_count"], 20)
                         self.assertTrue(payload["window"]["complete_window"])
-                        self.assertEqual(payload["window"]["realized_end_timestamp"], "2020-01-29T00:00:00Z")
+                        self.assertEqual(payload["window"]["realized_end_timestamp"], expected_end + "T00:00:00Z")
                         sync.assert_not_called()
 
     def test_chronological_window_excludes_anchor_and_later_extremes(self):
@@ -136,17 +139,17 @@ class PostgreSQLPriceParityTests(unittest.TestCase):
                                     stop_loss_pct=0.02, take_profit_pct=0.02)
         self.assertLess(result["future_state"]["max_price"], 100000)
         self.assertEqual(result["future_state"]["first_threshold_hit"], "both")
-        self.assertEqual(result["future_state"]["first_threshold_hit_timestamp"], "2020-01-01T04:45:00Z")
+        self.assertEqual(result["future_state"]["first_threshold_hit_timestamp"], "2020-01-01T04:15:00Z")
         partial = self.assert_parity("get_future_state", "BENCH", "15Min", parse_asof("2020-01-01T09:00:00Z"), 5)
         self.assertFalse(partial["window"]["complete_window"])
-        self.assertEqual(partial["window"]["future_bar_count"], 2)
+        self.assertEqual(partial["window"]["future_bar_count"], 3)
         self.assertIsNone(partial["window"]["target_end_timestamp"])
 
     def test_repository_anchor_boundaries_and_microsecond_successor(self):
         anchor = pd.Timestamp("2020-01-01T04:15:00Z")
         for asof in (anchor, anchor + pd.Timedelta(minutes=10)):
             latest = self.repo.fetch_latest_bar(self.symbol_id, "15Min", asof)
-            self.assertEqual(latest.iloc[0]["timestamp"], anchor)
+            self.assertEqual(latest.iloc[0]["timestamp"], anchor - pd.Timedelta(minutes=15))
         with psycopg2.connect(self.dsn) as conn, conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO stock_bars (symbol_id, timeframe, bar_time, open, high, low, close, volume)

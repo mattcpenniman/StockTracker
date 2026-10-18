@@ -60,7 +60,7 @@ def batch_fixture(database_url, count=100, bars=5000, mixed=False):
             cur.execute("""
                 INSERT INTO stock_bars (symbol_id, timeframe, bar_time, open, high, low, close, volume)
                 SELECT id, '15Min', %s::timestamptz + n * interval '15 minutes',
-                       100, 103, 97, 100 + n * 0.1, 1000
+                       100, GREATEST(103, 100 + n * 0.1), 97, 100 + n * 0.1, 1000
                 FROM symbol_metadata CROSS JOIN generate_series(0, 39) n
                 WHERE symbol NOT IN ('BENCH', 'D000')
             """, (end - timedelta(days=2),))
