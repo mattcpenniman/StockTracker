@@ -120,9 +120,9 @@ class SnapshotTests(unittest.TestCase):
         if indicators._rust_feature_columns:
             native = indicators._rust_feature_columns
             def old(*args, **kw):
-                if kw:
+                if "snapshot" in kw:
                     raise TypeError("feature_columns() got an unexpected keyword argument 'snapshot'")
-                return native(*args)
+                return native(*args, **kw)
             with patch.dict(os.environ, ANALYTICS_BACKEND="rust"), patch.object(indicators, "_rust_feature_columns", old):
                 actual = indicators.compute_feature_snapshot(bars, "1Day", AnalyticsSettings())
             with patch.dict(os.environ, ANALYTICS_BACKEND="rust"):

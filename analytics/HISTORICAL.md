@@ -67,8 +67,16 @@ positive lags; SMA, range extrema, standard deviation, z-scores, volume means an
 volatility-baseline median use trailing windows; EMA, Wilder RSI/ATR and MACD use
 forward recurrences with original history seeds; slopes and breakout/breakdown
 levels use positive shifts. Ratios, distances, regimes and anomaly flags are
-row-local. YTD uses the first stored close of the row's year (no backfill or
-year-end statistic). No centered window, negative shift or backward fill is
+row-local. YTD divides the row's daily close by the final trading-session close
+of the preceding calendar year, including the first trading day's gain/loss.
+The prior-year anchor must be present on the final NYSE session date (UTC daily
+bar labels); otherwise YTD is null, including IPOs, truncated histories, missing
+year-end sessions and whole missing years. There is no first-in-year or older-year
+fallback. Both prices use the stored adjustment basis: this is price return,
+not dividend-reinvested total return. `data_quality.ytd` reports unavailable
+anchors or qualifies available returns because adjustment provenance remains
+unverified (see VEC-831). State YTD uses the daily indicator close, even when
+`price` uses a 15-minute anchor. No centered window, negative shift or backward fill is
 used. Thus a prefix of the computed series is point-in-time equivalent. Tests
 compare every column after removing/changing later bars, plus full serialized
 per-date payloads under multiple settings/backends. Quality bar counts use only
