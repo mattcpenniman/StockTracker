@@ -1432,6 +1432,54 @@ silently substituted. Existing bars alone do not certify gap-free coverage.
 
 ## Historical analytics coverage (VEC-798)
 
+### Reproducible training-readiness audit (VEC-812)
+
+```bash
+python -m analytics.training_audit --base-url http://127.0.0.1:5005 \
+  --dates 2026-03-17,2026-06-16,2026-09-16 --output /tmp/before.json
+```
+
+The default audit issues historical GETs only, for date-only, midnight UTC and
+explicit 20:00 UTC cutoffs. It retains raw responses and a symbol/cutoff matrix
+with daily indicator and price timestamps/source timeframes, benchmark alignment,
+daily label anchors and realized horizon counts. The conservative screen requires
+200 daily bars, recent anchors, expected price source, aligned recent SPY/QQQ,
+matching indicator/label anchors and complete label horizons. Inspect
+`response_complete` separately from `screen_pass`: full response counts alone do
+not establish usable training coverage. Neither flag certifies interior gaps or
+exchange-session completeness. Closure dates do not require exact-date bars.
+
+Preparation is a separate explicit operation using the existing bounded API:
+
+```bash
+python -m analytics.training_audit --base-url http://127.0.0.1:5005 \
+  --prepare-from /tmp/before.json --output /tmp/preparation.json
+python -m analytics.training_audit --base-url http://127.0.0.1:5005 \
+  --output /tmp/after.json
+python -m analytics.training_audit --render-from /tmp/after.json \
+  --before-file /tmp/before.json --receipts /tmp/preparation.json \
+  --output /tmp/coverage-evidence.md
+```
+
+`--prepare-from` targets stale preferred 15-minute price anchors and stale daily
+benchmarks in eight-day windows, with at most five symbols per request. Other
+gaps, indicator warmup and interior benchmark history can be explicitly supplied
+via `--prepare-plan plan.json`, a JSON array of `/api/coverage/prepare` request
+bodies. API bounds still apply. Receipts retain provider errors and fetched-window
+counts; rerun the audit to establish actual effects. A successful preparation
+receipt alone is not evidence of available bars.
+
+For a **separate daily-price benchmark dataset**, use `--variants midnight` with
+the three original dates after preparation. Midnight selects the previous daily
+session on these dates, avoiding mixed intraday-price/daily-label snapshots;
+preserve actual anchors and join features/labels on symbol plus daily anchor.
+Vector DOC-243 summarizes the findings, DOC-241 contains the durable before/after
+matrix, DOC-242 stores the separate JSON dataset, and DOC-244 stores the closure
+and partial-horizon controls. DOC-228/source-34d31ae timings remain the original baseline against its
+original stored data; post-preparation quality results do not replace those
+measurements. Historical saved membership also does not certify survivorship-free
+portfolio selection.
+
 Historical state and future-label responses report `requested_asof` separately
 from their actual anchors. Inspect `data_quality.historical_coverage`: state
 reports daily indicators and price separately, while labels report their anchor.
