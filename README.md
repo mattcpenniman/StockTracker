@@ -1167,6 +1167,16 @@ are price returns, without dividends/distribution reinvestment; this change does
 not turn them into total shareholder returns. Other large moves remain review
 candidates, with no magnitude-based normalization.
 
+The 18-Oct-2026 rollout uses `deploy/vec-830.env` (code revision `0b73fe2`,
+release `vec-830-20261018`). The host's `.env` image selection was updated to the
+same release. AZN retained daily and 15-minute history was repaired through the
+command above and repeated with an identical adjustment revision. The previous
+image is retained as `apollo-app:pre-vec-830`; a pre-repair database backup is
+`/tmp/opencode/vec830-pre-deploy.dump`. Rolling back ingestion code also requires
+planning the data basis: older ingestion can overwrite corrected observations.
+Live API results, issuer references and the broader action audit are recorded in
+Vector on VEC-830.
+
 ### Validated Docker rollout (VEC-802)
 
 Compose requires Rust by default (`ANALYTICS_BACKEND=rust`); override explicitly
