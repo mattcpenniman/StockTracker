@@ -1,0 +1,16 @@
+{
+  "action_source": "https://www.astrazeneca.com/content/dam/az/PDF/2025/Circular-and-Notice-of-General-Meeting.pdf",
+  "action_source_section": "Part III.1, printed page 14; issuer circular dated 29 September 2025",
+  "source_excerpt": "American depositary shares representing uncertificated AstraZeneca Shares ... are currently traded on Nasdaq on a two for one basis pursuant to the ADR Programme.",
+  "effective_date_source": "https://www.astrazeneca.com/investor-relations/faqs.html",
+  "effective_date_excerpt": "On 2 February 2026, AstraZeneca implemented its harmonised listing structure",
+  "old_ads_per_ordinary_share": 2,
+  "observations_source": "Alpaca /v2/stocks/bars, raw and split independently requested 2026-10-18; these observations are not the source of the conversion factor",
+  "bars": [
+    {"t": "2026-01-30T05:00:00Z", "o": 93.03, "h": 93.51, "l": 92.46, "c": 92.77, "v": 5555024, "vw": 92.958973, "n": 70004},
+    {"t": "2026-02-02T05:00:00Z", "o": 187.5, "h": 192.79, "l": 186.18, "c": 188.41, "v": 3228784, "vw": 189.717497, "n": 45583}
+  ],
+  "expected_pre_conversion_close_in_ordinary_units": 185.54,
+  "expected_pre_conversion_volume_in_ordinary_units": 2777512,
+  "expected_boundary_price_return": 0.0154683626172254
+}

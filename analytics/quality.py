@@ -53,18 +53,30 @@ def validate_bars(bars):
         raise DataQualityError(f"Invalid OHLCV: impossible high/low range at row {int(np.flatnonzero(invalid)[0])}; resync the symbol.")
 
 
-def corporate_action_diagnostics(bars):
+def corporate_action_diagnostics(bars, context=None):
     close = bars.values[3] if isinstance(bars, StateBars) else bars["close"].to_numpy()
     changes = np.asarray(close[1:], dtype=float) / np.asarray(close[:-1], dtype=float) - 1
     indices = np.flatnonzero(np.abs(changes) >= .5)
     timestamps = (pd.to_datetime(bars.timestamps, unit="us", utc=True) if isinstance(bars, StateBars)
                   else bars["timestamp"])
+    context = context or {}
+    manifest = (context.get("adjustment_basis") or {}).get("corporate_actions") or {}
+    unresolved = list(manifest.get("unresolved_actions", []))
+    if context.get("symbol") == "AZN" and not manifest.get("reviewed_actions"):
+        unresolved.append({"id": "AZN-2026-02-02-ADS-ordinary", "status": "unresolved",
+                           "reason": "Stored history has not been prepared with issuer conversion provenance."})
+    if context.get("symbol") == "SNX" and not unresolved:
+        from corporate_actions import SNX_ACTION
+        unresolved.append(dict(SNX_ACTION))
     return {
-        "status": "warning" if len(indices) else "unknown",
+        "status": "warning" if len(indices) or unresolved else "unknown",
         "verified": False,
-        "reason": "large_moves_require_review" if len(indices) else "adjustment_provenance_not_verified",
+        "reason": ("unresolved_actions_require_review" if unresolved else
+                   "large_moves_require_review" if len(indices) else "adjustment_provenance_not_verified"),
         "review_ticket": "VEC-830",
         "adjustment_basis_ticket": "VEC-831",
+        "reviewed_actions": manifest.get("reviewed_actions", []),
+        "unresolved_actions": unresolved,
         "large_move_threshold_pct": .5,
         "large_move_count": len(indices),
         "examples": [{"timestamp": timestamps[i + 1] if isinstance(bars, StateBars) else timestamps.iloc[i + 1],
