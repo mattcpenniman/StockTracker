@@ -363,6 +363,46 @@ class AnalyticsService:
         )
 
     def _compute_future_state(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side):
+        repository = self.repository.repository if isinstance(self.repository, BatchReads) else self.repository
+        if callable(getattr(type(repository), "fetch_label_summary", None)):
+            return self._compute_typed_future_state(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side)
+        return self._compute_future_state_reference(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side)
+
+    def _compute_typed_future_state(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side):
+        anchors, bars, summary = self.repository.fetch_label_summary(
+            context["symbol_id"], timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side)
+        if not anchors:
+            raise AnalyticsNotFoundError(
+                f"No anchor bar available for symbol '{context['symbol']}' on timeframe '{timeframe}' at the requested as-of."
+            )
+        if not bars:
+            raise AnalyticsNotFoundError(
+                f"No future bars available for symbol '{context['symbol']}' on timeframe '{timeframe}' for the requested window."
+            )
+        anchor = anchors[-1]
+        close = anchor.close
+        direction = 1 if side == "long" else -1
+        stop = close * (1.0 - direction * stop_loss_pct) if stop_loss_pct is not None else None
+        take = close * (1.0 + direction * take_profit_pct) if take_profit_pct is not None else None
+        high_idx, low_idx, stop_idx, take_idx = summary
+        if high_idx < 0 or low_idx < 0:
+            raise ValueError("Future window has no valid extrema.")
+        high, low = bars[high_idx], bars[low_idx]
+        stop_hit = bars[stop_idx] if stop_idx >= 0 else None
+        take_hit = bars[take_idx] if take_idx >= 0 else None
+        first, timestamp = None, None
+        if stop_hit is not None and take_hit is not None:
+            first = "both" if stop_hit.timestamp == take_hit.timestamp else "stop_loss" if stop_hit.timestamp < take_hit.timestamp else "take_profit"
+            timestamp = min(stop_hit.timestamp, take_hit.timestamp)
+        elif stop_hit is not None:
+            first, timestamp = "stop_loss", stop_hit.timestamp
+        elif take_hit is not None:
+            first, timestamp = "take_profit", take_hit.timestamp
+        return self._future_payload(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side,
+            anchor.timestamp, close, len(bars), bars[-1], high, low, stop, take, stop_hit, take_hit, first, timestamp)
+
+    def _compute_future_state_reference(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side):
+        """Pandas oracle retained for differential tests and measurements."""
         price_timeframe = timeframe
         anchor_bars = self.repository.fetch_latest_bar(context["symbol_id"], price_timeframe, asof_dt)
         if anchor_bars.empty:
@@ -437,6 +477,17 @@ class AnalyticsService:
             first_threshold_hit = "take_profit"
             first_threshold_hit_timestamp = take_profit_hit["timestamp"]
 
+        return self._future_payload(context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side,
+            anchor_timestamp, anchor_close, len(future_bars), end_bar, max_bar, min_bar,
+            stop_loss_price, take_profit_price, stop_loss_hit, take_profit_hit,
+            first_threshold_hit, first_threshold_hit_timestamp)
+
+    def _future_payload(self, context, timeframe, asof_dt, days, stop_loss_pct, take_profit_pct, side,
+                        anchor_timestamp, anchor_close, count, end_bar, max_bar, min_bar,
+                        stop_loss_price, take_profit_price, stop_loss_hit, take_profit_hit,
+                        first_threshold_hit, first_threshold_hit_timestamp):
+        price_timeframe = timeframe
+        complete_window = count == days
         payload = clean_json_value(
             {
                 "symbol": context["symbol"],
@@ -456,9 +507,9 @@ class AnalyticsService:
                 },
                 "window": {
                     "requested_future_bar_count": days,
-                    "future_bar_count": len(future_bars),
+                    "future_bar_count": count,
                     "complete_window": complete_window,
-                    "target_end_timestamp": future_bars.iloc[days - 1]["timestamp"] if complete_window else None,
+                    "target_end_timestamp": end_bar["timestamp"] if complete_window else None,
                     "realized_end_timestamp": end_bar["timestamp"],
                     "source_timeframe": price_timeframe,
                 },

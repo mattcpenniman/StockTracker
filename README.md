@@ -334,6 +334,44 @@ observations with existing coverage warnings, not production capacity guarantees
 Full tables, methodology, coverage findings and prioritized Rust/Python/cache
 recommendations are maintained in Vector: `vector doc show DOC-228`.
 
+### Typed future-label batches (VEC-810)
+
+Future labels use UTC-microsecond `LabelBar` records containing only timestamp,
+high, low and close. Request-local batches read at most 100 symbols per chunk,
+with one anchor and at most the requested future bars per symbol. A single scan
+finds extrema (earliest ties) and first threshold hits. The pandas oracle remains
+available for differential validation; state/events keep their frame interface.
+
+The measured default is the direct Python reducer. The experimental PyO3
+`future_window_indices` comparator takes one chunk per call, releases the GIL,
+and returns four indices per window. Its conversion-inclusive latency did not
+justify selecting it over Python. Build the current extension before comparing:
+
+```bash
+VIRTUAL_ENV=/tmp/opencode/apollo-venv /tmp/opencode/apollo-venv/bin/maturin develop \
+  --release --manifest-path rust/Cargo.toml
+# Set DATABASE_URL to a read-only connection to your stored portfolio database.
+python -m analytics.future_benchmark --repeats 15 \
+  --dates 2026-03-17,2026-06-16,2026-09-16 --horizons 1,20,252 \
+  --output /tmp/future-comparison.json
+# Separate fresh-process RSS observations (repeat for python and rust).
+python -m analytics.future_benchmark --rss-variant reference --repeats 5 \
+  --output /tmp/future-reference-rss.json
+# Isolated HTTP target for the portfolio_load commands above.
+python -m analytics.future_benchmark --rss-variant python --serve 5011 \
+  --output /tmp/unused.json
+ANALYTICS_TEST_DATABASE_URL=<disposable-test-dsn> python -m unittest tests.test_future_labels
+```
+
+The comparison alternates reference/Python/Rust ordering, checks full JSON
+equality, and reports unprofiled cold/warm p50/p95. A separate instrumented pass
+reports bar conversion, conversion-inclusive batch reduction, and SQL/row counts
+including portfolio membership. RSS uses Linux `VmHWM` per fresh process. On the
+37-symbol portfolio, 20-bar cold median fell from 291 to 39 ms; warm median stayed
+near 17 ms. A 252-bar request can be partial when stored future history is short;
+inspect `complete_window`. Detailed evidence and load tables live in Vector:
+`vector doc show DOC-230`.
+
 ### Bounded analytics price reads (VEC-780)
 
 Price anchors use an inclusive latest-at-or-before query (`ORDER BY bar_time DESC

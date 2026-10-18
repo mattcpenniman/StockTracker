@@ -1,17 +1,32 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import NamedTuple
 from typing import Any
 
 import pandas as pd
 from database import get_connection
+from . import future_labels
 
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://stock_user:stock_pass@localhost:5432/stock_tracker",
 )
+
+
+class LabelBar(NamedTuple):
+    timestamp: datetime
+    high: float
+    low: float
+    close: float
+
+    def __getitem__(self, key):
+        return getattr(self, key) if isinstance(key, str) else tuple.__getitem__(self, key)
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class AnalyticsRepository:
@@ -169,7 +184,25 @@ class AnalyticsRepository:
             }
         )
 
-    def fetch_bars_many(self, symbol_ids, timeframe, asof=None, *, latest=False, after=None, limit=None):
+    def fetch_label_bars_many(self, symbol_ids, timeframe, asof=None, *, latest=False, after=None, limit=None):
+        """Bounded label-only records; preserve integer UTC microseconds."""
+        if not latest and (after is None or limit is None or limit <= 0):
+            raise ValueError("Label windows require anchors and a positive limit.")
+        return self.fetch_bars_many(symbol_ids, timeframe, asof, latest=latest,
+                                    after=after, limit=limit, _labels=True)
+
+    def fetch_label_window(self, symbol_id, timeframe, asof, days):
+        anchors = self.fetch_label_bars_many([symbol_id], timeframe, asof, latest=True)
+        anchor = anchors[symbol_id]
+        windows = self.fetch_label_bars_many([symbol_id], timeframe, after={symbol_id: anchor[-1].timestamp}, limit=days) if anchor else {}
+        return anchor, windows.get(symbol_id, [])
+
+    def fetch_label_summary(self, symbol_id, timeframe, asof, days, stop, take, side):
+        anchors, bars = self.fetch_label_window(symbol_id, timeframe, asof, days)
+        summary = future_labels.scan_windows([bars], [anchors[-1].close], stop, take, side)[0] if anchors else None
+        return anchors, bars, summary
+
+    def fetch_bars_many(self, symbol_ids, timeframe, asof=None, *, latest=False, after=None, limit=None, _labels=False):
         """Compatible reads; LATERAL limits apply per symbol, never to the batch.
 
         Full daily history is intentionally retained for indicator initialization.
@@ -188,7 +221,8 @@ class AnalyticsRepository:
                 raise ValueError("'limit' must be greater than zero.")
             sql += " JOIN unnest(%s::timestamptz[]) WITH ORDINALITY AS anchors(bar_time, position) USING (position)"
             params.append([after[sid].astimezone(timezone.utc) for sid in ids])
-        sql += " CROSS JOIN LATERAL (SELECT (EXTRACT(EPOCH FROM bar_time) * 1000000)::bigint AS bar_time_us, open, high, low, close, volume FROM stock_bars WHERE symbol_id = requested.symbol_id AND timeframe = %s"
+        columns = "high, low, close" if _labels else "open, high, low, close, volume"
+        sql += f" CROSS JOIN LATERAL (SELECT (EXTRACT(EPOCH FROM bar_time) * 1000000)::bigint AS bar_time_us, {columns} FROM stock_bars WHERE symbol_id = requested.symbol_id AND timeframe = %s"
         params.append(timeframe)
         if asof is not None:
             sql += " AND bar_time <= %s"
@@ -206,7 +240,15 @@ class AnalyticsRepository:
         grouped = {sid: [] for sid in ids}
         for row in rows:
             grouped[row[0]].append(row[1:])
+        if _labels:
+            return self._label_records(grouped)
         return {sid: self._bar_frame(values, timestamp_unit="us") for sid, values in grouped.items()}
+
+    @staticmethod
+    def _label_records(grouped):
+        return {sid: [LabelBar(_EPOCH + timedelta(microseconds=int(row[0])),
+                    *(float(value) if value is not None else float("nan") for value in row[1:]))
+                      for row in rows] for sid, rows in grouped.items()}
 
 
 class BatchReads:
@@ -223,6 +265,30 @@ class BatchReads:
         self.ids = list(dict.fromkeys(c["symbol_id"] for c in contexts.values()))
         self.frames = {}
         self.anchor_asofs = {}
+        self.label_windows = {}
+        self.label_summaries = {}
+
+    def fetch_label_summary(self, symbol_id, timeframe, asof, days, stop, take, side):
+        anchors, bars = self.fetch_label_window(symbol_id, timeframe, asof, days)
+        summaries = self.label_summaries.setdefault((timeframe, asof, days, stop, take, side), {})
+        if symbol_id not in summaries:
+            pending = {sid: pair for sid, pair in self.label_windows[timeframe, asof, days].items() if sid not in summaries}
+            valid = {sid: pair for sid, pair in pending.items() if pair[0]}
+            values = future_labels.scan_windows([pair[1] for pair in valid.values()],
+                [pair[0][-1].close for pair in valid.values()], stop, take, side)
+            summaries.update(dict.fromkeys(pending))
+            summaries.update(zip(valid, values))
+        return anchors, bars, summaries[symbol_id]
+
+    def fetch_label_window(self, symbol_id, timeframe, asof, days):
+        windows = self.label_windows.setdefault((timeframe, asof, days), {})
+        if symbol_id not in windows:
+            ids = [symbol_id] + [sid for sid in self.ids if sid != symbol_id and sid not in windows][:99]
+            anchors = self.repository.fetch_label_bars_many(ids, timeframe, asof, latest=True)
+            after = {sid: bars[-1].timestamp for sid, bars in anchors.items() if bars}
+            futures = self.repository.fetch_label_bars_many(list(after), timeframe, after=after, limit=days)
+            windows.update({sid: (anchors[sid], futures.get(sid, [])) for sid in ids})
+        return windows[symbol_id]
 
     def fetch_symbol_context(self, symbol):
         return self.contexts.get(str(symbol).strip().upper())
