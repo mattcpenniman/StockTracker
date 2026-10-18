@@ -1049,6 +1049,58 @@ containers (including the default unmodified WSGI app), not rolled out to the
 live service. At verification, port 5005 still served `vec-806-20261018` with
 `python app.py`; PR-open/merged and deployed are separate states.
 
+### Live WSGI rollout (VEC-824, 2026-10-18)
+
+The VEC-815 WSGI implementation is now deployed at
+**http://192.168.1.80:5005/**. This supersedes the earlier VEC-815 delivery-state
+observation above. Full deployment and preservation evidence is **Vector DOC-240:
+VEC-824 Live production WSGI rollout and serving-worker verification**.
+
+- Merged application: `11491a0d33a694f29e52d9955dbd4c8c5c179b25` (PR #27).
+- Release/image: `vec-824-20261018` / `apollo-app:vec-824-20261018`.
+- Immutable image: `sha256:0ba179b2502807f5ec93aab7ec6796e87b69f06f28c44d440d9410d770df3041`.
+- Started `2026-10-18T16:02:45Z`; actual Gunicorn master PID 1, two serving
+  workers, two request threads each, pool limit two per worker. No debug/reloader.
+- Both workers passed DB/schema and native startup; each executed **46 real
+  serving native calls**, zero fallbacks. Warm repeats across both workers added
+  zero native calls. State, 20-event intraday events, three-stock batch, 37-stock
+  portfolio state and portfolio future-label requests all passed on each PID.
+- Docker healthy, restart count zero; UI HTML and dashboard data passed (37
+  visible rows, all with prices). PostgreSQL container/volume stayed running;
+  1,839,280 bars, 38 stored forecasts and forecast checksum were unchanged.
+
+The non-secret release selection is `deploy/vec-824.env`. Application/provider
+credentials still come from the host's existing `.env`; its `APP_IMAGE` and
+`WSGI_INIT_DB=0` also select this deployed release for plain Compose commands.
+To repeat app-only startup with the already-built image:
+
+```bash
+docker compose --env-file deploy/vec-824.env up -d --no-build --no-deps app
+docker compose --env-file deploy/vec-824.env exec -T app python -m analytics.release_check \
+  --require-rust --expected-revision 11491a0d33a694f29e52d9955dbd4c8c5c179b25 \
+  --expected-release vec-824-20261018
+curl --fail http://192.168.1.80:5005/api/health/analytics
+```
+
+`WSGI_INIT_DB=0` assumes the schema was provisioned first: this rollout ran the
+supported initializer in a separate release container before replacement. For a
+fresh database, run that initializer or use `WSGI_INIT_DB=1` on first startup.
+The release image was built from `git archive` of the exact merged revision;
+the follow-up PR records configuration/evidence and is separate from live code.
+
+Rollback image `apollo-app:pre-vec-824` retains the previous `vec-806-20261018`
+image. A host-local pre-deploy backup is `/tmp/opencode/vec824-pre-deploy.dump`
+(`pg_restore --list` verified). Roll back only the app with:
+
+```bash
+APP_IMAGE=apollo-app:pre-vec-824 docker compose --env-file deploy/vec-824.env \
+  up -d --no-build --no-deps app
+```
+
+If keeping a rollback, update the host `.env`/release selection to that image as
+well; the inline override lasts only for the command. Keep PostgreSQL and its
+volume running. The rollback path was prepared, not exercised on the live app.
+
 ### Validated Docker rollout (VEC-802)
 
 Compose requires Rust by default (`ANALYTICS_BACKEND=rust`); override explicitly
