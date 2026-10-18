@@ -19,8 +19,9 @@ services:
       WSGI_THREADS: ${WSGI_THREADS:-2}
       WSGI_TIMEOUT: ${WSGI_TIMEOUT:-120}
       WSGI_GRACEFUL_TIMEOUT: ${WSGI_GRACEFUL_TIMEOUT:-120}
+      WSGI_INIT_DB: ${WSGI_INIT_DB:-1}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-2}
-    stop_grace_period: 130s
+    stop_grace_period: ${WSGI_STOP_GRACE_PERIOD:-130s}
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:5000/api/health/analytics', timeout=5).read()"]
       interval: 15s

@@ -266,7 +266,7 @@ def main():
                 monitor.thread.join(15)
             run["resource_samples"] = monitor.samples
             run["monitor_errors"] = monitor.errors
-            run["logs"] = docker("logs", identity)
+            run["logs"] = subprocess.check_output(["docker", "logs", identity], text=True, stderr=subprocess.STDOUT)
             save()
             docker("rm", "-f", identity)
         assert not monitor.errors, monitor.errors
