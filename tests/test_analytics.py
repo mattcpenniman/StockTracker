@@ -32,6 +32,62 @@ from analytics.dashboard_benchmark import baseline_namespace, dashboard_fixture,
 from analytics.events_benchmark import baseline_generate_events, event_fixture
 
 
+class ResponseRoundingTests(unittest.TestCase):
+    def test_nested_response_rounding_is_opt_in_and_does_not_mutate_payload(self):
+        payload = {"symbol": "NVDA", "count": 123456, "ok": True,
+                   "state": {"price": 123.456789, "negative": -1.234567,
+                             "missing": None, "text": "123.456789"},
+                   "events": [{"score": 0.123456789}, [2.5, 3.5]]}
+        original = json.loads(json.dumps(payload))
+        with patch.object(dashboard.analytics_service, "get_events", return_value=payload) as service, \
+             patch.object(dashboard, "_sync_current_analytics_data_if_needed"), \
+             flask_app.test_client() as client:
+            with patch.object(dashboard, "_round_response_numbers", wraps=dashboard._round_response_numbers) as rounding:
+                self.assertEqual(client.get("/api/events/NVDA").get_json(), original)
+                rounding.assert_not_called()
+            call = service.call_args
+            rounded = client.get("/api/events/NVDA?round=2").get_json()
+            self.assertEqual(service.call_args, call)
+            self.assertEqual(rounded["state"], {"price": 123.46, "negative": -1.23,
+                                               "missing": None, "text": "123.456789"})
+            self.assertEqual(rounded["events"], [{"score": 0.12}, [2.5, 3.5]])
+            self.assertIs(rounded["ok"], True)
+            self.assertIsInstance(rounded["count"], int)
+            self.assertEqual(rounded["count"], 123456)
+            whole = client.get("/api/events/NVDA?round=0").get_json()
+            self.assertEqual(whole["events"], [{"score": 0.0}, [2.0, 4.0]])
+            self.assertEqual(client.get("/api/events/NVDA?round=15").get_json(), original)
+            self.assertEqual(client.get("/api/events/NVDA").get_json(), original)
+        self.assertEqual(payload, original)
+
+    def test_invalid_precision_is_rejected_before_analytics_or_sync(self):
+        with patch.object(dashboard.analytics_service, "get_events") as service, \
+             patch.object(dashboard, "_init_db_if_needed") as init, \
+             patch.object(dashboard, "_sync_market_data") as sync, \
+             flask_app.test_client() as client:
+            for query in ("round=", "round=-1", "round=16", "round=2.0", "round=true",
+                          "round=abc", "round=2&round=3", "round=999999999999999999999"):
+                with self.subTest(query=query):
+                    response = client.get("/api/events/NVDA?" + query)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("'round'", response.get_json()["error"])
+            service.assert_not_called()
+            init.assert_not_called()
+            sync.assert_not_called()
+
+    def test_rounding_works_on_post_batch_and_preserves_partial_errors(self):
+        payload = {"states": [{"symbol": "NVDA", "score": 1.234567}],
+                   "errors": [{"symbol": "MISSING", "error": "No bars"}], "count": 1}
+        with patch.object(dashboard.analytics_service, "get_batch_state", return_value=payload), \
+             flask_app.test_client() as client:
+            response = client.post("/api/state/batch?round=3", json={"symbols": ["NVDA", "MISSING"],
+                                                                   "asof": "2023-09-20"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["states"][0]["score"], 1.235)
+        self.assertEqual(response.get_json()["errors"], payload["errors"])
+        self.assertEqual(payload["states"][0]["score"], 1.234567)
+
+
 class CacheAdmissionEndpointTests(unittest.TestCase):
     def test_single_symbol_admission_errors_are_retryable(self):
         for path, method in (("/api/state/NVDA?asof=2026-03-17", "get_symbol_state"),
@@ -94,6 +150,24 @@ class FutureLabelHorizonTests(unittest.TestCase):
             sid: read(tf, asof, after[sid] if after else None, limit, latest) for sid in ids
         }
         self.service = AnalyticsService(self.repo)
+
+    def test_response_precision_reuses_full_precision_future_cache(self):
+        path = "/api/futurestate/NVDA?asof=2023-09-20&days=20"
+        with patch.object(dashboard, "analytics_service", self.service), \
+             flask_app.test_client() as client:
+            full = client.get(path)
+            self.assertEqual(full.status_code, 200, full.get_json())
+            initial = self.service._future_cache.diagnostics()
+            self.repo.reset_mock()
+            rounded = client.get(path + "&round=2")
+            again = client.get(path)
+        self.assertEqual(rounded.status_code, 200, rounded.get_json())
+        self.assertEqual(again.get_json(), full.get_json())
+        self.assertEqual(rounded.get_json(), dashboard._round_response_numbers(full.get_json(), 2))
+        final = self.service._future_cache.diagnostics()
+        self.assertEqual(final["hits"], initial["hits"] + 2)
+        self.assertEqual(final["misses"], initial["misses"])
+        self.repo.fetch_future_bars.assert_not_called()
 
     def test_daily_responses_count_twenty_daily_bars_for_date_and_timed_cutoffs(self):
         for asof, anchor, end, close in (
