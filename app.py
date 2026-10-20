@@ -15,7 +15,8 @@ from urllib.request import Request, urlopen
 from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, has_request_context, jsonify, request
+from flask.json.provider import DefaultJSONProvider
 import matplotlib.pyplot as plt
 
 from analytics import AnalyticsNotFoundError, AnalyticsService, AnalyticsSettings
@@ -46,7 +47,42 @@ except Exception:  # pragma: no cover
     psycopg2 = None
     execute_values = None
 
+
+def _round_response_numbers(value, digits: int):
+    """Copy JSON containers so rounding never changes shared analytics caches."""
+    if isinstance(value, float):
+        return round(value, digits)
+    if isinstance(value, dict):
+        return {key: _round_response_numbers(item, digits) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_round_response_numbers(item, digits) for item in value]
+    return value
+
+
+class RoundedJSONProvider(DefaultJSONProvider):
+    def response(self, *args, **kwargs):
+        digits = getattr(g, "response_round_digits", None) if has_request_context() else None
+        if digits is None:
+            return super().response(*args, **kwargs)
+        # Transform before the sole serialization, rather than decoding and
+        # re-encoding a completed response in an after_request hook.
+        payload = self._prepare_response_obj(args, kwargs)
+        return super().response(_round_response_numbers(payload, digits))
+
+
 app = Flask(__name__)
+app.json = RoundedJSONProvider(app)
+
+
+@app.before_request
+def _parse_response_rounding():
+    if not request.path.startswith("/api/") or "round" not in request.args:
+        return None
+    values = request.args.getlist("round")
+    if len(values) != 1 or not re.fullmatch(r"(?:[0-9]|1[0-5])", values[0]):
+        return jsonify({"ok": False, "error": "'round' must be an integer from 0 to 15."}), 400
+    g.response_round_digits = int(values[0])
+
 
 _RAW_DB_TABLE = os.environ.get("STOCK_TRACKER_TABLE", "stock_forecasts")
 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _RAW_DB_TABLE):
@@ -4577,6 +4613,19 @@ def api_docs() -> Response:
 
         <h2>Analytics Endpoints</h2>
         <p>These endpoints expose non-visual market state JSON built from already-synced OHLCV bars in PostgreSQL.</p>
+
+        <h2>Optional response precision: ?round=N</h2>
+        <p>All JSON <code>/api/</code> endpoints accept <code>round</code> as a query parameter,
+        including POST endpoints. Use <code>?round=2</code> (or <code>&amp;round=2</code> with other parameters)
+        to round floating-point numbers in nested objects and arrays to at most two decimal places.
+        Integers, booleans, strings and nulls are unchanged. Omit it to retain existing precision.
+        Valid values are integers from 0 through 15; invalid or repeated values return 400 before endpoint work.
+        Rounding uses Python's nearest/even behavior for ties and returns JSON numbers, without fixed-width trailing zeros.
+        It applies only at response serialization: calculations, ranking, thresholds, stored data and cached results
+        retain full precision. Existing batch reads, cache keys and synchronization paths are preserved.
+        Requests without this parameter skip the rounding traversal.</p>
+<pre><code>curl -s "http://127.0.0.1:5000/api/portfolio/state?timeframe=1D&amp;round=2"
+curl -s "http://127.0.0.1:5000/api/futurestate/NVDA?asof=2023-09-20&amp;days=20&amp;round=4"</code></pre>
 
         <h2>POST /api/portfolio/history</h2>
         <p>Bounded synchronous daily historical sweep, with one history read and feature computation per symbol.
